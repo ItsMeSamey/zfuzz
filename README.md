@@ -1,6 +1,7 @@
 # Zig Fuzz
 
 This Zig module functions for fuzzy string matching, comparison, and flexible sorting of strings.
+Works with zig `0.14.0`, `0.14.1` and `0.15.1`.
 
 ## Features
 
