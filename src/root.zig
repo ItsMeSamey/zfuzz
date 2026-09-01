@@ -48,6 +48,31 @@ const StageMatch = struct {
     score: i32,
 };
 
+const lower_lut: [256]u8 = blk: {
+    var table: [256]u8 = undefined;
+    for (0..256) |i| table[i] = lower(@intCast(i));
+    break :blk table;
+};
+const signature_lut: [256]u6 = blk: {
+    var table: [256]u6 = undefined;
+    for (0..256) |i| table[i] = signatureClass(@intCast(i));
+    break :blk table;
+};
+const char_class_lut: [256]CharClass = blk: {
+    var table: [256]CharClass = undefined;
+    for (0..256) |i| table[i] = charClass(@intCast(i));
+    break :blk table;
+};
+const bonus_lut: [6][6]u8 = blk: {
+    var table: [6][6]u8 = undefined;
+    for (0..6) |previous| {
+        for (0..6) |current| {
+            table[previous][current] = @intCast(bonusFor(@enumFromInt(previous), @enumFromInt(current)));
+        }
+    }
+    break :blk table;
+};
+
 /// Preprocessed candidate array.
 ///
 /// Candidate text is copied into the searchable representation during init,
@@ -169,15 +194,15 @@ pub const Index = struct {
             var previous: CharClass = .white;
 
             for (value, 0..) |c, i| {
-                const folded = lower(c);
+                const folded = lower_lut[c];
                 lower_bytes[offset + i] = folded;
 
-                const current = charClass(c);
-                const raw_bonus = bonusFor(previous, current);
+                const current = char_class_lut[c];
+                const raw_bonus: i32 = bonus_lut[@intFromEnum(previous)][@intFromEnum(current)];
                 bonuses[offset + i] = @intCast(raw_bonus);
                 previous = current;
 
-                const class: usize = @intCast(signatureClass(folded));
+                const class: usize = @intCast(signature_lut[c]);
                 const class_bit = @as(u64, 1) << @intCast(class);
                 if ((once & class_bit) == 0) {
                     once |= class_bit;
@@ -270,6 +295,12 @@ pub const Index = struct {
             last_slot_for_class[best_class] = @intCast(selected_count);
         }
 
+        var last_slot_for_byte = [_]u8{0xff} ** 256;
+        for (0..256) |byte_value| {
+            const class: usize = @intCast(signatureClass(@intCast(byte_value)));
+            if (class < exact_signature_classes) last_slot_for_byte[byte_value] = last_slot_for_class[class];
+        }
+
         const last_positions = try allocator.alloc(u16, last_slots * values.len);
         errdefer allocator.free(last_positions);
         @memset(last_positions, std.math.maxInt(u16));
@@ -277,9 +308,7 @@ pub const Index = struct {
             if (entry.len >= std.math.maxInt(u16)) continue;
             const text = lower_bytes[entry.offset .. entry.offset + entry.len];
             for (text, 0..) |c, position| {
-                const class: usize = @intCast(signatureClass(c));
-                if (class >= exact_signature_classes) continue;
-                const slot = last_slot_for_class[class];
+                const slot = last_slot_for_byte[c];
                 if (slot == 0xff) continue;
                 last_positions[@as(usize, slot) * values.len + row] = @intCast(position);
             }
