@@ -1020,6 +1020,330 @@ pub const Index = struct {
         }
     }
 
+    fn scoreV2ThreeFromFirst(self: *Index, q: *const Query, entry: Entry, last_hint: ?usize) i32 {
+        const text = self.candidateLower(entry);
+        const bonus = self.candidateBonuses(entry);
+        const first0 = self.position_scratch[0];
+        const first1 = self.position_scratch[1];
+        const first2 = self.position_scratch[2];
+
+        var reverse_pattern: usize = 3;
+        var reverse_col = text.len;
+        var last2: usize = undefined;
+        if (last_hint) |position| {
+            last2 = position;
+            reverse_pattern = 2;
+            reverse_col = position;
+        }
+        var last1: usize = undefined;
+        while (reverse_pattern != 1) {
+            reverse_col -= 1;
+            if (text[reverse_col] != q.bytes[reverse_pattern - 1]) continue;
+            reverse_pattern -= 1;
+            if (reverse_pattern == 2) last2 = reverse_col else last1 = reverse_col;
+        }
+
+        const p0 = q.bytes[0];
+        const p1 = q.bytes[1];
+        const p2 = q.bytes[2];
+        const match_score: i16 = score_match;
+        const gap_start: i16 = score_gap_start;
+        const gap_extension: i16 = score_gap_extension;
+        const boundary: i16 = bonus_boundary;
+        const consecutive_bonus: i16 = bonus_consecutive;
+        const first_multiplier: i16 = bonus_first_char_multiplier;
+
+        var h0: i16 = 0;
+        var c0: i16 = 0;
+        var gap0 = false;
+        var j = first0;
+
+        // Row zero is the only live row before first1.
+        while (j < first1) : (j += 1) {
+            const ch = text[j];
+            if (ch == p0) {
+                h0 = match_score + @as(i16, @intCast(bonus[j])) * first_multiplier;
+                c0 = 1;
+                gap0 = false;
+            } else {
+                h0 = @max(h0 + (if (gap0) gap_extension else gap_start), 0);
+                c0 = 0;
+                gap0 = true;
+            }
+        }
+
+        // first1 is guaranteed by the forward subsequence pass. Seed row one
+        // from the previous row-zero column, then advance row zero at first1.
+        const raw1_seed: i16 = @intCast(bonus[first1]);
+        var b1_seed = raw1_seed;
+        var c1 = c0 + 1;
+        if (c1 > 1) {
+            const run_start = first1 + 1 - @as(usize, @intCast(c1));
+            const first_bonus: i16 = @intCast(bonus[run_start]);
+            if (b1_seed >= boundary and b1_seed > first_bonus) {
+                c1 = 1;
+            } else {
+                b1_seed = @max(b1_seed, @max(consecutive_bonus, first_bonus));
+            }
+        }
+        var h1 = h0 + match_score + b1_seed;
+        var gap1 = false;
+
+        if (first1 < last1) {
+            const ch = text[first1];
+            if (ch == p0) {
+                h0 = match_score + raw1_seed * first_multiplier;
+                c0 = 1;
+                gap0 = false;
+            } else {
+                h0 = @max(h0 + (if (gap0) gap_extension else gap_start), 0);
+                c0 = 0;
+                gap0 = true;
+            }
+        }
+
+        j = first1 + 1;
+        const both_end = @min(first2, last1);
+        while (j < both_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+
+            const gap_score1 = h1 + (if (gap1) gap_extension else gap_start);
+            var match1: i16 = -16_000;
+            var next_c1: i16 = 0;
+            if (ch == p1) {
+                match1 = h0 + match_score;
+                var b = raw;
+                next_c1 = c0 + 1;
+                if (next_c1 > 1) {
+                    const run_start = j + 1 - @as(usize, @intCast(next_c1));
+                    const first_bonus: i16 = @intCast(bonus[run_start]);
+                    if (b >= boundary and b > first_bonus) next_c1 = 1 else b = @max(b, @max(consecutive_bonus, first_bonus));
+                }
+                if (match1 + b < gap_score1) {
+                    match1 += raw;
+                    next_c1 = 0;
+                } else match1 += b;
+            }
+            gap1 = match1 < gap_score1;
+            h1 = @max(@max(match1, gap_score1), 0);
+            c1 = next_c1;
+
+            if (ch == p0) {
+                h0 = match_score + raw * first_multiplier;
+                c0 = 1;
+                gap0 = false;
+            } else {
+                h0 = @max(h0 + (if (gap0) gap_extension else gap_start), 0);
+                c0 = 0;
+                gap0 = true;
+            }
+        }
+
+        // If row zero's latest useful column precedes first2, finish row one
+        // alone up to the first feasible row-two match.
+        while (j < first2) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            const gap_score1 = h1 + (if (gap1) gap_extension else gap_start);
+            var match1: i16 = -16_000;
+            var next_c1: i16 = 0;
+            if (ch == p1) {
+                match1 = h0 + match_score;
+                var b = raw;
+                next_c1 = c0 + 1;
+                if (next_c1 > 1) {
+                    const run_start = j + 1 - @as(usize, @intCast(next_c1));
+                    const first_bonus: i16 = @intCast(bonus[run_start]);
+                    if (b >= boundary and b > first_bonus) next_c1 = 1 else b = @max(b, @max(consecutive_bonus, first_bonus));
+                }
+                if (match1 + b < gap_score1) {
+                    match1 += raw;
+                    next_c1 = 0;
+                } else match1 += b;
+            }
+            gap1 = match1 < gap_score1;
+            h1 = @max(@max(match1, gap_score1), 0);
+            c1 = next_c1;
+        }
+
+        // Seed the final row at its first feasible match before advancing lower
+        // rows at the same text column; V2 rows consume the previous column.
+        const raw2_seed: i16 = @intCast(bonus[first2]);
+        var b2_seed = raw2_seed;
+        var c2 = c1 + 1;
+        if (c2 > 1) {
+            const run_start = first2 + 1 - @as(usize, @intCast(c2));
+            const first_bonus: i16 = @intCast(bonus[run_start]);
+            if (b2_seed >= boundary and b2_seed > first_bonus) {
+                c2 = 1;
+            } else {
+                b2_seed = @max(b2_seed, @max(consecutive_bonus, first_bonus));
+            }
+        }
+        var h2 = h1 + match_score + b2_seed;
+        var gap2 = false;
+        var max_score = h2;
+        if (first2 == last2) return @intCast(max_score);
+
+        // Advance row one at first2. It remains live through last2 - 1.
+        {
+            const ch = text[first2];
+            const raw = raw2_seed;
+            const gap_score1 = h1 + (if (gap1) gap_extension else gap_start);
+            var match1: i16 = -16_000;
+            var next_c1: i16 = 0;
+            if (ch == p1) {
+                match1 = h0 + match_score;
+                var b = raw;
+                next_c1 = c0 + 1;
+                if (next_c1 > 1) {
+                    const run_start = first2 + 1 - @as(usize, @intCast(next_c1));
+                    const first_bonus: i16 = @intCast(bonus[run_start]);
+                    if (b >= boundary and b > first_bonus) next_c1 = 1 else b = @max(b, @max(consecutive_bonus, first_bonus));
+                }
+                if (match1 + b < gap_score1) {
+                    match1 += raw;
+                    next_c1 = 0;
+                } else match1 += b;
+            }
+            gap1 = match1 < gap_score1;
+            h1 = @max(@max(match1, gap_score1), 0);
+            c1 = next_c1;
+
+            if (first2 < last1) {
+                if (ch == p0) {
+                    h0 = match_score + raw * first_multiplier;
+                    c0 = 1;
+                    gap0 = false;
+                } else {
+                    h0 = @max(h0 + (if (gap0) gap_extension else gap_start), 0);
+                    c0 = 0;
+                    gap0 = true;
+                }
+            }
+        }
+
+        j = first2 + 1;
+        while (j < last1) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+
+            const gap_score2 = h2 + (if (gap2) gap_extension else gap_start);
+            var match2: i16 = -16_000;
+            if (ch == p2) {
+                match2 = h1 + match_score;
+                var b = raw;
+                const run = c1 + 1;
+                if (run > 1) {
+                    const run_start = j + 1 - @as(usize, @intCast(run));
+                    const first_bonus: i16 = @intCast(bonus[run_start]);
+                    if (!(b >= boundary and b > first_bonus)) b = @max(b, @max(consecutive_bonus, first_bonus));
+                }
+                if (match2 + b < gap_score2) match2 += raw else match2 += b;
+            }
+            gap2 = match2 < gap_score2;
+            h2 = @max(@max(match2, gap_score2), 0);
+            max_score = @max(max_score, h2);
+
+            const gap_score1 = h1 + (if (gap1) gap_extension else gap_start);
+            var match1: i16 = -16_000;
+            var next_c1: i16 = 0;
+            if (ch == p1) {
+                match1 = h0 + match_score;
+                var b = raw;
+                next_c1 = c0 + 1;
+                if (next_c1 > 1) {
+                    const run_start = j + 1 - @as(usize, @intCast(next_c1));
+                    const first_bonus: i16 = @intCast(bonus[run_start]);
+                    if (b >= boundary and b > first_bonus) next_c1 = 1 else b = @max(b, @max(consecutive_bonus, first_bonus));
+                }
+                if (match1 + b < gap_score1) {
+                    match1 += raw;
+                    next_c1 = 0;
+                } else match1 += b;
+            }
+            gap1 = match1 < gap_score1;
+            h1 = @max(@max(match1, gap_score1), 0);
+            c1 = next_c1;
+
+            if (ch == p0) {
+                h0 = match_score + raw * first_multiplier;
+                c0 = 1;
+                gap0 = false;
+            } else {
+                h0 = @max(h0 + (if (gap0) gap_extension else gap_start), 0);
+                c0 = 0;
+                gap0 = true;
+            }
+        }
+
+        while (j < last2) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+
+            const gap_score2 = h2 + (if (gap2) gap_extension else gap_start);
+            var match2: i16 = -16_000;
+            if (ch == p2) {
+                match2 = h1 + match_score;
+                var b = raw;
+                const run = c1 + 1;
+                if (run > 1) {
+                    const run_start = j + 1 - @as(usize, @intCast(run));
+                    const first_bonus: i16 = @intCast(bonus[run_start]);
+                    if (!(b >= boundary and b > first_bonus)) b = @max(b, @max(consecutive_bonus, first_bonus));
+                }
+                if (match2 + b < gap_score2) match2 += raw else match2 += b;
+            }
+            gap2 = match2 < gap_score2;
+            h2 = @max(@max(match2, gap_score2), 0);
+            max_score = @max(max_score, h2);
+
+            const gap_score1 = h1 + (if (gap1) gap_extension else gap_start);
+            var match1: i16 = -16_000;
+            var next_c1: i16 = 0;
+            if (ch == p1) {
+                match1 = h0 + match_score;
+                var b = raw;
+                next_c1 = c0 + 1;
+                if (next_c1 > 1) {
+                    const run_start = j + 1 - @as(usize, @intCast(next_c1));
+                    const first_bonus: i16 = @intCast(bonus[run_start]);
+                    if (b >= boundary and b > first_bonus) next_c1 = 1 else b = @max(b, @max(consecutive_bonus, first_bonus));
+                }
+                if (match1 + b < gap_score1) {
+                    match1 += raw;
+                    next_c1 = 0;
+                } else match1 += b;
+            }
+            gap1 = match1 < gap_score1;
+            h1 = @max(@max(match1, gap_score1), 0);
+            c1 = next_c1;
+        }
+
+        // last2 is final-row-only: lower rows cannot feed a later column.
+        {
+            const ch = text[last2];
+            const raw: i16 = @intCast(bonus[last2]);
+            const gap_score2 = h2 + (if (gap2) gap_extension else gap_start);
+            var match2: i16 = -16_000;
+            if (ch == p2) {
+                match2 = h1 + match_score;
+                var b = raw;
+                const run = c1 + 1;
+                if (run > 1) {
+                    const run_start = last2 + 1 - @as(usize, @intCast(run));
+                    const first_bonus: i16 = @intCast(bonus[run_start]);
+                    if (!(b >= boundary and b > first_bonus)) b = @max(b, @max(consecutive_bonus, first_bonus));
+                }
+                if (match2 + b < gap_score2) match2 += raw else match2 += b;
+            }
+            h2 = @max(@max(match2, gap_score2), 0);
+            max_score = @max(max_score, h2);
+        }
+        return @intCast(max_score);
+    }
+
     /// Compile-time-unrolled score-only V2 kernel for the small-pattern cases
     /// where scalar row state is faster than candidate-sized DP buffers.
     fn scoreV2SmallFromFirst(self: *Index, comptime M: usize, q: *const Query, entry: Entry, last_hint: ?usize) i32 {
@@ -1353,7 +1677,7 @@ pub const Index = struct {
         if (q.bytes.len == 2) return self.scoreV2TwoIndexed(q, entry, entry_index);
         const last_hint = self.indexedLastPosition(entry, entry_index, q.classes[q.classes.len - 1]);
         return switch (q.bytes.len) {
-            3 => self.scoreV2SmallFromFirst(3, q, entry, last_hint),
+            3 => self.scoreV2ThreeFromFirst(q, entry, last_hint),
             4 => self.scoreV2SmallFromFirst(4, q, entry, last_hint),
             5 => self.scoreV2SmallFromFirst(5, q, entry, last_hint),
             6 => self.scoreV2SmallFromFirst(6, q, entry, last_hint),
@@ -1363,7 +1687,7 @@ pub const Index = struct {
 
     fn scoreV2FromFirst(self: *Index, q: *const Query, entry: Entry) i32 {
         return switch (q.bytes.len) {
-            3 => self.scoreV2SmallFromFirst(3, q, entry, null),
+            3 => self.scoreV2ThreeFromFirst(q, entry, null),
             4 => self.scoreV2SmallFromFirst(4, q, entry, null),
             5 => self.scoreV2SmallFromFirst(5, q, entry, null),
             6 => self.scoreV2SmallFromFirst(6, q, entry, null),
