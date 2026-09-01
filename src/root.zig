@@ -617,9 +617,19 @@ pub const Index = struct {
                 if (!self.subsequence(&q, entry)) continue;
                 self.next_survivors[word] |= row_bit;
 
+                var score: i32 = undefined;
+                if (q.bytes.len >= 7 and q.bytes.len <= 1000 and stage_len == top_k) {
+                    self.prepareLastPositions(&q, entry, entry_index);
+                    const tightened = self.gapAwareUpperPrepared(&q, self.bonus_caps[entry_index]);
+                    if (tightened < self.stage[0].score) continue;
+                    score = self.scoreV2GeneralFromFirst(&q, entry, null, true);
+                } else {
+                    score = self.scoreV2IndexedFromFirst(&q, entry, entry_index);
+                }
+
                 self.addStage(.{
                     .entry = entry_index,
-                    .score = self.scoreV2IndexedFromFirst(&q, entry, entry_index),
+                    .score = score,
                 }, top_k, &stage_len);
             }
         }
@@ -1119,7 +1129,7 @@ pub const Index = struct {
 
     /// General exact score-only fzf V2 DP. Kept separate from the small-query
     /// kernels both as the 7+ byte production path and as a parity reference.
-    fn scoreV2GeneralFromFirst(self: *Index, q: *const Query, entry: Entry, last_hint: ?usize) i32 {
+    fn scoreV2GeneralFromFirst(self: *Index, q: *const Query, entry: Entry, last_hint: ?usize, last_prepared: bool) i32 {
         const text = self.candidateLower(entry);
         const bonus = self.candidateBonuses(entry);
         const m = q.bytes.len;
@@ -1131,18 +1141,20 @@ pub const Index = struct {
         if (m > 1000) return self.scoreV1(q, entry).?;
 
         const last = self.last_position_scratch[0..m];
-        var reverse_pattern = m;
-        var reverse_col = n;
-        if (last_hint) |position| {
-            last[m - 1] = position;
-            reverse_pattern = m - 1;
-            reverse_col = position;
-        }
-        while (reverse_pattern != 0) {
-            reverse_col -= 1;
-            if (text[reverse_col] != q.bytes[reverse_pattern - 1]) continue;
-            reverse_pattern -= 1;
-            last[reverse_pattern] = reverse_col;
+        if (!last_prepared) {
+            var reverse_pattern = m;
+            var reverse_col = n;
+            if (last_hint) |position| {
+                last[m - 1] = position;
+                reverse_pattern = m - 1;
+                reverse_col = position;
+            }
+            while (reverse_pattern != 0) {
+                reverse_col -= 1;
+                if (text[reverse_col] != q.bytes[reverse_pattern - 1]) continue;
+                reverse_pattern -= 1;
+                last[reverse_pattern] = reverse_col;
+            }
         }
 
         const first_col = first[0];
@@ -1226,6 +1238,42 @@ pub const Index = struct {
         return @intCast(max_score);
     }
 
+    fn prepareLastPositions(self: *Index, q: *const Query, entry: Entry, entry_index: usize) void {
+        const text = self.candidateLower(entry);
+        const m = q.bytes.len;
+        const last = self.last_position_scratch[0..m];
+        var reverse_pattern = m;
+        var reverse_col = text.len;
+        if (self.indexedLastPosition(entry, entry_index, q.classes[m - 1])) |position| {
+            last[m - 1] = position;
+            reverse_pattern = m - 1;
+            reverse_col = position;
+        }
+        while (reverse_pattern != 0) {
+            reverse_col -= 1;
+            if (text[reverse_col] != q.bytes[reverse_pattern - 1]) continue;
+            reverse_pattern -= 1;
+            last[reverse_pattern] = reverse_col;
+        }
+    }
+
+    fn gapAwareUpperPrepared(self: *const Index, q: *const Query, caps: BonusCaps) i32 {
+        var prefix_bonus = bonusCap(caps, q.classes[0]);
+        var upper = score_match + prefix_bonus * bonus_first_char_multiplier;
+        for (1..q.bytes.len) |i| {
+            const latest_previous = self.last_position_scratch[i - 1];
+            const earliest_current = self.position_scratch[i];
+            if (latest_previous + 1 < earliest_current) {
+                const gap = earliest_current - latest_previous - 1;
+                const penalty = score_gap_start + @as(i32, @intCast(gap - 1)) * score_gap_extension;
+                upper = @max(0, upper + penalty);
+            }
+            prefix_bonus = @max(prefix_bonus, bonusCap(caps, q.classes[i]));
+            upper += score_match + @max(prefix_bonus, bonus_consecutive);
+        }
+        return upper;
+    }
+
     fn indexedLastPosition(self: *const Index, entry: Entry, entry_index: usize, class_value: u6) ?usize {
         if (entry.len >= std.math.maxInt(u16)) return null;
         const class: usize = @intCast(class_value);
@@ -1245,7 +1293,7 @@ pub const Index = struct {
             4 => self.scoreV2SmallFromFirst(4, q, entry, last_hint),
             5 => self.scoreV2SmallFromFirst(5, q, entry, last_hint),
             6 => self.scoreV2SmallFromFirst(6, q, entry, last_hint),
-            else => self.scoreV2GeneralFromFirst(q, entry, last_hint),
+            else => self.scoreV2GeneralFromFirst(q, entry, last_hint, false),
         };
     }
 
@@ -1255,7 +1303,7 @@ pub const Index = struct {
             4 => self.scoreV2SmallFromFirst(4, q, entry, null),
             5 => self.scoreV2SmallFromFirst(5, q, entry, null),
             6 => self.scoreV2SmallFromFirst(6, q, entry, null),
-            else => self.scoreV2GeneralFromFirst(q, entry, null),
+            else => self.scoreV2GeneralFromFirst(q, entry, null, false),
         };
     }
 
@@ -1508,6 +1556,37 @@ test "score ceiling never underestimates representative V2 scores" {
     }
 }
 
+test "gap-aware ceiling never underestimates generic V2" {
+    const values = [_][]const u8{
+        "src/alpha_beta_gamma_delta.zig",
+        "/usr/local/share/doc/fuzzy-search/README.md",
+        "FrameBufferManagerAndRenderer",
+        "one_two_three_four_five_six_seven",
+        "abcdefghijklmno_abcdefghijklmno",
+        "a---b---c---d---e---f---g---h",
+    };
+    const queries = [_][]const u8{ "abgdzg", "ulshred", "fbmaren", "ottffss", "acegikm", "abcdefgh" };
+
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+
+    for (queries) |text| {
+        const q = index.compileQuery(text);
+        if (q.bytes.len < 7 or q.bytes.len > 1000) continue;
+        for (index.entries, 0..) |entry, i| {
+            if (!index.subsequence(&q, entry)) continue;
+            index.prepareLastPositions(&q, entry, i);
+            const ceiling = index.gapAwareUpperPrepared(&q, index.bonus_caps[i]);
+            const exact = index.scoreV2GeneralFromFirst(&q, entry, null, true);
+            try std.testing.expect(exact <= ceiling);
+
+            try std.testing.expect(index.subsequence(&q, entry));
+            const ordinary = index.scoreV2GeneralFromFirst(&q, entry, null, false);
+            try std.testing.expectEqual(ordinary, exact);
+        }
+    }
+}
+
 test "ported V1 and V2 match fzf scoring vectors" {
     const Case = struct { value: []const u8, q: []const u8, expected: i32 };
     const cases = [_]Case{
@@ -1553,7 +1632,7 @@ test "small V2 kernels match general DP" {
         if (q.bytes.len < 3 or q.bytes.len > 6) continue;
         for (index.entries) |entry| {
             if (!index.subsequence(&q, entry)) continue;
-            const general = index.scoreV2GeneralFromFirst(&q, entry, null);
+            const general = index.scoreV2GeneralFromFirst(&q, entry, null, false);
             try std.testing.expect(index.subsequence(&q, entry));
             const specialized = switch (q.bytes.len) {
                 3 => index.scoreV2SmallFromFirst(3, &q, entry, null),
