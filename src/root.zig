@@ -618,7 +618,12 @@ pub const Index = struct {
                 self.next_survivors[word] |= row_bit;
 
                 var score: i32 = undefined;
-                if (q.bytes.len >= 7 and q.bytes.len <= 1000 and stage_len == top_k) {
+                if (q.bytes.len == 6 and stage_len == top_k) {
+                    self.prepareLastPositions(&q, entry, entry_index);
+                    const tightened = self.gapAwareUpperPrepared(&q, self.bonus_caps[entry_index]);
+                    if (tightened < self.stage[0].score) continue;
+                    score = self.scoreV2SmallPreparedFromFirst(6, &q, entry);
+                } else if (q.bytes.len >= 7 and q.bytes.len <= 1000 and stage_len == top_k) {
                     self.prepareLastPositions(&q, entry, entry_index);
                     const tightened = self.gapAwareUpperPrepared(&q, self.bonus_caps[entry_index]);
                     if (tightened < self.stage[0].score) continue;
@@ -1056,6 +1061,82 @@ pub const Index = struct {
             reverse_pattern -= 1;
             last[reverse_pattern] = reverse_col;
         }
+
+        var h = [_]i16{0} ** M;
+        var consecutive = [_]i16{0} ** M;
+        var in_gap = [_]bool{false} ** M;
+
+        const match_score: i16 = score_match;
+        const gap_start: i16 = score_gap_start;
+        const gap_extension: i16 = score_gap_extension;
+        const boundary: i16 = bonus_boundary;
+        const consecutive_bonus: i16 = bonus_consecutive;
+        const first_multiplier: i16 = bonus_first_char_multiplier;
+
+        var max_score: i16 = 0;
+        var j = first[0];
+        while (j <= last[M - 1]) : (j += 1) {
+            const char = text[j];
+            const raw_bonus: i16 = @intCast(bonus[j]);
+
+            inline for (1..M) |reverse_index| {
+                const i = M - reverse_index;
+                const row_end = if (i + 1 < M) last[i + 1] - 1 else last[i];
+                if (j >= first[i] and j <= row_end) {
+                    const left: i16 = if (j > first[i]) h[i] else 0;
+                    const gap_score: i16 = left + (if (in_gap[i]) gap_extension else gap_start);
+                    var match_value: i16 = -16_000;
+                    var run: i16 = 0;
+
+                    if (char == q.bytes[i]) {
+                        match_value = h[i - 1] + match_score;
+                        var b = raw_bonus;
+                        run = consecutive[i - 1] + 1;
+                        if (run > 1) {
+                            const run_start = j + 1 - @as(usize, @intCast(run));
+                            const first_bonus: i16 = @intCast(bonus[run_start]);
+                            if (b >= boundary and b > first_bonus) {
+                                run = 1;
+                            } else {
+                                b = @max(b, @max(consecutive_bonus, first_bonus));
+                            }
+                        }
+                        if (match_value + b < gap_score) {
+                            match_value += raw_bonus;
+                            run = 0;
+                        } else {
+                            match_value += b;
+                        }
+                    }
+
+                    consecutive[i] = run;
+                    in_gap[i] = match_value < gap_score;
+                    h[i] = @max(@max(match_value, gap_score), 0);
+                    if (i == M - 1) max_score = @max(max_score, h[i]);
+                }
+            }
+
+            if (j < last[1]) {
+                if (char == q.bytes[0]) {
+                    h[0] = match_score + raw_bonus * first_multiplier;
+                    consecutive[0] = 1;
+                    in_gap[0] = false;
+                } else {
+                    h[0] = @max(h[0] + (if (in_gap[0]) gap_extension else gap_start), 0);
+                    consecutive[0] = 0;
+                    in_gap[0] = true;
+                }
+            }
+        }
+
+        return @intCast(max_score);
+    }
+
+    fn scoreV2SmallPreparedFromFirst(self: *Index, comptime M: usize, q: *const Query, entry: Entry) i32 {
+        const text = self.candidateLower(entry);
+        const bonus = self.candidateBonuses(entry);
+        const first = self.position_scratch[0..M];
+        const last = self.last_position_scratch[0..M];
 
         var h = [_]i16{0} ** M;
         var consecutive = [_]i16{0} ** M;
@@ -1609,6 +1690,36 @@ test "ported V1 and V2 match fzf scoring vectors" {
         const entry = index.entries[0];
         try std.testing.expectEqual(case.expected, index.scoreV1(&q, entry).?);
         try std.testing.expectEqual(case.expected, index.scoreV2(&q, entry).?);
+    }
+}
+
+test "prepared six-byte V2 kernel matches ordinary small kernel" {
+    const values = [_][]const u8{
+        "alpha-beta-gamma-delta",
+        "FrameBufferManagerAndRenderer",
+        "src/fuzzy_backend_search.zig",
+        "one_two_three_four_five_six",
+        "abcdefabcdefabcdef",
+    };
+    const queries = [_][]const u8{ "abgade", "fbmare", "fbsrch", "ottffs", "aceace" };
+
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+
+    for (queries) |text| {
+        const q = index.compileQuery(text);
+        try std.testing.expectEqual(@as(usize, 6), q.bytes.len);
+        for (index.entries, 0..) |entry, i| {
+            if (!index.subsequence(&q, entry)) continue;
+            const ordinary = index.scoreV2SmallFromFirst(6, &q, entry, index.indexedLastPosition(entry, i, q.classes[5]));
+
+            try std.testing.expect(index.subsequence(&q, entry));
+            index.prepareLastPositions(&q, entry, i);
+            const ceiling = index.gapAwareUpperPrepared(&q, index.bonus_caps[i]);
+            const prepared = index.scoreV2SmallPreparedFromFirst(6, &q, entry);
+            try std.testing.expect(prepared <= ceiling);
+            try std.testing.expectEqual(ordinary, prepared);
+        }
     }
 }
 
