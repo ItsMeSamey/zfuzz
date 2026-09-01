@@ -1035,7 +1035,10 @@ pub const Index = struct {
             reverse_pattern = M - 1;
             reverse_col = position;
         }
-        while (reverse_pattern != 0) {
+        // last[0] is never consumed by the small DP: row zero is bounded by
+        // last[1]. Stop once that bound is known instead of scanning farther
+        // backward just to materialize an unused position.
+        while (reverse_pattern != 1) {
             reverse_col -= 1;
             if (text[reverse_col] != q.bytes[reverse_pattern - 1]) continue;
             reverse_pattern -= 1;
