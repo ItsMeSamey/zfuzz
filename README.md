@@ -1,7 +1,7 @@
 # Zig Fuzz
 
 This Zig module functions for fuzzy string matching, comparison, and flexible sorting of strings.
-Works with zig `0.14.0`, `0.14.1` and `0.15.1`.
+Requires Zig `0.16.0`.
 
 ## Features
 
@@ -45,7 +45,7 @@ const std = @import("std");
 const fuzzy = @import("fuzzy");
 
 pub fn main() !void {
-  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+  var gpa: std.heap.DebugAllocator(.{}) = .init;
   defer _ = gpa.deinit();
   const allocator = gpa.allocator();
 

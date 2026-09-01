@@ -1,6 +1,6 @@
 const std = @import("std");
 
-fn Int(array: anytype) std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(array))) {
+fn Int(array: anytype) @Int(.unsigned, @bitSizeOf(@TypeOf(array))) {
   return @bitCast(array);
 }
 
@@ -9,7 +9,7 @@ pub const CommonAll = struct {common: usize, a: usize, b: usize};
 pub fn GetNGramExistence(n: comptime_int, static: bool, count_total: bool) type {
   const total_count = std.math.pow(usize, 256, n);
   return struct {
-    set: if (static) std.bit_set.StaticBitSet(total_count) else std.hash_map.AutoHashMapUnmanaged([n]u8, void) = if (static) .initEmpty() else .{},
+    set: if (static) std.bit_set.StaticBitSet(total_count) else std.hash_map.AutoHashMapUnmanaged([n]u8, void) = .empty,
     _total: if (static and count_total) usize else void = if (static and count_total) 0 else {},
 
     pub fn count(self: *@This()) usize {
@@ -95,7 +95,7 @@ pub fn GetNGramExistence(n: comptime_int, static: bool, count_total: bool) type 
     /// Clears the set
     pub fn clear(self: *@This()) void {
       switch (static) {
-        true => self.set = .initEmpty(),
+        true => self.set = .empty,
         false => self.set.clearRetainingCapacity(),
       }
     }
@@ -131,7 +131,7 @@ test GetNGramExistence {
 pub fn GetNGramFrequency(I: type, n: comptime_int, static: bool, count_total: bool) type {
   const total_count = std.math.pow(usize, 256, n);
   return struct {
-    set: if (static) [total_count]I else std.hash_map.AutoHashMapUnmanaged([n]u8, I) = if (static) .{0} ** total_count else .{},
+    set: if (static) [total_count]I else std.hash_map.AutoHashMapUnmanaged([n]u8, I) = if (static) .{0} ** total_count else .empty,
     _total: if (static and count_total) usize else void = if (static and count_total) 0 else {},
 
     pub fn count(self: *@This()) usize {

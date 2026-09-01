@@ -1,172 +1,255 @@
 const std = @import("std");
 
-/// A helper function for FrequencyDistance
-fn diff(comptime T: type, a: anytype, b: @TypeOf(a)) T {
-  const result = if (a > b) a - b else b - a;
-  if (@typeInfo(T) == .float) return @floatFromInt(result);
-  return @intCast(result);
+fn lowerBound(comptime I: type, values: []const I, needle: I) usize {
+  var low: usize = 0;
+  var high: usize = values.len;
+
+  while (low < high) {
+    const mid = low + (high - low) / 2;
+    if (values[mid] < needle) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+
+  return low;
 }
 
-/// A dissimilarity measure that calculates a "Frequency Distance" between two strings.
-/// It attempts to quantify how "far apart" characters and their positions are across strings,
-/// especially when character frequencies differ.
+fn absSigned(value: i128) i128 {
+  return if (value < 0) -value else value;
+}
+
+fn absDiff(comptime I: type, a: I, b: I) i128 {
+  return absSigned(@as(i128, @intCast(a)) - @as(i128, @intCast(b)));
+}
+
+fn asFloat(comptime F: type, value: anytype) F {
+  return @floatFromInt(value);
+}
+
+/// Exact Zig port of go_fuzzy/heuristics/algorithms.FrequencyDistance.
 ///
-/// C=256 (alphabet size)
+/// This intentionally preserves the Go implementation's matching window,
+/// normalization, edge cases, and search behavior, including cases where the
+/// returned distance is greater than 1 (for example, a non-empty string versus
+/// an empty string).
+///
+/// C = 256 (byte alphabet size)
 /// Time complexity: O(a + b + C * log2(max(a, b)))
 /// Space complexity: O(a + b + C)
+///
+/// `I` is the integer type used to store byte positions. Both input lengths
+/// must fit in `I`.
 pub fn FrequencyDistance(comptime I: type, comptime F: type, a_: []const u8, b_: []const u8, allocator: std.mem.Allocator) std.mem.Allocator.Error!F {
-  @setEvalBranchQuota(10_000);
   var a = a_;
   var b = b_;
 
+  // Match Go: recurse with the longer string as a. Swapping is equivalent and
+  // avoids another function call.
   if (a.len < b.len) {
     a = b_;
     b = a_;
   }
 
-  if (b.len == 0) return @as(F, @floatFromInt(a.len));
-  if (a.len == 1) return if (a[0] == b[0]) 0.0 else 1.0;
+  if (b.len == 0) return asFloat(F, a.len);
+  if (a.len == 1) return if (a[0] == b[0]) 0 else 1;
 
-  // Initialize frequency maps to store indices of character occurrences.
-  var fa_array: [256]std.ArrayListUnmanaged(I) = [_]std.ArrayListUnmanaged(I){.{}} ** 256;
-  var fb_array: [256]std.ArrayListUnmanaged(I) = [_]std.ArrayListUnmanaged(I){.{}} ** 256;
+  // Go uses [256][]uint32 and appends positions while scanning each string.
+  // Store those same sorted position lists in two flat allocations instead of
+  // performing up to 512 small allocations.
+  var a_counts = [_]usize{0} ** 256;
+  var b_counts = [_]usize{0} ** 256;
+  for (a) |c| a_counts[c] += 1;
+  for (b) |c| b_counts[c] += 1;
 
-  defer {
-    inline for (0..256) |i| {
-      fa_array[i].deinit(allocator);
-      fb_array[i].deinit(allocator);
-    }
+  var a_offsets: [256]usize = undefined;
+  var b_offsets: [256]usize = undefined;
+  var a_cursor: usize = 0;
+  var b_cursor: usize = 0;
+  for (0..256) |c| {
+    a_offsets[c] = a_cursor;
+    b_offsets[c] = b_cursor;
+    a_cursor += a_counts[c];
+    b_cursor += b_counts[c];
   }
 
-  for (0..a.len) |i| try fa_array[a[i]].append(allocator, @intCast(i));
-  for (0..b.len) |i| try fb_array[b[i]].append(allocator, @intCast(i));
+  const positions = try allocator.alloc(I, a.len + b.len);
+  defer allocator.free(positions);
 
-  var distance_no_div: F = 0.0;
-  var distance: F = 0.0;
-  const norm_factor_inner: F = @floatFromInt(b.len - 1);
+  const a_positions = positions[0..a.len];
+  const b_positions = positions[a.len..];
 
-  const lessThanFn = struct {
-    fn inner(v_a: I, v_b: I) bool {
-      return v_a < v_b;
+  var a_write = a_offsets;
+  var b_write = b_offsets;
+  for (a, 0..) |c, i| {
+    a_positions[a_write[c]] = @intCast(i);
+    a_write[c] += 1;
+  }
+  for (b, 0..) |c, i| {
+    b_positions[b_write[c]] = @intCast(i);
+    b_write[c] += 1;
+  }
+
+  const norm: F = asFloat(F, a.len - 1);
+  var distance: F = 0;
+
+  for (0..256) |c| {
+    var ia = a_positions[a_offsets[c] .. a_offsets[c] + a_counts[c]];
+    var ib = b_positions[b_offsets[c] .. b_offsets[c] + b_counts[c]];
+
+    if (ia.len == ib.len) {
+      for (ia, ib) |pa, pb| {
+        distance += asFloat(F, absDiff(I, pa, pb)) / norm;
+      }
+      continue;
     }
-  }.inner;
-
-  inline for (0..256) |char_code| {
-    var ia = fa_array[char_code].items;
-    var ib = fb_array[char_code].items;
 
     if (ia.len < ib.len) {
-      ia = fb_array[char_code].items;
-      ib = fa_array[char_code].items;
+      const tmp = ia;
+      ia = ib;
+      ib = tmp;
     }
 
-    // If character counts are the same, sum absolute differences of corresponding indices
-    if (ia.len == ib.len) {
-      for (0..ia.len) |j| distance += diff(F, ia[j], ib[j]);
-    } else if (ib.len == 0) { // character counts are different
-      // All are unmatched
-      distance_no_div += @floatFromInt(ia.len);
-    } else if (ib.len == 1) { // Special matching for 1 occurrence
-      if (ia.len == 1) {
-        distance += diff(F, ia[0], ib[0]);
-      } else {
-        distance_no_div += @floatFromInt(ia.len - 1);
+    if (ib.len == 0) {
+      distance += asFloat(F, ia.len);
+      continue;
+    }
 
-        var idx = std.sort.partitionPoint(I, ia, ib[0], lessThanFn);
-        if (idx == ia.len) {
-          idx = ia.len - 1;
-        } else if (idx == 0) {
-          idx = 1;
-        }
-        
-        // Compare with element at idx and idx-1 (for closest match)
-        distance += @floatFromInt(@min(diff(I, ia[idx], ib[0]), diff(I, ia[idx-1], ib[0])));
+    if (ib.len == 1) {
+      distance += asFloat(F, ia.len - 1);
+      const idx = lowerBound(I, ia, ib[0]);
+
+      if (idx == ia.len or idx == ia.len - 1) {
+        distance += asFloat(F, absDiff(I, ia[ia.len - 1], ib[0])) / norm;
+      } else {
+        // This is intentionally idx/idx+1, matching the Go implementation.
+        distance += asFloat(F, @min(
+          absDiff(I, ia[idx], ib[0]),
+          absDiff(I, ia[idx + 1], ib[0]),
+        )) / norm;
       }
+      continue;
+    }
+
+    distance += asFloat(F, ia.len - ib.len);
+    var start = lowerBound(I, ia, ib[0]);
+    var end = lowerBound(I, ia, ib[ib.len - 1]);
+
+    var c_start: i128 = 0;
+    var c_end: i128 = 0;
+    if (end >= ia.len - 1) {
+      end = ia.len - 1;
+      start = end - ib.len;
+    } else if (start == 0) {
+      end = ib.len;
     } else {
-      distance_no_div += @as(F, @floatFromInt(ia.len - ib.len));
+      c_start = @min(
+        absDiff(I, ia[start], ib[0]),
+        absDiff(I, ia[start + 1], ib[0]),
+      );
+      c_end = @min(
+        absDiff(I, ia[end], ib[ib.len - 1]),
+        absDiff(I, ia[end + 1], ib[ib.len - 1]),
+      );
+    }
 
-      var start_idx = std.sort.partitionPoint(I, ia, ib[0], lessThanFn);
-      var end_idx = std.sort.partitionPoint(I, ia[start_idx..], ib[ib.len - 1], lessThanFn) + start_idx;
-
-      if (end_idx == ia.len) {
-        end_idx = ia.len - 1;
-      }
-      if (start_idx > end_idx) {
-        start_idx = end_idx;
-      }
-
-      const mid = start_idx + (end_idx - start_idx) / 2;
-      const is_start_longer: I = if (mid - start_idx > end_idx - mid) 1 else 0;
-      if (mid < ib.len/2 + is_start_longer) {
-        start_idx = 0;
-        end_idx = ib.len - 1;
-      } else if (mid + (ib.len/2 + (1^is_start_longer)) >= ia.len) {
-        end_idx = ia.len - 1;
-        start_idx = ia.len - ib.len;
+    while (end - start < ib.len) {
+      if (c_start > c_end) {
+        end += 1;
+        if (end == ia.len - 1) {
+          start = end - ib.len;
+          break;
+        }
+        c_end = @min(
+          absDiff(I, ia[end], ib[ib.len - 1]),
+          absDiff(I, ia[end + 1], ib[ib.len - 1]),
+        );
       } else {
-        start_idx = mid - (ib.len/2 + is_start_longer);
-        end_idx = mid + (ib.len/2 + (1^is_start_longer));
-      }
-
-      ia = ia[start_idx..end_idx];
-
-      const c_start = diff(I, ia[0], ib[0]);
-      const c_end = diff(I, ia[ia.len - 1], ib[ib.len - 1]);
-      distance += 2 * @as(F, @floatFromInt(@min(c_start, c_end)));
-
-      for (1..ib.len - 1) |i| {
-        const dis = diff(I, ia[i], ib[i]);
-        distance += @floatFromInt(@min(@min(diff(I, dis, c_start), diff(I, dis, c_end)), dis));
+        start -= 1;
+        if (start == 0) {
+          end = ib.len;
+          break;
+        }
+        c_start = @min(
+          absDiff(I, ia[start], ib[0]),
+          absDiff(I, ia[start + 1], ib[0]),
+        );
       }
     }
+
+    c_start = absDiff(I, ia[start], ib[0]);
+    c_end = absDiff(I, ia[end], ib[ib.len - 1]);
+
+    var partial_distance: F = 0;
+    var j: usize = 1;
+    while (j < ib.len - 1) : (j += 1) {
+      const position_delta = @as(i128, @intCast(ia[start + j])) - @as(i128, @intCast(ib[j]));
+      partial_distance += asFloat(F, @min(
+        absSigned(position_delta - c_start),
+        absSigned(position_delta - c_end),
+      ));
+    }
+    partial_distance += asFloat(F, c_start + c_end);
+    distance += partial_distance / norm;
   }
 
-  const result = (distance_no_div + distance / norm_factor_inner) / @as(F, @floatFromInt(a.len + b.len));
-  std.debug.assert(result >= 0.0 and result <= 1.0);
-  return result;
+  return distance / asFloat(F, a.len + b.len);
 }
 
-test FrequencyDistance {
-  const TestCase = struct {
-    a: []const u8,
-    b: []const u8,
+const ParityCase = struct {
+  a: []const u8,
+  b: []const u8,
+  distance: f64,
+};
+
+test "FrequencyDistance matches Go implementation" {
+  // Expected values are generated by go_fuzzy/heuristics/algorithms.FrequencyDistance[float64].
+  const cases = [_]ParityCase{
+    .{ .a = "", .b = "", .distance = 0.0 },
+    .{ .a = "a", .b = "", .distance = 1.0 },
+    .{ .a = "abc", .b = "", .distance = 3.0 },
+    .{ .a = "a", .b = "a", .distance = 0.0 },
+    .{ .a = "a", .b = "b", .distance = 1.0 },
+    .{ .a = "abb", .b = "bba", .distance = 0.33333333333333331 },
+    .{ .a = "abc", .b = "acb", .distance = 0.16666666666666666 },
+    .{ .a = "abc", .b = "bac", .distance = 0.16666666666666666 },
+    .{ .a = "aabb", .b = "abab", .distance = 0.083333333333333329 },
+    .{ .a = "aaaa", .b = "bbbb", .distance = 1.0 },
+    .{ .a = "abc", .b = "abcd", .distance = 0.14285714285714285 },
+    .{ .a = "abcd", .b = "abc", .distance = 0.14285714285714285 },
+    .{ .a = "apple", .b = "apxle", .distance = 0.20000000000000001 },
+    .{ .a = "apple", .b = "apxpl", .distance = 0.25 },
+    .{ .a = "apple", .b = "axple", .distance = 0.20000000000000001 },
+    .{ .a = "apple", .b = "bpple", .distance = 0.20000000000000001 },
+    .{ .a = "hello", .b = "world", .distance = 0.67500000000000004 },
+    .{ .a = "testing", .b = "test", .distance = 0.27272727272727271 },
+    .{ .a = "test", .b = "testing", .distance = 0.27272727272727271 },
+    .{ .a = "aaaaa", .b = "aaaba", .distance = 0.20000000000000001 },
+    .{ .a = "aaaba", .b = "aaaaa", .distance = 0.20000000000000001 },
+    .{ .a = "aaaaa", .b = "aabba", .distance = 0.42499999999999999 },
+    .{ .a = "aabba", .b = "aaaaa", .distance = 0.42499999999999999 },
+    .{ .a = "abcde", .b = "edcba", .distance = 0.29999999999999999 },
+    .{ .a = "microsoft", .b = "mitsubishi", .distance = 0.62573099415204669 },
+    .{ .a = "intention", .b = "execution", .distance = 0.4513888888888889 },
+    .{ .a = "aaaa", .b = "aaa", .distance = 0.19047619047619047 },
+    .{ .a = "aaa", .b = "aaaa", .distance = 0.19047619047619047 },
+    .{ .a = "cat", .b = "act", .distance = 0.16666666666666666 },
+    .{ .a = "dog", .b = "god", .distance = 0.33333333333333331 },
+    .{ .a = "listen", .b = "silent", .distance = 0.13333333333333333 },
   };
 
-  const test_cases = [_]TestCase{
-    .{ .a = "", .b = "" },
-    .{ .a = "a", .b = "a" },
-    .{ .a = "abb", .b = "bba" },
-    .{ .a = "abc", .b = "acb" },
-    .{ .a = "abc", .b = "bac" },
-    .{ .a = "aabb", .b = "abab" },
-    .{ .a = "aaaa", .b = "bbbb" },
-    .{ .a = "abc", .b = "abcd" },
-    .{ .a = "abcd", .b = "abc" },
-    .{ .a = "apple", .b = "apxle" },
-    .{ .a = "apple", .b = "apxpl" },
-    .{ .a = "apple", .b = "axple" },
-    .{ .a = "apple", .b = "bpple" },
-    .{ .a = "hello", .b = "world" },
-    .{ .a = "testing", .b = "test" },
-    .{ .a = "test", .b = "testing" },
-    .{ .a = "aaaaa", .b = "aaaba" },
-    .{ .a = "aaaba", .b = "aaaaa" },
-    .{ .a = "aaaaa", .b = "aabba" },
-    .{ .a = "aabba", .b = "aaaaa" },
-    .{ .a = "abcde", .b = "edcba" },
-    .{ .a = "microsoft", .b = "mitsubishi" },
-    .{ .a = "intention", .b = "execution" },
-    .{ .a = "aaaa", .b = "aaa" },
-    .{ .a = "aaa", .b = "aaaa" },
-    .{ .a = "cat", .b = "act" },
-    .{ .a = "dog", .b = "god" },
-    .{ .a = "listen", .b = "silent" },
-  };
-
-  inline for (test_cases) |tc| {
-    const value = try FrequencyDistance(u32, f32, tc.a, tc.b, std.testing.allocator);
-    try std.testing.expect(value >= 0);
-    try std.testing.expect(value <= 1);
+  for (cases) |case| {
+    const actual = try FrequencyDistance(u32, f64, case.a, case.b, std.testing.allocator);
+    try std.testing.expectApproxEqAbs(case.distance, actual, 1e-12);
   }
 }
 
+test "FrequencyDistance float32 matches Go operation order" {
+  const actual = try FrequencyDistance(u32, f32, "microsoft", "mitsubishi", std.testing.allocator);
+  try std.testing.expectApproxEqAbs(@as(f32, 0.625730991), actual, 1e-7);
+}
+
+test {
+  std.testing.refAllDeclsRecursive(@This());
+}

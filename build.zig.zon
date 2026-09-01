@@ -2,7 +2,7 @@
   .name = .fuzzy,
   .version = "0.1.1",
   .fingerprint = 0x29de903cd928751a,
-  .minimum_zig_version = "0.14.0",
+  .minimum_zig_version = "0.16.0",
   .paths = .{
     "build.zig",
     "build.zig.zon",

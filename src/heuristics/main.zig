@@ -211,7 +211,7 @@ pub fn WrapTrim(f: SimilarityMeasure, prefix_l: comptime_float, prefix_limit: co
         + @as(F, @floatFromInt(pre)) * prefix_l
       ) / @as(F, @floatFromInt(min_len_original));
     }
-  };
+  }.inner;
 }
 
 test {
