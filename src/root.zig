@@ -162,10 +162,10 @@ pub const Index = struct {
                 .len = value.len,
             };
 
-            var counts = [_]u8{0} ** signature_classes;
-            var bonus_categories = [_]u2{0} ** signature_classes;
+            var once: u64 = 0;
+            var twice: u64 = 0;
+            var caps: BonusCaps = .{ 0, 0 };
             var single_scores = [_]u8{0} ** exact_signature_classes;
-            var single_seen: u64 = 0;
             var previous: CharClass = .white;
 
             for (value, 0..) |c, i| {
@@ -178,12 +178,23 @@ pub const Index = struct {
                 previous = current;
 
                 const class: usize = @intCast(signatureClass(folded));
-                if (counts[class] < signature_levels) counts[class] += 1;
-                bonus_categories[class] = @max(bonus_categories[class], bonusCategory(raw_bonus));
+                const class_bit = @as(u64, 1) << @intCast(class);
+                if ((once & class_bit) == 0) {
+                    once |= class_bit;
+                } else {
+                    twice |= class_bit;
+                }
+
+                const cap_word = class / 32;
+                const cap_shift: u6 = @intCast((class & 31) * 2);
+                const category = bonusCategory(raw_bonus);
+                const old_category: u2 = @truncate(caps[cap_word] >> cap_shift);
+                if (category > old_category) {
+                    const mask = @as(u64, 3) << cap_shift;
+                    caps[cap_word] = (caps[cap_word] & ~mask) | (@as(u64, category) << cap_shift);
+                }
 
                 if (class < exact_signature_classes) {
-                    const bit = @as(u64, 1) << @intCast(class);
-                    single_seen |= bit;
                     // A raw bonus >= boundary settles scoreV2Single at this
                     // first strong occurrence. Before that, only the maximum
                     // weak occurrence matters.
@@ -196,7 +207,7 @@ pub const Index = struct {
                 }
             }
 
-            var remaining_single = single_seen;
+            var remaining_single = once & ((@as(u64, 1) << exact_signature_classes) - 1);
             while (remaining_single != 0) {
                 const class: usize = @intCast(@ctz(remaining_single));
                 remaining_single &= remaining_single - 1;
@@ -214,28 +225,27 @@ pub const Index = struct {
                 }
             }
 
-            var caps: BonusCaps = .{ 0, 0 };
-            for (bonus_categories, 0..) |category, class| {
-                const cap_word = class / 32;
-                const shift: u6 = @intCast((class & 31) * 2);
-                caps[cap_word] |= @as(u64, category) << shift;
-            }
             bonus_caps[row] = caps;
 
             if (words != 0) {
                 const word = row / 64;
                 const row_bit = @as(u64, 1) << @intCast(row & 63);
-                for (counts, 0..) |count, class| {
-                    if (count >= 1) {
-                        const plane = class;
-                        planes[plane * words + word] |= row_bit;
-                        plane_frequency[plane] += 1;
-                    }
-                    if (count >= 2) {
-                        const plane = signature_classes + class;
-                        planes[plane * words + word] |= row_bit;
-                        plane_frequency[plane] += 1;
-                    }
+
+                var remaining_once = once;
+                while (remaining_once != 0) {
+                    const class: usize = @intCast(@ctz(remaining_once));
+                    remaining_once &= remaining_once - 1;
+                    planes[class * words + word] |= row_bit;
+                    plane_frequency[class] += 1;
+                }
+
+                var remaining_twice = twice;
+                while (remaining_twice != 0) {
+                    const class: usize = @intCast(@ctz(remaining_twice));
+                    remaining_twice &= remaining_twice - 1;
+                    const plane = signature_classes + class;
+                    planes[plane * words + word] |= row_bit;
+                    plane_frequency[plane] += 1;
                 }
             }
 
