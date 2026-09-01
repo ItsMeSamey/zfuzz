@@ -622,7 +622,7 @@ pub const Index = struct {
                     self.prepareLastPositions(&q, entry, entry_index);
                     const tightened = self.gapAwareUpperPrepared(&q, self.bonus_caps[entry_index]);
                     if (tightened < self.stage[0].score) continue;
-                    score = self.scoreV2SmallPreparedFromFirst(6, &q, entry);
+                    score = self.scoreV2SixPreparedFromFirst(&q, entry);
                 } else if (q.bytes.len >= 7 and q.bytes.len <= 1000 and stage_len == top_k) {
                     self.prepareLastPositions(&q, entry, entry_index);
                     const tightened = self.gapAwareUpperPrepared(&q, self.bonus_caps[entry_index]);
@@ -1767,6 +1767,548 @@ pub const Index = struct {
         return @intCast(max_score);
     }
 
+    fn scoreV2SixFromFirst(self: *Index, q: *const Query, entry: Entry, last_hint: ?usize) i32 {
+        const text = self.candidateLower(entry);
+        const bonus = self.candidateBonuses(entry);
+        const first0 = self.position_scratch[0];
+        const first1 = self.position_scratch[1];
+        const first2 = self.position_scratch[2];
+        const first3 = self.position_scratch[3];
+        const first4 = self.position_scratch[4];
+        const first5 = self.position_scratch[5];
+
+        var last: [6]usize = undefined;
+        var reverse_pattern: usize = 6;
+        var reverse_col = text.len;
+        if (last_hint) |position| {
+            last[5] = position;
+            reverse_pattern = 5;
+            reverse_col = position;
+        }
+        while (reverse_pattern != 1) {
+            reverse_col -= 1;
+            if (text[reverse_col] != q.bytes[reverse_pattern - 1]) continue;
+            reverse_pattern -= 1;
+            last[reverse_pattern] = reverse_col;
+        }
+        const last1 = last[1];
+        const last2 = last[2];
+        const last3 = last[3];
+        const last4 = last[4];
+        const last5 = last[5];
+
+        const p0 = q.bytes[0];
+        const p1 = q.bytes[1];
+        const p2 = q.bytes[2];
+        const p3 = q.bytes[3];
+        const p4 = q.bytes[4];
+        const p5 = q.bytes[5];
+
+        var h0: i16 = 0;
+        var h1: i16 = 0;
+        var h2: i16 = 0;
+        var h3: i16 = 0;
+        var h4: i16 = 0;
+        var h5: i16 = 0;
+        var c0: i16 = 0;
+        var c1: i16 = 0;
+        var c2: i16 = 0;
+        var c3: i16 = 0;
+        var c4: i16 = 0;
+        var c5: i16 = 0;
+        var gap0 = false;
+        var gap1 = false;
+        var gap2 = false;
+        var gap3 = false;
+        var gap4 = false;
+        var gap5 = false;
+
+        var j = first0;
+        while (j < first1) : (j += 1) {
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2FirstState(text[j], p0, raw, &h0, &c0, &gap0);
+        }
+
+        // Activate row 1 before lower rows at the same text column.
+        {
+            const ch = text[first1];
+            const raw: i16 = @intCast(bonus[first1]);
+            advanceV2RowState(ch, p1, raw, bonus, first1, h0, c0, &h1, &c1, &gap1);
+            if (first1 < last1) advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+
+        j = first1 + 1;
+        const phase1_0_end = @min(first2, last1);
+        while (j < phase1_0_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+            advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+        while (j < first2) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+        }
+
+        // Activate row 2 before lower rows at the same text column.
+        {
+            const ch = text[first2];
+            const raw: i16 = @intCast(bonus[first2]);
+            advanceV2RowState(ch, p2, raw, bonus, first2, h1, c1, &h2, &c2, &gap2);
+            if (first2 < last2) advanceV2RowState(ch, p1, raw, bonus, first2, h0, c0, &h1, &c1, &gap1);
+            if (first2 < last1) advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+
+        j = first2 + 1;
+        const phase2_0_end = @min(first3, last1);
+        while (j < phase2_0_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+            advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+        const phase2_1_end = @min(first3, last2);
+        while (j < phase2_1_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+        }
+        while (j < first3) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+        }
+
+        // Activate row 3 before lower rows at the same text column.
+        {
+            const ch = text[first3];
+            const raw: i16 = @intCast(bonus[first3]);
+            advanceV2RowState(ch, p3, raw, bonus, first3, h2, c2, &h3, &c3, &gap3);
+            if (first3 < last3) advanceV2RowState(ch, p2, raw, bonus, first3, h1, c1, &h2, &c2, &gap2);
+            if (first3 < last2) advanceV2RowState(ch, p1, raw, bonus, first3, h0, c0, &h1, &c1, &gap1);
+            if (first3 < last1) advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+
+        j = first3 + 1;
+        const phase3_0_end = @min(first4, last1);
+        while (j < phase3_0_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+            advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+        const phase3_1_end = @min(first4, last2);
+        while (j < phase3_1_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+        }
+        const phase3_2_end = @min(first4, last3);
+        while (j < phase3_2_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+        }
+        while (j < first4) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+        }
+
+        // Activate row 4 before lower rows at the same text column.
+        {
+            const ch = text[first4];
+            const raw: i16 = @intCast(bonus[first4]);
+            advanceV2RowState(ch, p4, raw, bonus, first4, h3, c3, &h4, &c4, &gap4);
+            if (first4 < last4) advanceV2RowState(ch, p3, raw, bonus, first4, h2, c2, &h3, &c3, &gap3);
+            if (first4 < last3) advanceV2RowState(ch, p2, raw, bonus, first4, h1, c1, &h2, &c2, &gap2);
+            if (first4 < last2) advanceV2RowState(ch, p1, raw, bonus, first4, h0, c0, &h1, &c1, &gap1);
+            if (first4 < last1) advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+
+        j = first4 + 1;
+        const phase4_0_end = @min(first5, last1);
+        while (j < phase4_0_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+            advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+        const phase4_1_end = @min(first5, last2);
+        while (j < phase4_1_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+        }
+        const phase4_2_end = @min(first5, last3);
+        while (j < phase4_2_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+        }
+        const phase4_3_end = @min(first5, last4);
+        while (j < phase4_3_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+        }
+        while (j < first5) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+        }
+
+        // Activate row 5 before lower rows at the same text column.
+        {
+            const ch = text[first5];
+            const raw: i16 = @intCast(bonus[first5]);
+            advanceV2RowState(ch, p5, raw, bonus, first5, h4, c4, &h5, &c5, &gap5);
+            if (first5 == last5) return @intCast(h5);
+            if (first5 < last5) advanceV2RowState(ch, p4, raw, bonus, first5, h3, c3, &h4, &c4, &gap4);
+            if (first5 < last4) advanceV2RowState(ch, p3, raw, bonus, first5, h2, c2, &h3, &c3, &gap3);
+            if (first5 < last3) advanceV2RowState(ch, p2, raw, bonus, first5, h1, c1, &h2, &c2, &gap2);
+            if (first5 < last2) advanceV2RowState(ch, p1, raw, bonus, first5, h0, c0, &h1, &c1, &gap1);
+            if (first5 < last1) advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+
+        var max_score = h5;
+        j = first5 + 1;
+        while (j < last1) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p5, raw, bonus, j, h4, c4, &h5, &c5, &gap5);
+            max_score = @max(max_score, h5);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+            advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+        while (j < last2) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p5, raw, bonus, j, h4, c4, &h5, &c5, &gap5);
+            max_score = @max(max_score, h5);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+        }
+        while (j < last3) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p5, raw, bonus, j, h4, c4, &h5, &c5, &gap5);
+            max_score = @max(max_score, h5);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+        }
+        while (j < last4) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p5, raw, bonus, j, h4, c4, &h5, &c5, &gap5);
+            max_score = @max(max_score, h5);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+        }
+        while (j < last5) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p5, raw, bonus, j, h4, c4, &h5, &c5, &gap5);
+            max_score = @max(max_score, h5);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+        }
+        {
+            const j_final = last5;
+            const ch = text[j_final];
+            const raw: i16 = @intCast(bonus[j_final]);
+            advanceV2RowState(ch, p5, raw, bonus, j_final, h4, c4, &h5, &c5, &gap5);
+            max_score = @max(max_score, h5);
+        }
+        return @intCast(max_score);
+    }
+
+    fn scoreV2SixPreparedFromFirst(self: *Index, q: *const Query, entry: Entry) i32 {
+        const text = self.candidateLower(entry);
+        const bonus = self.candidateBonuses(entry);
+        const first0 = self.position_scratch[0];
+        const first1 = self.position_scratch[1];
+        const first2 = self.position_scratch[2];
+        const first3 = self.position_scratch[3];
+        const first4 = self.position_scratch[4];
+        const first5 = self.position_scratch[5];
+
+        const last1 = self.last_position_scratch[1];
+        const last2 = self.last_position_scratch[2];
+        const last3 = self.last_position_scratch[3];
+        const last4 = self.last_position_scratch[4];
+        const last5 = self.last_position_scratch[5];
+
+        const p0 = q.bytes[0];
+        const p1 = q.bytes[1];
+        const p2 = q.bytes[2];
+        const p3 = q.bytes[3];
+        const p4 = q.bytes[4];
+        const p5 = q.bytes[5];
+
+        var h0: i16 = 0;
+        var h1: i16 = 0;
+        var h2: i16 = 0;
+        var h3: i16 = 0;
+        var h4: i16 = 0;
+        var h5: i16 = 0;
+        var c0: i16 = 0;
+        var c1: i16 = 0;
+        var c2: i16 = 0;
+        var c3: i16 = 0;
+        var c4: i16 = 0;
+        var c5: i16 = 0;
+        var gap0 = false;
+        var gap1 = false;
+        var gap2 = false;
+        var gap3 = false;
+        var gap4 = false;
+        var gap5 = false;
+
+        var j = first0;
+        while (j < first1) : (j += 1) {
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2FirstState(text[j], p0, raw, &h0, &c0, &gap0);
+        }
+
+        // Activate row 1 before lower rows at the same text column.
+        {
+            const ch = text[first1];
+            const raw: i16 = @intCast(bonus[first1]);
+            advanceV2RowState(ch, p1, raw, bonus, first1, h0, c0, &h1, &c1, &gap1);
+            if (first1 < last1) advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+
+        j = first1 + 1;
+        const phase1_0_end = @min(first2, last1);
+        while (j < phase1_0_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+            advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+        while (j < first2) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+        }
+
+        // Activate row 2 before lower rows at the same text column.
+        {
+            const ch = text[first2];
+            const raw: i16 = @intCast(bonus[first2]);
+            advanceV2RowState(ch, p2, raw, bonus, first2, h1, c1, &h2, &c2, &gap2);
+            if (first2 < last2) advanceV2RowState(ch, p1, raw, bonus, first2, h0, c0, &h1, &c1, &gap1);
+            if (first2 < last1) advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+
+        j = first2 + 1;
+        const phase2_0_end = @min(first3, last1);
+        while (j < phase2_0_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+            advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+        const phase2_1_end = @min(first3, last2);
+        while (j < phase2_1_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+        }
+        while (j < first3) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+        }
+
+        // Activate row 3 before lower rows at the same text column.
+        {
+            const ch = text[first3];
+            const raw: i16 = @intCast(bonus[first3]);
+            advanceV2RowState(ch, p3, raw, bonus, first3, h2, c2, &h3, &c3, &gap3);
+            if (first3 < last3) advanceV2RowState(ch, p2, raw, bonus, first3, h1, c1, &h2, &c2, &gap2);
+            if (first3 < last2) advanceV2RowState(ch, p1, raw, bonus, first3, h0, c0, &h1, &c1, &gap1);
+            if (first3 < last1) advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+
+        j = first3 + 1;
+        const phase3_0_end = @min(first4, last1);
+        while (j < phase3_0_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+            advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+        const phase3_1_end = @min(first4, last2);
+        while (j < phase3_1_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+        }
+        const phase3_2_end = @min(first4, last3);
+        while (j < phase3_2_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+        }
+        while (j < first4) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+        }
+
+        // Activate row 4 before lower rows at the same text column.
+        {
+            const ch = text[first4];
+            const raw: i16 = @intCast(bonus[first4]);
+            advanceV2RowState(ch, p4, raw, bonus, first4, h3, c3, &h4, &c4, &gap4);
+            if (first4 < last4) advanceV2RowState(ch, p3, raw, bonus, first4, h2, c2, &h3, &c3, &gap3);
+            if (first4 < last3) advanceV2RowState(ch, p2, raw, bonus, first4, h1, c1, &h2, &c2, &gap2);
+            if (first4 < last2) advanceV2RowState(ch, p1, raw, bonus, first4, h0, c0, &h1, &c1, &gap1);
+            if (first4 < last1) advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+
+        j = first4 + 1;
+        const phase4_0_end = @min(first5, last1);
+        while (j < phase4_0_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+            advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+        const phase4_1_end = @min(first5, last2);
+        while (j < phase4_1_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+        }
+        const phase4_2_end = @min(first5, last3);
+        while (j < phase4_2_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+        }
+        const phase4_3_end = @min(first5, last4);
+        while (j < phase4_3_end) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+        }
+        while (j < first5) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+        }
+
+        // Activate row 5 before lower rows at the same text column.
+        {
+            const ch = text[first5];
+            const raw: i16 = @intCast(bonus[first5]);
+            advanceV2RowState(ch, p5, raw, bonus, first5, h4, c4, &h5, &c5, &gap5);
+            if (first5 == last5) return @intCast(h5);
+            if (first5 < last5) advanceV2RowState(ch, p4, raw, bonus, first5, h3, c3, &h4, &c4, &gap4);
+            if (first5 < last4) advanceV2RowState(ch, p3, raw, bonus, first5, h2, c2, &h3, &c3, &gap3);
+            if (first5 < last3) advanceV2RowState(ch, p2, raw, bonus, first5, h1, c1, &h2, &c2, &gap2);
+            if (first5 < last2) advanceV2RowState(ch, p1, raw, bonus, first5, h0, c0, &h1, &c1, &gap1);
+            if (first5 < last1) advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+
+        var max_score = h5;
+        j = first5 + 1;
+        while (j < last1) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p5, raw, bonus, j, h4, c4, &h5, &c5, &gap5);
+            max_score = @max(max_score, h5);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+            advanceV2FirstState(ch, p0, raw, &h0, &c0, &gap0);
+        }
+        while (j < last2) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p5, raw, bonus, j, h4, c4, &h5, &c5, &gap5);
+            max_score = @max(max_score, h5);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+            advanceV2RowState(ch, p1, raw, bonus, j, h0, c0, &h1, &c1, &gap1);
+        }
+        while (j < last3) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p5, raw, bonus, j, h4, c4, &h5, &c5, &gap5);
+            max_score = @max(max_score, h5);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+            advanceV2RowState(ch, p2, raw, bonus, j, h1, c1, &h2, &c2, &gap2);
+        }
+        while (j < last4) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p5, raw, bonus, j, h4, c4, &h5, &c5, &gap5);
+            max_score = @max(max_score, h5);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+            advanceV2RowState(ch, p3, raw, bonus, j, h2, c2, &h3, &c3, &gap3);
+        }
+        while (j < last5) : (j += 1) {
+            const ch = text[j];
+            const raw: i16 = @intCast(bonus[j]);
+            advanceV2RowState(ch, p5, raw, bonus, j, h4, c4, &h5, &c5, &gap5);
+            max_score = @max(max_score, h5);
+            advanceV2RowState(ch, p4, raw, bonus, j, h3, c3, &h4, &c4, &gap4);
+        }
+        {
+            const j_final = last5;
+            const ch = text[j_final];
+            const raw: i16 = @intCast(bonus[j_final]);
+            advanceV2RowState(ch, p5, raw, bonus, j_final, h4, c4, &h5, &c5, &gap5);
+            max_score = @max(max_score, h5);
+        }
+        return @intCast(max_score);
+    }
+
     /// Compile-time-unrolled score-only V2 kernel for the small-pattern cases
     /// where scalar row state is faster than candidate-sized DP buffers.
     fn scoreV2SmallFromFirst(self: *Index, comptime M: usize, q: *const Query, entry: Entry, last_hint: ?usize) i32 {
@@ -2103,7 +2645,7 @@ pub const Index = struct {
             3 => self.scoreV2ThreeFromFirst(q, entry, last_hint),
             4 => self.scoreV2FourFromFirst(q, entry, last_hint),
             5 => self.scoreV2FiveFromFirst(q, entry, last_hint),
-            6 => self.scoreV2SmallFromFirst(6, q, entry, last_hint),
+            6 => self.scoreV2SixFromFirst(q, entry, last_hint),
             else => self.scoreV2GeneralFromFirst(q, entry, last_hint, false),
         };
     }
@@ -2113,7 +2655,7 @@ pub const Index = struct {
             3 => self.scoreV2ThreeFromFirst(q, entry, null),
             4 => self.scoreV2FourFromFirst(q, entry, null),
             5 => self.scoreV2FiveFromFirst(q, entry, null),
-            6 => self.scoreV2SmallFromFirst(6, q, entry, null),
+            6 => self.scoreV2SixFromFirst(q, entry, null),
             else => self.scoreV2GeneralFromFirst(q, entry, null, false),
         };
     }
