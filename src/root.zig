@@ -879,76 +879,7 @@ pub const Index = struct {
         const first1 = self.position_scratch[1];
         const last_col = std.mem.findScalarLast(u8, text, q.bytes[1]).?;
 
-        const p0 = q.bytes[0];
-        const p1 = q.bytes[1];
-        const match_score: i16 = score_match;
-        const gap_start: i16 = score_gap_start;
-        const gap_extension: i16 = score_gap_extension;
-        const boundary: i16 = bonus_boundary;
-        const consecutive_bonus: i16 = bonus_consecutive;
-        const first_multiplier: i16 = bonus_first_char_multiplier;
-        var h0_prev: i16 = 0;
-        var c0_prev: i16 = 0;
-        var b_prev: i16 = 0;
-        var in_gap0 = false;
-
-        var h1_prev: i16 = 0;
-        var in_gap1 = false;
-        var max_score: i16 = 0;
-
-        var j = first0;
-        while (j <= last_col) : (j += 1) {
-            const c = text[j];
-
-            var h0_cur: i16 = undefined;
-            var c0_cur: i16 = 0;
-            if (c == p0) {
-                const raw_bonus: i16 = @intCast(bonus[j]);
-                h0_cur = match_score + raw_bonus * first_multiplier;
-                c0_cur = 1;
-                b_prev = raw_bonus;
-                in_gap0 = false;
-            } else {
-                h0_cur = @max(h0_prev + (if (in_gap0) gap_extension else gap_start), 0);
-                in_gap0 = true;
-            }
-
-            if (j >= first1) {
-                const left: i16 = if (j == first1) 0 else h1_prev;
-                const gap_score: i16 = left + (if (in_gap1) gap_extension else gap_start);
-                var match_value: i16 = 0;
-
-                if (c == p1 and j > first0) {
-                    const raw_bonus: i16 = @intCast(bonus[j]);
-                    match_value = h0_prev + match_score;
-                    var b = raw_bonus;
-                    const consecutive = c0_prev + 1;
-                    if (consecutive > 1) {
-                        if (b >= boundary and b > b_prev) {
-                            // Chunk is broken at the stronger boundary. The
-                            // consecutive count itself is not needed because
-                            // this is the final row.
-                        } else {
-                            b = @max(b, @max(consecutive_bonus, b_prev));
-                        }
-                    }
-                    if (match_value + b < gap_score) {
-                        match_value += raw_bonus;
-                    } else {
-                        match_value += b;
-                    }
-                }
-
-                in_gap1 = match_value < gap_score;
-                h1_prev = @max(@max(match_value, gap_score), 0);
-                max_score = @max(max_score, h1_prev);
-            }
-
-            h0_prev = h0_cur;
-            c0_prev = c0_cur;
-        }
-
-        return @intCast(max_score);
+        return self.scoreV2TwoWindow(q, text, bonus, first0, first1, last_col);
     }
 
     fn scoreV2TwoIndexed(self: *const Index, q: *const Query, entry: Entry, entry_index: usize) i32 {
@@ -968,6 +899,19 @@ pub const Index = struct {
             break :blk std.mem.findScalarLast(u8, text, q.bytes[1]).?;
         };
 
+        return self.scoreV2TwoWindow(q, text, bonus, first0, first1, last_col);
+    }
+
+    inline fn scoreV2TwoWindow(
+        self: *const Index,
+        q: *const Query,
+        text: []const u8,
+        bonus: []const u8,
+        first0: usize,
+        first1: usize,
+        last_col: usize,
+    ) i32 {
+        _ = self;
         const p0 = q.bytes[0];
         const p1 = q.bytes[1];
         const match_score: i16 = score_match;
@@ -976,19 +920,17 @@ pub const Index = struct {
         const boundary: i16 = bonus_boundary;
         const consecutive_bonus: i16 = bonus_consecutive;
         const first_multiplier: i16 = bonus_first_char_multiplier;
+
         var h0_prev: i16 = 0;
         var c0_prev: i16 = 0;
         var b_prev: i16 = 0;
         var in_gap0 = false;
 
-        var h1_prev: i16 = 0;
-        var in_gap1 = false;
-        var max_score: i16 = 0;
-
+        // Before first1, only row zero can contribute. Keep this separate so
+        // the main two-row loop has no first-column gating branch.
         var j = first0;
-        while (j <= last_col) : (j += 1) {
+        while (j < first1) : (j += 1) {
             const c = text[j];
-
             var h0_cur: i16 = undefined;
             var c0_cur: i16 = 0;
             if (c == p0) {
@@ -1001,43 +943,81 @@ pub const Index = struct {
                 h0_cur = @max(h0_prev + (if (in_gap0) gap_extension else gap_start), 0);
                 in_gap0 = true;
             }
+            h0_prev = h0_cur;
+            c0_prev = c0_cur;
+        }
 
-            if (j >= first1) {
-                const left: i16 = if (j == first1) 0 else h1_prev;
-                const gap_score: i16 = left + (if (in_gap1) gap_extension else gap_start);
+        // first1 is known to match p1 from the ordered-subsequence pass. Seed
+        // the final row once, then run the branch-free steady-state window.
+        {
+            const c = text[first1];
+            const raw_bonus: i16 = @intCast(bonus[first1]);
+            var h0_cur: i16 = undefined;
+            var c0_cur: i16 = 0;
+            if (c == p0) {
+                h0_cur = match_score + raw_bonus * first_multiplier;
+                c0_cur = 1;
+                b_prev = raw_bonus;
+                in_gap0 = false;
+            } else {
+                h0_cur = @max(h0_prev + (if (in_gap0) gap_extension else gap_start), 0);
+                in_gap0 = true;
+            }
+
+            var b = raw_bonus;
+            const consecutive = c0_prev + 1;
+            if (consecutive > 1 and !(b >= boundary and b > b_prev)) {
+                b = @max(b, @max(consecutive_bonus, b_prev));
+            }
+            var h1_prev = h0_prev + match_score + b;
+            var in_gap1 = false;
+            var max_score = h1_prev;
+
+            h0_prev = h0_cur;
+            c0_prev = c0_cur;
+
+            j = first1 + 1;
+            while (j <= last_col) : (j += 1) {
+                const ch = text[j];
+
+                h0_cur = undefined;
+                c0_cur = 0;
+                if (ch == p0) {
+                    const raw0: i16 = @intCast(bonus[j]);
+                    h0_cur = match_score + raw0 * first_multiplier;
+                    c0_cur = 1;
+                    b_prev = raw0;
+                    in_gap0 = false;
+                } else {
+                    h0_cur = @max(h0_prev + (if (in_gap0) gap_extension else gap_start), 0);
+                    in_gap0 = true;
+                }
+
+                const gap_score: i16 = h1_prev + (if (in_gap1) gap_extension else gap_start);
                 var match_value: i16 = 0;
-
-                if (c == p1 and j > first0) {
-                    const raw_bonus: i16 = @intCast(bonus[j]);
+                if (ch == p1) {
+                    const raw1: i16 = @intCast(bonus[j]);
                     match_value = h0_prev + match_score;
-                    var b = raw_bonus;
-                    const consecutive = c0_prev + 1;
-                    if (consecutive > 1) {
-                        if (b >= boundary and b > b_prev) {
-                            // Chunk is broken at the stronger boundary. The
-                            // consecutive count itself is not needed because
-                            // this is the final row.
-                        } else {
-                            b = @max(b, @max(consecutive_bonus, b_prev));
-                        }
+                    var match_bonus = raw1;
+                    const run = c0_prev + 1;
+                    if (run > 1 and !(match_bonus >= boundary and match_bonus > b_prev)) {
+                        match_bonus = @max(match_bonus, @max(consecutive_bonus, b_prev));
                     }
-                    if (match_value + b < gap_score) {
-                        match_value += raw_bonus;
+                    if (match_value + match_bonus < gap_score) {
+                        match_value += raw1;
                     } else {
-                        match_value += b;
+                        match_value += match_bonus;
                     }
                 }
 
                 in_gap1 = match_value < gap_score;
                 h1_prev = @max(@max(match_value, gap_score), 0);
                 max_score = @max(max_score, h1_prev);
+                h0_prev = h0_cur;
+                c0_prev = c0_cur;
             }
-
-            h0_prev = h0_cur;
-            c0_prev = c0_cur;
+            return @intCast(max_score);
         }
-
-        return @intCast(max_score);
     }
 
     /// Compile-time-unrolled score-only V2 kernel for the small-pattern cases
