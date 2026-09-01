@@ -5,6 +5,7 @@ const signature_levels = 2;
 const signature_planes = signature_classes * signature_levels;
 const last_slots = 24;
 const exact_signature_classes = 56;
+const single_cache_limit = 64;
 
 const score_match: i32 = 16;
 const score_gap_start: i32 = -3;
@@ -62,6 +63,8 @@ pub const Index = struct {
     bonus_caps: []BonusCaps,
     last_positions: []u16,
     last_slot_for_class: [exact_signature_classes]u8,
+    single_top: []usize,
+    single_top_len: [exact_signature_classes]u8,
 
     words: usize,
     planes: []u64,
@@ -103,6 +106,10 @@ pub const Index = struct {
 
         const bonus_caps = try allocator.alloc(BonusCaps, values.len);
         errdefer allocator.free(bonus_caps);
+
+        const single_stage = try allocator.alloc(StageMatch, exact_signature_classes * single_cache_limit);
+        defer allocator.free(single_stage);
+        var single_top_len = [_]u8{0} ** exact_signature_classes;
 
         const words = (values.len + 63) / 64;
         const planes = try allocator.alloc(u64, signature_planes * words);
@@ -157,6 +164,8 @@ pub const Index = struct {
 
             var counts = [_]u8{0} ** signature_classes;
             var bonus_categories = [_]u2{0} ** signature_classes;
+            var single_scores = [_]u8{0} ** exact_signature_classes;
+            var single_seen: u64 = 0;
             var previous: CharClass = .white;
 
             for (value, 0..) |c, i| {
@@ -171,6 +180,38 @@ pub const Index = struct {
                 const class: usize = @intCast(signatureClass(folded));
                 if (counts[class] < signature_levels) counts[class] += 1;
                 bonus_categories[class] = @max(bonus_categories[class], bonusCategory(raw_bonus));
+
+                if (class < exact_signature_classes) {
+                    const bit = @as(u64, 1) << @intCast(class);
+                    single_seen |= bit;
+                    // A raw bonus >= boundary settles scoreV2Single at this
+                    // first strong occurrence. Before that, only the maximum
+                    // weak occurrence matters.
+                    if (single_scores[class] < score_match + bonus_boundary * bonus_first_char_multiplier) {
+                        const one_score: u8 = @intCast(score_match + raw_bonus * bonus_first_char_multiplier);
+                        if (raw_bonus >= bonus_boundary or one_score > single_scores[class]) {
+                            single_scores[class] = one_score;
+                        }
+                    }
+                }
+            }
+
+            var remaining_single = single_seen;
+            while (remaining_single != 0) {
+                const class: usize = @intCast(@ctz(remaining_single));
+                remaining_single &= remaining_single - 1;
+                const segment = single_stage[class * single_cache_limit .. (class + 1) * single_cache_limit];
+                var segment_len: usize = single_top_len[class];
+                const item: StageMatch = .{ .entry = row, .score = single_scores[class] };
+                if (segment_len < single_cache_limit) {
+                    segment[segment_len] = item;
+                    stageBubbleWorst(entries, segment[0 .. segment_len + 1], segment_len);
+                    segment_len += 1;
+                    single_top_len[class] = @intCast(segment_len);
+                } else if (betterStage(entries, item, segment[0])) {
+                    segment[0] = item;
+                    stageSiftWorst(entries, segment, 0);
+                }
             }
 
             var caps: BonusCaps = .{ 0, 0 };
@@ -234,6 +275,16 @@ pub const Index = struct {
             }
         }
 
+        const single_top = try allocator.alloc(usize, exact_signature_classes * single_cache_limit);
+        errdefer allocator.free(single_top);
+        @memset(single_top, 0);
+        for (0..exact_signature_classes) |class| {
+            const len: usize = single_top_len[class];
+            const segment = single_stage[class * single_cache_limit .. class * single_cache_limit + len];
+            stageSortBestFirst(entries, segment);
+            for (segment, 0..) |item, i| single_top[class * single_cache_limit + i] = item.entry;
+        }
+
         return .{
             .allocator = allocator,
             .entries = entries,
@@ -242,6 +293,8 @@ pub const Index = struct {
             .bonus_caps = bonus_caps,
             .last_positions = last_positions,
             .last_slot_for_class = last_slot_for_class,
+            .single_top = single_top,
+            .single_top_len = single_top_len,
             .words = words,
             .planes = planes,
             .plane_frequency = plane_frequency,
@@ -276,6 +329,7 @@ pub const Index = struct {
         self.allocator.free(self.position_scratch);
         self.allocator.free(self.dp);
         self.allocator.free(self.planes);
+        self.allocator.free(self.single_top);
         self.allocator.free(self.last_positions);
         self.allocator.free(self.bonus_caps);
         self.allocator.free(self.bonuses);
@@ -359,6 +413,31 @@ pub const Index = struct {
 
         const top_k = @min(out.len, self.entries.len);
         try self.ensureStage(top_k);
+
+        if (q.bytes.len == 1 and top_k <= single_cache_limit) {
+            const class: usize = @intCast(signatureClass(q.bytes[0]));
+            if (class < exact_signature_classes) {
+                const cached_len: usize = self.single_top_len[class];
+                const result_len = @min(top_k, cached_len);
+                const cached = self.single_top[class * single_cache_limit .. class * single_cache_limit + result_len];
+                @memcpy(out[0..result_len], cached);
+
+                // For an exact signature class, its once-plane is exactly the
+                // complete one-byte subsequence survivor set. Preserve normal
+                // prefix-extension caching without scanning candidate text.
+                if (self.words != 0) {
+                    const plane = self.planes[class * self.words .. (class + 1) * self.words];
+                    @memcpy(self.survivors, plane);
+                    @memset(self.next_survivors, 0);
+                    @memset(self.seed_bits, 0);
+                }
+                self.previous_query[0] = q.bytes[0];
+                self.previous_query_len = 1;
+                self.previous_stage_len = result_len;
+                @memcpy(self.previous_stage[0..result_len], cached);
+                return out[0..result_len];
+            }
+        }
 
         @memset(self.next_survivors, 0);
         @memset(self.seed_bits, 0);
@@ -1362,6 +1441,75 @@ test "small V2 kernels match general DP" {
                 else => unreachable,
             };
             try std.testing.expectEqual(general, specialized);
+        }
+    }
+}
+
+test "V2 matches fzf long-pattern V1 fallback" {
+    const allocator = std.testing.allocator;
+    const candidate_unit = "ba_YyBAYXYBBAXbxxy";
+    const query_unit = "ybxx";
+    const repetitions = 300;
+
+    const candidate = try allocator.alloc(u8, candidate_unit.len * repetitions);
+    defer allocator.free(candidate);
+    const query = try allocator.alloc(u8, query_unit.len * repetitions);
+    defer allocator.free(query);
+    for (0..repetitions) |i| {
+        @memcpy(candidate[i * candidate_unit.len ..][0..candidate_unit.len], candidate_unit);
+        @memcpy(query[i * query_unit.len ..][0..query_unit.len], query_unit);
+    }
+
+    const values = [_][]const u8{candidate};
+    var index = try init(allocator, &values);
+    defer index.deinit();
+
+    const q = index.compileQuery(query);
+    const entry = index.entries[0];
+    const v1 = index.scoreV1(&q, entry).?;
+    const v2 = index.scoreV2(&q, entry).?;
+    try std.testing.expectEqual(@as(i32, 14_415), v1);
+    try std.testing.expectEqual(v1, v2);
+}
+
+test "single-byte cache matches exact V2 ranking" {
+    const values = [_][]const u8{
+        "alpha",
+        "Alpha",
+        "a/path",
+        "foo_bar",
+        "foo/bar",
+        "src/main.zig",
+        "1-alpha",
+        "@scope/pkg",
+        "{alpha}",
+        "zeta",
+        "beta-a",
+        "unrelated",
+    };
+    const queries = [_][]const u8{ "a", "1", "_", "/", "@", "}" };
+
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+
+    for (queries) |text| {
+        const q = index.compileQuery(text);
+        var exact: [values.len]StageMatch = undefined;
+        var exact_len: usize = 0;
+        for (index.entries, 0..) |entry, entry_index| {
+            const score = index.scoreV2(&q, entry) orelse continue;
+            exact[exact_len] = .{ .entry = entry_index, .score = score };
+            stageBubbleWorst(index.entries, exact[0 .. exact_len + 1], exact_len);
+            exact_len += 1;
+        }
+        stageSortBestFirst(index.entries, exact[0..exact_len]);
+
+        index.resetHistory();
+        var out: [values.len]usize = undefined;
+        const got = try index.search(text, &out);
+        try std.testing.expectEqual(exact_len, got.len);
+        for (got, exact[0..exact_len]) |entry_index, expected| {
+            try std.testing.expectEqual(expected.entry, entry_index);
         }
     }
 }
