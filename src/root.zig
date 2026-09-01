@@ -48,6 +48,11 @@ const StageMatch = struct {
     score: i32,
 };
 
+const IndexedPosition = struct {
+    first: u8,
+    last: u8,
+};
+
 const lower_lut: [256]u8 = blk: {
     var table: [256]u8 = undefined;
     for (0..256) |i| table[i] = lower(@intCast(i));
@@ -133,7 +138,7 @@ pub const Index = struct {
     lower_bytes: []u8,
     bonuses: []u8,
     bonus_caps: []BonusCaps,
-    last_positions: []u16,
+    last_positions: []IndexedPosition,
     last_slot_for_class: [exact_signature_classes]u8,
     single_top: []usize,
     single_top_len: [exact_signature_classes]u8,
@@ -167,6 +172,43 @@ pub const Index = struct {
             max_len = @max(max_len, value.len);
         }
 
+        var slot_frequency = [_]usize{0} ** exact_signature_classes;
+        const slot_sample_count = @min(values.len, 2048);
+        for (0..slot_sample_count) |sample_index| {
+            const value = values[sample_index * values.len / slot_sample_count];
+            var seen_exact: u64 = 0;
+            for (value) |c| {
+                const class: usize = @intCast(signature_lut[c]);
+                if (class < exact_signature_classes) seen_exact |= @as(u64, 1) << @intCast(class);
+            }
+            while (seen_exact != 0) {
+                const class: usize = @intCast(@ctz(seen_exact));
+                seen_exact &= seen_exact - 1;
+                slot_frequency[class] += 1;
+            }
+        }
+
+        var last_slot_for_class = [_]u8{0xff} ** exact_signature_classes;
+        var selected_count: usize = 0;
+        while (selected_count < last_slots) : (selected_count += 1) {
+            var best_class: usize = 0;
+            var best_frequency: usize = 0;
+            for (0..exact_signature_classes) |class| {
+                if (last_slot_for_class[class] != 0xff) continue;
+                const frequency = slot_frequency[class];
+                if (frequency > best_frequency) {
+                    best_frequency = frequency;
+                    best_class = class;
+                }
+            }
+            last_slot_for_class[best_class] = @intCast(selected_count);
+        }
+        var last_slot_for_byte = [_]u8{0xff} ** 256;
+        for (0..256) |byte_value| {
+            const class: usize = @intCast(signatureClass(@intCast(byte_value)));
+            if (class < exact_signature_classes) last_slot_for_byte[byte_value] = last_slot_for_class[class];
+        }
+
         const entries = try allocator.alloc(Entry, values.len);
         errdefer allocator.free(entries);
 
@@ -178,6 +220,10 @@ pub const Index = struct {
 
         const bonus_caps = try allocator.alloc(BonusCaps, values.len);
         errdefer allocator.free(bonus_caps);
+
+        const last_positions = try allocator.alloc(IndexedPosition, last_slots * values.len);
+        errdefer allocator.free(last_positions);
+        @memset(last_positions, .{ .first = 0xff, .last = 0xff });
 
         const single_stage = try allocator.alloc(StageMatch, exact_signature_classes * single_cache_limit);
         defer allocator.free(single_stage);
@@ -251,10 +297,19 @@ pub const Index = struct {
 
                 const class: usize = @intCast(signature_lut[c]);
                 const class_bit = @as(u64, 1) << @intCast(class);
-                if ((once & class_bit) == 0) {
+                const first_class_occurrence = (once & class_bit) == 0;
+                if (first_class_occurrence) {
                     once |= class_bit;
                 } else {
                     twice |= class_bit;
+                }
+
+                const slot = last_slot_for_byte[folded];
+                if (slot != 0xff and value.len < 256) {
+                    const meta = &last_positions[@as(usize, slot) * values.len + row];
+                    const pos: u8 = @intCast(i);
+                    if (first_class_occurrence) meta.first = pos;
+                    meta.last = pos;
                 }
 
                 const cap_word = class / 32;
@@ -322,43 +377,6 @@ pub const Index = struct {
             }
 
             offset += value.len;
-        }
-
-        var last_slot_for_class = [_]u8{0xff} ** exact_signature_classes;
-        var selected = [_]u8{0} ** last_slots;
-        var selected_count: usize = 0;
-        while (selected_count < last_slots) : (selected_count += 1) {
-            var best_class: usize = 0;
-            var best_frequency: usize = 0;
-            for (0..exact_signature_classes) |class| {
-                if (last_slot_for_class[class] != 0xff) continue;
-                const frequency = plane_frequency[class];
-                if (frequency > best_frequency) {
-                    best_frequency = frequency;
-                    best_class = class;
-                }
-            }
-            selected[selected_count] = @intCast(best_class);
-            last_slot_for_class[best_class] = @intCast(selected_count);
-        }
-
-        var last_slot_for_byte = [_]u8{0xff} ** 256;
-        for (0..256) |byte_value| {
-            const class: usize = @intCast(signatureClass(@intCast(byte_value)));
-            if (class < exact_signature_classes) last_slot_for_byte[byte_value] = last_slot_for_class[class];
-        }
-
-        const last_positions = try allocator.alloc(u16, last_slots * values.len);
-        errdefer allocator.free(last_positions);
-        @memset(last_positions, std.math.maxInt(u16));
-        for (entries, 0..) |entry, row| {
-            if (entry.len >= std.math.maxInt(u16)) continue;
-            const text = lower_bytes[entry.offset .. entry.offset + entry.len];
-            for (text, 0..) |c, position| {
-                const slot = last_slot_for_byte[c];
-                if (slot == 0xff) continue;
-                last_positions[@as(usize, slot) * values.len + row] = @intCast(position);
-            }
         }
 
         const single_top = try allocator.alloc(usize, exact_signature_classes * single_cache_limit);
@@ -499,6 +517,8 @@ pub const Index = struct {
 
         const top_k = @min(out.len, self.entries.len);
         try self.ensureStage(top_k);
+        const first_class: usize = @intCast(q.classes[0]);
+        const first_slot: u8 = if (first_class < exact_signature_classes) self.last_slot_for_class[first_class] else 0xff;
 
         if (q.bytes.len == 1 and top_k <= single_cache_limit) {
             const class: usize = @intCast(signatureClass(q.bytes[0]));
@@ -544,7 +564,7 @@ pub const Index = struct {
 
                 const entry = self.entries[entry_index];
                 if (q.bytes.len > entry.len) continue;
-                if (!self.subsequence(&q, entry)) continue;
+                if (!self.subsequenceIndexed(&q, entry, entry_index, first_slot)) continue;
                 self.next_survivors[word] |= row_bit;
 
                 self.addStage(.{
@@ -603,7 +623,7 @@ pub const Index = struct {
                     continue;
                 }
                 if (q.bytes.len == 2) {
-                    if (!self.subsequence(&q, entry)) continue;
+                    if (!self.subsequenceIndexed(&q, entry, entry_index, first_slot)) continue;
                     self.next_survivors[word] |= row_bit;
                     self.addStage(.{
                         .entry = entry_index,
@@ -614,7 +634,7 @@ pub const Index = struct {
 
                 // Longer queries still use the exact subsequence pass to
                 // populate the first-feasible position of every query byte.
-                if (!self.subsequence(&q, entry)) continue;
+                if (!self.subsequenceIndexed(&q, entry, entry_index, first_slot)) continue;
                 self.next_survivors[word] |= row_bit;
 
                 var score: i32 = undefined;
@@ -826,6 +846,27 @@ pub const Index = struct {
         return false;
     }
 
+    fn subsequenceIndexed(self: *Index, q: *const Query, entry: Entry, entry_index: usize, first_slot: u8) bool {
+        const text = self.candidateLower(entry);
+        if (q.bytes.len == 0) return true;
+        if (q.bytes.len > text.len) return false;
+        var pattern_index: usize = 0;
+        var text_start: usize = 0;
+        if (self.indexedFirstPositionForSlot(entry, entry_index, first_slot)) |position| {
+            self.position_scratch[0] = position;
+            pattern_index = 1;
+            if (pattern_index == q.bytes.len) return true;
+            text_start = position + 1;
+        }
+        for (text[text_start..], text_start..) |c, i| {
+            if (c != q.bytes[pattern_index]) continue;
+            self.position_scratch[pattern_index] = i;
+            pattern_index += 1;
+            if (pattern_index == q.bytes.len) return true;
+        }
+        return false;
+    }
+
     /// Safe upper bound for any fzf V2 alignment of this query/candidate.
     ///
     /// Candidate preprocessing stores the maximum raw fzf bonus for each of
@@ -889,11 +930,11 @@ pub const Index = struct {
         const first1 = self.position_scratch[1];
         const last_col = blk: {
             const class: usize = @intCast(signatureClass(q.bytes[1]));
-            if (class < exact_signature_classes and entry.len < std.math.maxInt(u16)) {
+            if (class < exact_signature_classes and entry.len < 256) {
                 const slot = self.last_slot_for_class[class];
                 if (slot != 0xff) {
-                    const stored = self.last_positions[@as(usize, slot) * self.entries.len + entry_index];
-                    if (stored != std.math.maxInt(u16)) break :blk @as(usize, stored);
+                    const stored = self.last_positions[@as(usize, slot) * self.entries.len + entry_index].last;
+                    if (stored != 0xff) break :blk @as(usize, stored);
                 }
             }
             break :blk std.mem.findScalarLast(u8, text, q.bytes[1]).?;
@@ -2628,13 +2669,19 @@ pub const Index = struct {
     }
 
     fn indexedLastPosition(self: *const Index, entry: Entry, entry_index: usize, class_value: u6) ?usize {
-        if (entry.len >= std.math.maxInt(u16)) return null;
+        if (entry.len >= 256) return null;
         const class: usize = @intCast(class_value);
         if (class >= exact_signature_classes) return null;
         const slot = self.last_slot_for_class[class];
         if (slot == 0xff) return null;
-        const stored = self.last_positions[@as(usize, slot) * self.entries.len + entry_index];
-        return if (stored == std.math.maxInt(u16)) null else @as(usize, stored);
+        const stored = self.last_positions[@as(usize, slot) * self.entries.len + entry_index].last;
+        return if (stored == 0xff) null else @as(usize, stored);
+    }
+
+    fn indexedFirstPositionForSlot(self: *const Index, entry: Entry, entry_index: usize, slot: u8) ?usize {
+        if (slot == 0xff or entry.len >= 256) return null;
+        const stored = self.last_positions[@as(usize, slot) * self.entries.len + entry_index].first;
+        return if (stored == 0xff) null else @as(usize, stored);
     }
 
     fn scoreV2IndexedFromFirst(self: *Index, q: *const Query, entry: Entry, entry_index: usize) i32 {
