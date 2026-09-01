@@ -3,6 +3,8 @@ const std = @import("std");
 const signature_classes = 64;
 const signature_levels = 2;
 const signature_planes = signature_classes * signature_levels;
+const last_slots = 24;
+const exact_signature_classes = 56;
 
 const score_match: i32 = 16;
 const score_gap_start: i32 = -3;
@@ -58,14 +60,17 @@ pub const Index = struct {
     lower_bytes: []u8,
     bonuses: []u8,
     bonus_caps: []BonusCaps,
+    last_positions: []u16,
+    last_slot_for_class: [exact_signature_classes]u8,
 
     words: usize,
     planes: []u64,
     plane_frequency: [signature_planes]usize,
 
     max_len: usize,
-    dp: []i32,
+    dp: []i16,
     position_scratch: []usize,
+    last_position_scratch: []usize,
     stage: []StageMatch,
 
     query_bytes: []u8,
@@ -104,11 +109,14 @@ pub const Index = struct {
         errdefer allocator.free(planes);
         @memset(planes, 0);
 
-        const dp = try allocator.alloc(i32, max_len * 4);
+        const dp = try allocator.alloc(i16, max_len * 4);
         errdefer allocator.free(dp);
 
         const position_scratch = try allocator.alloc(usize, max_len);
         errdefer allocator.free(position_scratch);
+
+        const last_position_scratch = try allocator.alloc(usize, max_len);
+        errdefer allocator.free(last_position_scratch);
 
         const initial_stage_len = @min(values.len, 16);
         const stage = try allocator.alloc(StageMatch, initial_stage_len);
@@ -193,18 +201,54 @@ pub const Index = struct {
             offset += value.len;
         }
 
+        var last_slot_for_class = [_]u8{0xff} ** exact_signature_classes;
+        var selected = [_]u8{0} ** last_slots;
+        var selected_count: usize = 0;
+        while (selected_count < last_slots) : (selected_count += 1) {
+            var best_class: usize = 0;
+            var best_frequency: usize = 0;
+            for (0..exact_signature_classes) |class| {
+                if (last_slot_for_class[class] != 0xff) continue;
+                const frequency = plane_frequency[class];
+                if (frequency > best_frequency) {
+                    best_frequency = frequency;
+                    best_class = class;
+                }
+            }
+            selected[selected_count] = @intCast(best_class);
+            last_slot_for_class[best_class] = @intCast(selected_count);
+        }
+
+        const last_positions = try allocator.alloc(u16, last_slots * values.len);
+        errdefer allocator.free(last_positions);
+        @memset(last_positions, std.math.maxInt(u16));
+        for (entries, 0..) |entry, row| {
+            if (entry.len >= std.math.maxInt(u16)) continue;
+            const text = lower_bytes[entry.offset .. entry.offset + entry.len];
+            for (text, 0..) |c, position| {
+                const class: usize = @intCast(signatureClass(c));
+                if (class >= exact_signature_classes) continue;
+                const slot = last_slot_for_class[class];
+                if (slot == 0xff) continue;
+                last_positions[@as(usize, slot) * values.len + row] = @intCast(position);
+            }
+        }
+
         return .{
             .allocator = allocator,
             .entries = entries,
             .lower_bytes = lower_bytes,
             .bonuses = bonuses,
             .bonus_caps = bonus_caps,
+            .last_positions = last_positions,
+            .last_slot_for_class = last_slot_for_class,
             .words = words,
             .planes = planes,
             .plane_frequency = plane_frequency,
             .max_len = max_len,
             .dp = dp,
             .position_scratch = position_scratch,
+            .last_position_scratch = last_position_scratch,
             .stage = stage,
             .query_bytes = query_bytes,
             .query_classes = query_classes,
@@ -228,9 +272,11 @@ pub const Index = struct {
         self.allocator.free(self.query_classes);
         self.allocator.free(self.query_bytes);
         self.allocator.free(self.stage);
+        self.allocator.free(self.last_position_scratch);
         self.allocator.free(self.position_scratch);
         self.allocator.free(self.dp);
         self.allocator.free(self.planes);
+        self.allocator.free(self.last_positions);
         self.allocator.free(self.bonus_caps);
         self.allocator.free(self.bonuses);
         self.allocator.free(self.lower_bytes);
@@ -338,7 +384,7 @@ pub const Index = struct {
 
                 self.addStage(.{
                     .entry = entry_index,
-                    .score = self.scoreV2FromFirst(&q, entry),
+                    .score = self.scoreV2IndexedFromFirst(&q, entry, entry_index),
                 }, top_k, &stage_len);
             }
         }
@@ -366,21 +412,49 @@ pub const Index = struct {
                 const entry = self.entries[entry_index];
                 if (q.bytes.len > entry.len) continue;
 
-                // This linear scan is exact and also prepares fzf V2's first
-                // feasible position for each query byte, so DP does not repeat
-                // the subsequence prefilter.
-                if (!self.subsequence(&q, entry)) continue;
-                self.next_survivors[word] |= row_bit;
+                // The precomputed bonus ceiling needs no candidate scan. Once
+                // top-K is full, use it before the ordered-subsequence pass.
+                // Rows skipped here stay in the prefix cache as "possible";
+                // that cache is allowed to be a superset, so future prefix
+                // extensions remain exact.
+                if (stage_len == top_k) {
+                    const upper = self.scoreUpperBound(&q, self.bonus_caps[entry_index]);
+                    const worst = self.stage[0];
+                    const worst_entry = self.entries[worst.entry];
+                    if (upper < worst.score or
+                        (upper == worst.score and
+                            (entry.len > worst_entry.len or
+                                (entry.len == worst_entry.len and entry_index > worst.entry))))
+                    {
+                        self.next_survivors[word] |= row_bit;
+                        continue;
+                    }
+                }
 
-                if (stage_len == top_k and
-                    self.scoreUpperBound(&q, self.bonus_caps[entry_index]) < self.stage[0].score)
-                {
+                if (q.bytes.len == 1) {
+                    const score = self.scoreV2Single(&q, entry) orelse continue;
+                    self.next_survivors[word] |= row_bit;
+                    self.addStage(.{ .entry = entry_index, .score = score }, top_k, &stage_len);
+                    continue;
+                }
+                if (q.bytes.len == 2) {
+                    if (!self.subsequence(&q, entry)) continue;
+                    self.next_survivors[word] |= row_bit;
+                    self.addStage(.{
+                        .entry = entry_index,
+                        .score = self.scoreV2TwoIndexed(&q, entry, entry_index),
+                    }, top_k, &stage_len);
                     continue;
                 }
 
+                // Longer queries still use the exact subsequence pass to
+                // populate the first-feasible position of every query byte.
+                if (!self.subsequence(&q, entry)) continue;
+                self.next_survivors[word] |= row_bit;
+
                 self.addStage(.{
                     .entry = entry_index,
-                    .score = self.scoreV2FromFirst(&q, entry),
+                    .score = self.scoreV2IndexedFromFirst(&q, entry, entry_index),
                 }, top_k, &stage_len);
             }
         }
@@ -488,6 +562,10 @@ pub const Index = struct {
 
         if (m == 0) return 0;
         if (m > text.len) return null;
+        if (m == 1) {
+            const match_index = std.mem.findScalar(u8, text, q.bytes[0]) orelse return null;
+            return score_match + @as(i32, @intCast(bonus[match_index])) * bonus_first_char_multiplier;
+        }
 
         var pattern_index: usize = 0;
         var start: ?usize = null;
@@ -591,45 +669,349 @@ pub const Index = struct {
         return total;
     }
 
-    /// Exact fzf V2 score, assuming subsequence() already populated
-    /// position_scratch for this query/candidate. Score-only needs two DP rows
-    /// instead of fzf's full backtrace matrix.
-    fn scoreV2FromFirst(self: *Index, q: *const Query, entry: Entry) i32 {
+    fn scoreV2Single(self: *const Index, q: *const Query, entry: Entry) ?i32 {
+        const text = self.candidateLower(entry);
+        const bonus = self.candidateBonuses(entry);
+        const pattern_char = q.bytes[0];
+        var found = false;
+        var max_score: i32 = 0;
+
+        // Match fzf V2's forward single-byte fast path exactly: once we hit a
+        // word-boundary-class bonus, the forward result is settled and later
+        // occurrences are deliberately ignored.
+        for (text, bonus) |c, b| {
+            if (c != pattern_char) continue;
+            found = true;
+            const raw_bonus: i32 = @intCast(b);
+            const score = score_match + raw_bonus * bonus_first_char_multiplier;
+            max_score = @max(max_score, score);
+            if (raw_bonus >= bonus_boundary) return score;
+        }
+        return if (found) max_score else null;
+    }
+
+    /// Fused score-only fzf V2 path for two-byte queries. This is the same two
+    /// DP rows as the general algorithm, but both rows are carried as scalar
+    /// running state in one pass instead of materializing/reading four arrays.
+    fn scoreV2TwoFromFirst(self: *const Index, q: *const Query, entry: Entry) i32 {
+        const text = self.candidateLower(entry);
+        const bonus = self.candidateBonuses(entry);
+        const first0 = self.position_scratch[0];
+        const first1 = self.position_scratch[1];
+        const last_col = std.mem.findScalarLast(u8, text, q.bytes[1]).?;
+
+        const p0 = q.bytes[0];
+        const p1 = q.bytes[1];
+        const match_score: i16 = score_match;
+        const gap_start: i16 = score_gap_start;
+        const gap_extension: i16 = score_gap_extension;
+        const boundary: i16 = bonus_boundary;
+        const consecutive_bonus: i16 = bonus_consecutive;
+        const first_multiplier: i16 = bonus_first_char_multiplier;
+        var h0_prev: i16 = 0;
+        var c0_prev: i16 = 0;
+        var b_prev: i16 = 0;
+        var in_gap0 = false;
+
+        var h1_prev: i16 = 0;
+        var in_gap1 = false;
+        var max_score: i16 = 0;
+
+        var j = first0;
+        while (j <= last_col) : (j += 1) {
+            const c = text[j];
+
+            var h0_cur: i16 = undefined;
+            var c0_cur: i16 = 0;
+            if (c == p0) {
+                const raw_bonus: i16 = @intCast(bonus[j]);
+                h0_cur = match_score + raw_bonus * first_multiplier;
+                c0_cur = 1;
+                b_prev = raw_bonus;
+                in_gap0 = false;
+            } else {
+                h0_cur = @max(h0_prev + (if (in_gap0) gap_extension else gap_start), 0);
+                in_gap0 = true;
+            }
+
+            if (j >= first1) {
+                const left: i16 = if (j == first1) 0 else h1_prev;
+                const gap_score: i16 = left + (if (in_gap1) gap_extension else gap_start);
+                var match_value: i16 = 0;
+
+                if (c == p1 and j > first0) {
+                    const raw_bonus: i16 = @intCast(bonus[j]);
+                    match_value = h0_prev + match_score;
+                    var b = raw_bonus;
+                    const consecutive = c0_prev + 1;
+                    if (consecutive > 1) {
+                        if (b >= boundary and b > b_prev) {
+                            // Chunk is broken at the stronger boundary. The
+                            // consecutive count itself is not needed because
+                            // this is the final row.
+                        } else {
+                            b = @max(b, @max(consecutive_bonus, b_prev));
+                        }
+                    }
+                    if (match_value + b < gap_score) {
+                        match_value += raw_bonus;
+                    } else {
+                        match_value += b;
+                    }
+                }
+
+                in_gap1 = match_value < gap_score;
+                h1_prev = @max(@max(match_value, gap_score), 0);
+                max_score = @max(max_score, h1_prev);
+            }
+
+            h0_prev = h0_cur;
+            c0_prev = c0_cur;
+        }
+
+        return @intCast(max_score);
+    }
+
+    fn scoreV2TwoIndexed(self: *const Index, q: *const Query, entry: Entry, entry_index: usize) i32 {
+        const text = self.candidateLower(entry);
+        const bonus = self.candidateBonuses(entry);
+        const first0 = self.position_scratch[0];
+        const first1 = self.position_scratch[1];
+        const last_col = blk: {
+            const class: usize = @intCast(signatureClass(q.bytes[1]));
+            if (class < exact_signature_classes and entry.len < std.math.maxInt(u16)) {
+                const slot = self.last_slot_for_class[class];
+                if (slot != 0xff) {
+                    const stored = self.last_positions[@as(usize, slot) * self.entries.len + entry_index];
+                    if (stored != std.math.maxInt(u16)) break :blk @as(usize, stored);
+                }
+            }
+            break :blk std.mem.findScalarLast(u8, text, q.bytes[1]).?;
+        };
+
+        const p0 = q.bytes[0];
+        const p1 = q.bytes[1];
+        const match_score: i16 = score_match;
+        const gap_start: i16 = score_gap_start;
+        const gap_extension: i16 = score_gap_extension;
+        const boundary: i16 = bonus_boundary;
+        const consecutive_bonus: i16 = bonus_consecutive;
+        const first_multiplier: i16 = bonus_first_char_multiplier;
+        var h0_prev: i16 = 0;
+        var c0_prev: i16 = 0;
+        var b_prev: i16 = 0;
+        var in_gap0 = false;
+
+        var h1_prev: i16 = 0;
+        var in_gap1 = false;
+        var max_score: i16 = 0;
+
+        var j = first0;
+        while (j <= last_col) : (j += 1) {
+            const c = text[j];
+
+            var h0_cur: i16 = undefined;
+            var c0_cur: i16 = 0;
+            if (c == p0) {
+                const raw_bonus: i16 = @intCast(bonus[j]);
+                h0_cur = match_score + raw_bonus * first_multiplier;
+                c0_cur = 1;
+                b_prev = raw_bonus;
+                in_gap0 = false;
+            } else {
+                h0_cur = @max(h0_prev + (if (in_gap0) gap_extension else gap_start), 0);
+                in_gap0 = true;
+            }
+
+            if (j >= first1) {
+                const left: i16 = if (j == first1) 0 else h1_prev;
+                const gap_score: i16 = left + (if (in_gap1) gap_extension else gap_start);
+                var match_value: i16 = 0;
+
+                if (c == p1 and j > first0) {
+                    const raw_bonus: i16 = @intCast(bonus[j]);
+                    match_value = h0_prev + match_score;
+                    var b = raw_bonus;
+                    const consecutive = c0_prev + 1;
+                    if (consecutive > 1) {
+                        if (b >= boundary and b > b_prev) {
+                            // Chunk is broken at the stronger boundary. The
+                            // consecutive count itself is not needed because
+                            // this is the final row.
+                        } else {
+                            b = @max(b, @max(consecutive_bonus, b_prev));
+                        }
+                    }
+                    if (match_value + b < gap_score) {
+                        match_value += raw_bonus;
+                    } else {
+                        match_value += b;
+                    }
+                }
+
+                in_gap1 = match_value < gap_score;
+                h1_prev = @max(@max(match_value, gap_score), 0);
+                max_score = @max(max_score, h1_prev);
+            }
+
+            h0_prev = h0_cur;
+            c0_prev = c0_cur;
+        }
+
+        return @intCast(max_score);
+    }
+
+    /// Compile-time-unrolled score-only V2 kernel for the small-pattern cases
+    /// where scalar row state is faster than candidate-sized DP buffers.
+    fn scoreV2SmallFromFirst(self: *Index, comptime M: usize, q: *const Query, entry: Entry, last_hint: ?usize) i32 {
+        const text = self.candidateLower(entry);
+        const bonus = self.candidateBonuses(entry);
+        const first = self.position_scratch[0..M];
+        const last = self.last_position_scratch[0..M];
+
+        var reverse_pattern: usize = M;
+        var reverse_col = text.len;
+        if (last_hint) |position| {
+            last[M - 1] = position;
+            reverse_pattern = M - 1;
+            reverse_col = position;
+        }
+        while (reverse_pattern != 0) {
+            reverse_col -= 1;
+            if (text[reverse_col] != q.bytes[reverse_pattern - 1]) continue;
+            reverse_pattern -= 1;
+            last[reverse_pattern] = reverse_col;
+        }
+
+        var h = [_]i16{0} ** M;
+        var consecutive = [_]i16{0} ** M;
+        var in_gap = [_]bool{false} ** M;
+
+        const match_score: i16 = score_match;
+        const gap_start: i16 = score_gap_start;
+        const gap_extension: i16 = score_gap_extension;
+        const boundary: i16 = bonus_boundary;
+        const consecutive_bonus: i16 = bonus_consecutive;
+        const first_multiplier: i16 = bonus_first_char_multiplier;
+
+        var max_score: i16 = 0;
+        var j = first[0];
+        while (j <= last[M - 1]) : (j += 1) {
+            const char = text[j];
+            const raw_bonus: i16 = @intCast(bonus[j]);
+
+            inline for (1..M) |reverse_index| {
+                const i = M - reverse_index;
+                const row_end = if (i + 1 < M) last[i + 1] - 1 else last[i];
+                if (j >= first[i] and j <= row_end) {
+                    const left: i16 = if (j > first[i]) h[i] else 0;
+                    const gap_score: i16 = left + (if (in_gap[i]) gap_extension else gap_start);
+                    var match_value: i16 = -16_000;
+                    var run: i16 = 0;
+
+                    if (char == q.bytes[i]) {
+                        match_value = h[i - 1] + match_score;
+                        var b = raw_bonus;
+                        run = consecutive[i - 1] + 1;
+                        if (run > 1) {
+                            const run_start = j + 1 - @as(usize, @intCast(run));
+                            const first_bonus: i16 = @intCast(bonus[run_start]);
+                            if (b >= boundary and b > first_bonus) {
+                                run = 1;
+                            } else {
+                                b = @max(b, @max(consecutive_bonus, first_bonus));
+                            }
+                        }
+                        if (match_value + b < gap_score) {
+                            match_value += raw_bonus;
+                            run = 0;
+                        } else {
+                            match_value += b;
+                        }
+                    }
+
+                    consecutive[i] = run;
+                    in_gap[i] = match_value < gap_score;
+                    h[i] = @max(@max(match_value, gap_score), 0);
+                    if (i == M - 1) max_score = @max(max_score, h[i]);
+                }
+            }
+
+            if (j < last[1]) {
+                if (char == q.bytes[0]) {
+                    h[0] = match_score + raw_bonus * first_multiplier;
+                    consecutive[0] = 1;
+                    in_gap[0] = false;
+                } else {
+                    h[0] = @max(h[0] + (if (in_gap[0]) gap_extension else gap_start), 0);
+                    consecutive[0] = 0;
+                    in_gap[0] = true;
+                }
+            }
+        }
+
+        return @intCast(max_score);
+    }
+
+    /// General exact score-only fzf V2 DP. Kept separate from the small-query
+    /// kernels both as the 7+ byte production path and as a parity reference.
+    fn scoreV2GeneralFromFirst(self: *Index, q: *const Query, entry: Entry, last_hint: ?usize) i32 {
         const text = self.candidateLower(entry);
         const bonus = self.candidateBonuses(entry);
         const m = q.bytes.len;
         const n = text.len;
         const first = self.position_scratch[0..m];
 
-        var h0 = self.dp[0..n];
-        const h1 = self.dp[self.max_len .. self.max_len + n];
-        var c0 = self.dp[self.max_len * 2 .. self.max_len * 2 + n];
-        const c1 = self.dp[self.max_len * 3 .. self.max_len * 3 + n];
+        if (m == 1) return self.scoreV2Single(q, entry).?;
+        if (m == 2) return self.scoreV2TwoFromFirst(q, entry);
+        if (m > 1000) return self.scoreV1(q, entry).?;
+
+        const last = self.last_position_scratch[0..m];
+        var reverse_pattern = m;
+        var reverse_col = n;
+        if (last_hint) |position| {
+            last[m - 1] = position;
+            reverse_pattern = m - 1;
+            reverse_col = position;
+        }
+        while (reverse_pattern != 0) {
+            reverse_col -= 1;
+            if (text[reverse_col] != q.bytes[reverse_pattern - 1]) continue;
+            reverse_pattern -= 1;
+            last[reverse_pattern] = reverse_col;
+        }
+
+        const first_col = first[0];
+        var previous = self.dp[0 .. n * 2];
+        var current = self.dp[n * 2 .. n * 4];
+
+        const match_score_base: i16 = score_match;
+        const gap_start: i16 = score_gap_start;
+        const gap_extension: i16 = score_gap_extension;
+        const boundary: i16 = bonus_boundary;
+        const consecutive_bonus: i16 = bonus_consecutive;
+        const first_multiplier: i16 = bonus_first_char_multiplier;
 
         var in_gap = false;
-        var previous_score: i32 = 0;
-        var max_score: i32 = 0;
+        var previous_score: i16 = 0;
+        var max_score: i16 = 0;
         const first_char = q.bytes[0];
 
-        for (text, 0..) |c, j| {
+        var first_row_col = first_col;
+        while (first_row_col < last[1]) : (first_row_col += 1) {
+            const c = text[first_row_col];
+            const cell = first_row_col * 2;
             if (c == first_char) {
-                h0[j] = score_match + @as(i32, @intCast(bonus[j])) * bonus_first_char_multiplier;
-                c0[j] = 1;
+                previous[cell] = match_score_base + @as(i16, @intCast(bonus[first_row_col])) * first_multiplier;
+                previous[cell + 1] = 1;
                 in_gap = false;
-                if (m == 1) max_score = @max(max_score, h0[j]);
             } else {
-                h0[j] = @max(previous_score + (if (in_gap) score_gap_extension else score_gap_start), 0);
-                c0[j] = 0;
+                previous[cell] = @max(previous_score + (if (in_gap) gap_extension else gap_start), 0);
+                previous[cell + 1] = 0;
                 in_gap = true;
             }
-            previous_score = h0[j];
+            previous_score = previous[cell];
         }
-        if (m == 1) return max_score;
-
-        var previous_h: []i32 = h0;
-        var previous_c: []i32 = c0;
-        var current_h: []i32 = h1;
-        var current_c: []i32 = c1;
 
         var pattern_index: usize = 1;
         while (pattern_index < m) : (pattern_index += 1) {
@@ -638,60 +1020,88 @@ pub const Index = struct {
             in_gap = false;
 
             var j = first_feasible;
-            while (j < n) : (j += 1) {
-                const left: i32 = if (j > first_feasible) current_h[j - 1] else 0;
-                const gap_score = left + (if (in_gap) score_gap_extension else score_gap_start);
+            const row_end = if (pattern_index + 1 < m) last[pattern_index + 1] - 1 else last[pattern_index];
+            while (j <= row_end) : (j += 1) {
+                const cell = j * 2;
+                const left: i16 = if (j > first_feasible) current[cell - 2] else 0;
+                const gap_score = left + (if (in_gap) gap_extension else gap_start);
 
-                var match_score: i32 = -1_000_000_000;
-                var consecutive: i32 = 0;
-
+                var match_value: i16 = -16_000;
+                var consecutive: i16 = 0;
                 if (text[j] == pattern_char and j > 0) {
-                    match_score = previous_h[j - 1] + score_match;
-                    var b: i32 = @intCast(bonus[j]);
-                    consecutive = previous_c[j - 1] + 1;
-
+                    const prev_cell = cell - 2;
+                    match_value = previous[prev_cell] + match_score_base;
+                    var b: i16 = @intCast(bonus[j]);
+                    consecutive = previous[prev_cell + 1] + 1;
                     if (consecutive > 1) {
                         const run_start = j + 1 - @as(usize, @intCast(consecutive));
-                        const first_bonus: i32 = @intCast(bonus[run_start]);
-                        if (b >= bonus_boundary and b > first_bonus) {
+                        const first_bonus: i16 = @intCast(bonus[run_start]);
+                        if (b >= boundary and b > first_bonus) {
                             consecutive = 1;
                         } else {
-                            b = @max(b, @max(bonus_consecutive, first_bonus));
+                            b = @max(b, @max(consecutive_bonus, first_bonus));
                         }
                     }
-
-                    if (match_score + b < gap_score) {
-                        match_score += @intCast(bonus[j]);
+                    if (match_value + b < gap_score) {
+                        match_value += @intCast(bonus[j]);
                         consecutive = 0;
                     } else {
-                        match_score += b;
+                        match_value += b;
                     }
                 }
-
-                current_c[j] = consecutive;
-                in_gap = match_score < gap_score;
-                const score = @max(@max(match_score, gap_score), 0);
-                current_h[j] = score;
-
+                current[cell + 1] = consecutive;
+                in_gap = match_value < gap_score;
+                const score: i16 = @max(@max(match_value, gap_score), 0);
+                current[cell] = score;
                 if (pattern_index == m - 1) max_score = @max(max_score, score);
             }
-
-            const temp_h = previous_h;
-            previous_h = current_h;
-            current_h = temp_h;
-
-            const temp_c = previous_c;
-            previous_c = current_c;
-            current_c = temp_c;
+            const temp = previous;
+            previous = current;
+            current = temp;
         }
+        return @intCast(max_score);
+    }
 
-        return max_score;
+    fn indexedLastPosition(self: *const Index, entry: Entry, entry_index: usize, c: u8) ?usize {
+        if (entry.len >= std.math.maxInt(u16)) return null;
+        const class: usize = @intCast(signatureClass(c));
+        if (class >= exact_signature_classes) return null;
+        const slot = self.last_slot_for_class[class];
+        if (slot == 0xff) return null;
+        const stored = self.last_positions[@as(usize, slot) * self.entries.len + entry_index];
+        return if (stored == std.math.maxInt(u16)) null else @as(usize, stored);
+    }
+
+    fn scoreV2IndexedFromFirst(self: *Index, q: *const Query, entry: Entry, entry_index: usize) i32 {
+        if (q.bytes.len == 1) return self.scoreV2Single(q, entry).?;
+        if (q.bytes.len == 2) return self.scoreV2TwoIndexed(q, entry, entry_index);
+        const last_hint = self.indexedLastPosition(entry, entry_index, q.bytes[q.bytes.len - 1]);
+        return switch (q.bytes.len) {
+            3 => self.scoreV2SmallFromFirst(3, q, entry, last_hint),
+            4 => self.scoreV2SmallFromFirst(4, q, entry, last_hint),
+            5 => self.scoreV2SmallFromFirst(5, q, entry, last_hint),
+            6 => self.scoreV2SmallFromFirst(6, q, entry, last_hint),
+            else => self.scoreV2GeneralFromFirst(q, entry, last_hint),
+        };
+    }
+
+    fn scoreV2FromFirst(self: *Index, q: *const Query, entry: Entry) i32 {
+        return switch (q.bytes.len) {
+            3 => self.scoreV2SmallFromFirst(3, q, entry, null),
+            4 => self.scoreV2SmallFromFirst(4, q, entry, null),
+            5 => self.scoreV2SmallFromFirst(5, q, entry, null),
+            6 => self.scoreV2SmallFromFirst(6, q, entry, null),
+            else => self.scoreV2GeneralFromFirst(q, entry, null),
+        };
     }
 
     /// Convenience wrapper used by parity tests.
     fn scoreV2(self: *Index, q: *const Query, entry: Entry) ?i32 {
         if (q.bytes.len == 0) return 0;
+        if (q.bytes.len > entry.len) return null;
+        if (q.bytes.len == 1) return self.scoreV2Single(q, entry);
         if (!self.subsequence(q, entry)) return null;
+        if (q.bytes.len == 2) return self.scoreV2TwoFromFirst(q, entry);
         return self.scoreV2FromFirst(q, entry);
     }
 };
@@ -919,6 +1329,40 @@ test "ported V1 and V2 match fzf scoring vectors" {
         const entry = index.entries[0];
         try std.testing.expectEqual(case.expected, index.scoreV1(&q, entry).?);
         try std.testing.expectEqual(case.expected, index.scoreV2(&q, entry).?);
+    }
+}
+
+test "small V2 kernels match general DP" {
+    const values = [_][]const u8{
+        "src/fuzzy_backend.zig",
+        "fooBarBazQux",
+        "alpha-beta-gamma-delta",
+        "/usr/local/share/something",
+        "abcdefabcdefabcdef",
+        "FrameBufferManager",
+        "one_two_three_four",
+    };
+    const queries = [_][]const u8{ "fbz", "fbbq", "abgd", "ulssg", "abcdea", "fbm" };
+
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+
+    for (queries) |text| {
+        const q = index.compileQuery(text);
+        if (q.bytes.len < 3 or q.bytes.len > 6) continue;
+        for (index.entries) |entry| {
+            if (!index.subsequence(&q, entry)) continue;
+            const general = index.scoreV2GeneralFromFirst(&q, entry, null);
+            try std.testing.expect(index.subsequence(&q, entry));
+            const specialized = switch (q.bytes.len) {
+                3 => index.scoreV2SmallFromFirst(3, &q, entry, null),
+                4 => index.scoreV2SmallFromFirst(4, &q, entry, null),
+                5 => index.scoreV2SmallFromFirst(5, &q, entry, null),
+                6 => index.scoreV2SmallFromFirst(6, &q, entry, null),
+                else => unreachable,
+            };
+            try std.testing.expectEqual(general, specialized);
+        }
     }
 }
 
