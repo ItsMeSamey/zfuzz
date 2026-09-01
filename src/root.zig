@@ -73,6 +73,53 @@ const bonus_lut: [6][6]u8 = blk: {
     break :blk table;
 };
 
+fn makeBoundBonusTable(comptime m: usize) [1 << (2 * m)]u8 {
+    @setEvalBranchQuota(100000);
+    var out: [1 << (2 * m)]u8 = undefined;
+    for (0..out.len) |packed_value| {
+        var x = packed_value;
+        var prefix: i32 = 0;
+        var total: i32 = 0;
+        for (0..m) |i| {
+            const category: u2 = @truncate(x);
+            x >>= 2;
+            const b: i32 = switch (category) {
+                0 => 0,
+                1 => 8,
+                2 => 9,
+                3 => 10,
+            };
+            prefix = @max(prefix, b);
+            total += if (i == 0)
+                prefix * bonus_first_char_multiplier
+            else
+                @max(prefix, bonus_consecutive);
+        }
+        out[packed_value] = @intCast(total);
+    }
+    return out;
+}
+
+const bound_bonus3 = makeBoundBonusTable(3);
+const bound_bonus4 = makeBoundBonusTable(4);
+const bound_bonus5 = makeBoundBonusTable(5);
+const bound_bonus6 = makeBoundBonusTable(6);
+
+fn bonusCategoryRaw(caps: BonusCaps, class: u6) u2 {
+    const class_index: usize = @intCast(class);
+    const word = class_index >> 5;
+    const shift: u6 = @intCast((class_index & 31) * 2);
+    return @truncate(caps[word] >> shift);
+}
+
+fn packedBoundIndex(comptime m: usize, caps: BonusCaps, classes: []const u6) usize {
+    var index: usize = 0;
+    inline for (0..m) |i| {
+        index |= @as(usize, bonusCategoryRaw(caps, classes[i])) << @intCast(2 * i);
+    }
+    return index;
+}
+
 /// Preprocessed candidate array.
 ///
 /// Candidate text is copied into the searchable representation during init,
@@ -776,15 +823,14 @@ pub const Index = struct {
         _ = self;
         if (q.bytes.len == 0) return 0;
 
-        var total: i32 = @as(i32, @intCast(q.bytes.len)) * score_match;
-        var prefix_bonus = bonusCap(caps, q.classes[0]);
-        total += prefix_bonus * bonus_first_char_multiplier;
-
-        for (q.classes[1..]) |class| {
-            prefix_bonus = @max(prefix_bonus, bonusCap(caps, class));
-            total += @max(prefix_bonus, bonus_consecutive);
+        switch (q.bytes.len) {
+            3 => return 3 * score_match + @as(i32, bound_bonus3[packedBoundIndex(3, caps, q.classes)]),
+            4 => return 4 * score_match + @as(i32, bound_bonus4[packedBoundIndex(4, caps, q.classes)]),
+            5 => return 5 * score_match + @as(i32, bound_bonus5[packedBoundIndex(5, caps, q.classes)]),
+            6 => return 6 * score_match + @as(i32, bound_bonus6[packedBoundIndex(6, caps, q.classes)]),
+            else => {},
         }
-        return total;
+        return scoreUpperBoundGeneric(q, caps);
     }
 
     fn scoreV2Single(self: *const Index, q: *const Query, entry: Entry) ?i32 {
@@ -1285,6 +1331,20 @@ fn bonusCategory(raw_bonus: i32) u2 {
     return 3;
 }
 
+fn scoreUpperBoundGeneric(q: *const Query, caps: BonusCaps) i32 {
+    if (q.bytes.len == 0) return 0;
+
+    var total: i32 = @as(i32, @intCast(q.bytes.len)) * score_match;
+    var prefix_bonus = bonusCap(caps, q.classes[0]);
+    total += prefix_bonus * bonus_first_char_multiplier;
+
+    for (q.classes[1..]) |class| {
+        prefix_bonus = @max(prefix_bonus, bonusCap(caps, class));
+        total += @max(prefix_bonus, bonus_consecutive);
+    }
+    return total;
+}
+
 fn bonusCap(caps: BonusCaps, class: u6) i32 {
     const class_index: usize = @intCast(class);
     const word = class_index / 32;
@@ -1398,6 +1458,29 @@ test "query preprocessing tracks one and two occurrences" {
     try std.testing.expect(has_a_twice);
     try std.testing.expect(has_b_once);
     try std.testing.expect(has_one_once);
+}
+
+test "small-query score ceiling LUT matches generic arithmetic" {
+    const values = [_][]const u8{
+        "fooBarbaz1",
+        "foo bar baz",
+        "/AutomatorDocument.icns",
+        "/man1/zshcompctl.1",
+        "/.oh-my-zsh/cache",
+        "abcabcabc",
+        "src/FrameBuffer.zig",
+    };
+    const queries = [_][]const u8{ "obz", "fbbq", "rdoc5", "zshcmp" };
+
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+
+    for (queries) |text| {
+        const q = index.compileQuery(text);
+        for (index.bonus_caps) |caps| {
+            try std.testing.expectEqual(scoreUpperBoundGeneric(&q, caps), index.scoreUpperBound(&q, caps));
+        }
+    }
 }
 
 test "score ceiling never underestimates representative V2 scores" {
