@@ -602,9 +602,9 @@ pub const Index = struct {
         const first = self.position_scratch[0..m];
 
         var h0 = self.dp[0..n];
-        var h1 = self.dp[self.max_len .. self.max_len + n];
+        const h1 = self.dp[self.max_len .. self.max_len + n];
         var c0 = self.dp[self.max_len * 2 .. self.max_len * 2 + n];
-        var c1 = self.dp[self.max_len * 3 .. self.max_len * 3 + n];
+        const c1 = self.dp[self.max_len * 3 .. self.max_len * 3 + n];
 
         var in_gap = false;
         var previous_score: i32 = 0;
@@ -651,7 +651,7 @@ pub const Index = struct {
                     consecutive = previous_c[j - 1] + 1;
 
                     if (consecutive > 1) {
-                        const run_start = j - @as(usize, @intCast(consecutive)) + 1;
+                        const run_start = j + 1 - @as(usize, @intCast(consecutive));
                         const first_bonus: i32 = @intCast(bonus[run_start]);
                         if (b >= bonus_boundary and b > first_bonus) {
                             consecutive = 1;
@@ -694,7 +694,6 @@ pub const Index = struct {
         if (!self.subsequence(q, entry)) return null;
         return self.scoreV2FromFirst(q, entry);
     }
-
 };
 
 /// Preprocess an immutable candidate array for repeated searching.
@@ -776,7 +775,7 @@ fn charClass(c: u8) CharClass {
     if (c >= 'A' and c <= 'Z') return .upper;
     if (c >= '0' and c <= '9') return .number;
     return switch (c) {
-        ' ', '\t', '\n', '\r', '\v', '\f' => .white,
+        ' ', '\t', '\n', '\r', 0x0b, 0x0c => .white,
         '/', ',', ':', ';', '|' => .delimiter,
         else => .non_word,
     };
@@ -942,7 +941,6 @@ test "search filters impossible rows and returns V2-ranked results" {
     try std.testing.expectEqual(@as(usize, 3), matches.len);
     try std.testing.expectEqual(@as(usize, 2), matches[0]);
 }
-
 
 test "prefix extension reuses exact survivor cache and backspace resets it" {
     const values = [_][]const u8{
