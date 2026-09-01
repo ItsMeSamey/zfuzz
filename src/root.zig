@@ -1180,9 +1180,9 @@ pub const Index = struct {
         return @intCast(max_score);
     }
 
-    fn indexedLastPosition(self: *const Index, entry: Entry, entry_index: usize, c: u8) ?usize {
+    fn indexedLastPosition(self: *const Index, entry: Entry, entry_index: usize, class_value: u6) ?usize {
         if (entry.len >= std.math.maxInt(u16)) return null;
-        const class: usize = @intCast(signatureClass(c));
+        const class: usize = @intCast(class_value);
         if (class >= exact_signature_classes) return null;
         const slot = self.last_slot_for_class[class];
         if (slot == 0xff) return null;
@@ -1193,7 +1193,7 @@ pub const Index = struct {
     fn scoreV2IndexedFromFirst(self: *Index, q: *const Query, entry: Entry, entry_index: usize) i32 {
         if (q.bytes.len == 1) return self.scoreV2Single(q, entry).?;
         if (q.bytes.len == 2) return self.scoreV2TwoIndexed(q, entry, entry_index);
-        const last_hint = self.indexedLastPosition(entry, entry_index, q.bytes[q.bytes.len - 1]);
+        const last_hint = self.indexedLastPosition(entry, entry_index, q.classes[q.classes.len - 1]);
         return switch (q.bytes.len) {
             3 => self.scoreV2SmallFromFirst(3, q, entry, last_hint),
             4 => self.scoreV2SmallFromFirst(4, q, entry, last_hint),
