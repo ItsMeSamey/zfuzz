@@ -83,6 +83,7 @@ const Options = struct {
     exact: bool = false,
     case_mode: CaseMode = .smart,
     tac: bool = false,
+    tail: ?usize = null,
     mouse: bool = true,
     border: bool = true,
     height_percent: u8 = 100,
@@ -122,17 +123,22 @@ const CandidateSet = struct {
     }
 };
 
+const TerminalSize = struct { rows: usize, cols: usize };
+
 const Terminal = struct {
     file: Io.File,
     original: std.posix.termios,
     active: bool = false,
     mouse: bool,
+    inline_mode: bool,
+    height_percent: u8,
+    inline_rows: usize = 0,
 
-    fn open(io: Io, mouse: bool) !Terminal {
+    fn open(io: Io, mouse: bool, height_percent: u8) !Terminal {
         var file = try Io.Dir.openFileAbsolute(io, "/dev/tty", .{ .mode = .read_write });
         errdefer file.close(io);
         const original = try std.posix.tcgetattr(file.handle);
-        return .{ .file = file, .original = original, .mouse = mouse };
+        return .{ .file = file, .original = original, .mouse = mouse, .inline_mode = height_percent < 100, .height_percent = height_percent };
     }
 
     fn enter(self: *Terminal) !void {
@@ -150,14 +156,38 @@ const Terminal = struct {
         raw.cc[@intFromEnum(std.posix.V.TIME)] = 1;
         try std.posix.tcsetattr(self.file.handle, .FLUSH, raw);
         self.active = true;
-        try self.write("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+        if (self.inline_mode) {
+            const physical = self.physicalSize();
+            self.inline_rows = std.math.clamp(physical.rows * self.height_percent / 100, @as(usize, 3), physical.rows);
+            try self.write("\x1b[?25l");
+            var i: usize = 1;
+            while (i < self.inline_rows) : (i += 1) try self.write("\r\n");
+            if (self.inline_rows > 1) {
+                var buf: [32]u8 = undefined;
+                const up = try std.fmt.bufPrint(&buf, "\x1b[{d}A", .{self.inline_rows - 1});
+                try self.write(up);
+            }
+            try self.write("\r\x1b7");
+        } else {
+            try self.write("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+        }
         if (self.mouse) try self.write("\x1b[?1000h\x1b[?1006h");
     }
 
     fn leave(self: *Terminal) void {
         if (!self.active) return;
         if (self.mouse) self.write("\x1b[?1000l\x1b[?1006l") catch {};
-        self.write("\x1b[?25h\x1b[?1049l") catch {};
+        if (self.inline_mode) {
+            self.write("\x1b8") catch {};
+            var i: usize = 0;
+            while (i < self.inline_rows) : (i += 1) {
+                self.write("\r\x1b[2K") catch {};
+                if (i + 1 < self.inline_rows) self.write("\x1b[1B") catch {};
+            }
+            self.write("\x1b8\r\x1b[?25h") catch {};
+        } else {
+            self.write("\x1b[?25h\x1b[?1049l") catch {};
+        }
         std.posix.tcsetattr(self.file.handle, .FLUSH, self.original) catch {};
         self.active = false;
     }
@@ -188,11 +218,18 @@ const Terminal = struct {
         }
     }
 
-    fn size(self: *Terminal) struct { rows: usize, cols: usize } {
+    fn physicalSize(self: *Terminal) TerminalSize {
         var ws: std.posix.winsize = undefined;
         const rc = std.c.ioctl(self.file.handle, std.c.T.IOCGWINSZ, &ws);
         if (rc != 0 or ws.row == 0 or ws.col == 0) return .{ .rows = 24, .cols = 80 };
         return .{ .rows = ws.row, .cols = ws.col };
+    }
+
+    fn size(self: *Terminal) TerminalSize {
+        const physical = self.physicalSize();
+        if (!self.inline_mode) return physical;
+        const rows = if (self.inline_rows != 0) self.inline_rows else std.math.clamp(physical.rows * self.height_percent / 100, @as(usize, 3), physical.rows);
+        return .{ .rows = rows, .cols = physical.cols };
     }
 };
 
@@ -425,7 +462,7 @@ const Ui = struct {
         var fixed: usize = 1;
         if (self.options.header != null) fixed += 1;
         if (self.options.footer != null) fixed += 1;
-        const effective = @max(@as(usize, 3), rows * self.options.height_percent / 100);
+        const effective = @max(@as(usize, 3), rows);
         return if (effective > fixed) effective - fixed else 1;
     }
 
@@ -854,9 +891,17 @@ const Ui = struct {
         var frame: Io.Writer.Allocating = .init(self.allocator);
         defer frame.deinit();
         const w = &frame.writer;
-        try w.writeAll("\x1b[H\x1b[2J");
+        if (self.terminal.inline_mode) {
+            var clear_row: usize = 1;
+            while (clear_row <= size.rows) : (clear_row += 1) {
+                try cursorTo(w, clear_row, 1, true);
+                try w.writeAll("\x1b[2K");
+            }
+        } else {
+            try w.writeAll("\x1b[H\x1b[2J");
+        }
 
-        if (self.options.border) try drawPaneBorder(w, geom.main);
+        if (self.options.border) try drawPaneBorder(w, geom.main, self.terminal.inline_mode);
         const content = self.contentPane(geom.main);
         var row = content.row;
         if (self.options.layout == .reverse) {
@@ -888,7 +933,7 @@ const Ui = struct {
     }
 
     fn renderPrompt(self: *Ui, w: anytype, row: usize, col: usize, cols: usize) !void {
-        try cursorTo(w, row, col);
+        try cursorTo(w, row, col, self.terminal.inline_mode);
         try w.print("\x1b[1m{s}\x1b[0m", .{self.options.prompt});
         try w.writeAll(self.query.items[0..self.cursor]);
         if (self.cursor < self.query.items.len) {
@@ -912,8 +957,7 @@ const Ui = struct {
     }
 
     fn renderPlainLine(self: *Ui, w: anytype, row: usize, col: usize, text: []const u8, cols: usize) !void {
-        _ = self;
-        try cursorTo(w, row, col);
+        try cursorTo(w, row, col, self.terminal.inline_mode);
         try writeTruncated(w, text, cols, false, "");
     }
 
@@ -923,7 +967,7 @@ const Ui = struct {
         while (line < rows) : (line += 1) {
             const row = start_row + line;
             if (row >= content.row + content.rows) break;
-            try cursorTo(w, row, content.col);
+            try cursorTo(w, row, content.col, self.terminal.inline_mode);
             const logical = if (top_down) self.scroll + line else self.scroll + (rows - 1 - line);
             if (logical >= self.result_len) continue;
             const idx = self.results[logical];
@@ -968,59 +1012,65 @@ const Ui = struct {
     fn renderPreviewOverlay(self: *Ui, frame: *Io.Writer.Allocating, size: anytype, geom: PaneGeometry, preview: Pane) !void {
         const w = &frame.writer;
         switch (self.options.preview.position) {
-            .right => try drawVerticalSeparator(w, 1, size.rows, preview.col - 1),
-            .left => try drawVerticalSeparator(w, 1, size.rows, geom.main.col - 1),
-            .down => try drawHorizontalSeparator(w, preview.row - 1, 1, size.cols),
-            .up => try drawHorizontalSeparator(w, geom.main.row - 1, 1, size.cols),
+            .right => try drawVerticalSeparator(w, 1, size.rows, preview.col - 1, self.terminal.inline_mode),
+            .left => try drawVerticalSeparator(w, 1, size.rows, geom.main.col - 1, self.terminal.inline_mode),
+            .down => try drawHorizontalSeparator(w, preview.row - 1, 1, size.cols, self.terminal.inline_mode),
+            .up => try drawHorizontalSeparator(w, geom.main.row - 1, 1, size.cols, self.terminal.inline_mode),
         }
 
         var lines = std.mem.splitScalar(u8, self.preview_text, '\n');
         var row: usize = 0;
         while (row < preview.rows) : (row += 1) {
             const line = lines.next() orelse break;
-            try cursorTo(w, preview.row + row, preview.col);
+            try cursorTo(w, preview.row + row, preview.col, self.terminal.inline_mode);
             try writeTruncated(w, line, preview.cols, self.options.preview.wrap, "");
         }
     }
 };
 
-fn cursorTo(w: anytype, row: usize, col: usize) !void {
-    try w.print("\x1b[{d};{d}H", .{ row, col });
+fn cursorTo(w: anytype, row: usize, col: usize, inline_mode: bool) !void {
+    if (!inline_mode) {
+        try w.print("\x1b[{d};{d}H", .{ row, col });
+        return;
+    }
+    try w.writeAll("\x1b8");
+    if (row > 1) try w.print("\x1b[{d}B", .{row - 1});
+    try w.print("\x1b[{d}G", .{col});
 }
 
-fn drawPaneBorder(w: anytype, pane: Pane) !void {
+fn drawPaneBorder(w: anytype, pane: Pane, inline_mode: bool) !void {
     if (pane.rows < 2 or pane.cols < 2) return;
-    try cursorTo(w, pane.row, pane.col);
+    try cursorTo(w, pane.row, pane.col, inline_mode);
     try w.writeAll("╭");
     var i: usize = 0;
     while (i + 2 < pane.cols) : (i += 1) try w.writeAll("─");
     try w.writeAll("╮");
     var r: usize = 1;
     while (r + 1 < pane.rows) : (r += 1) {
-        try cursorTo(w, pane.row + r, pane.col);
+        try cursorTo(w, pane.row + r, pane.col, inline_mode);
         try w.writeAll("│");
-        try cursorTo(w, pane.row + r, pane.col + pane.cols - 1);
+        try cursorTo(w, pane.row + r, pane.col + pane.cols - 1, inline_mode);
         try w.writeAll("│");
     }
-    try cursorTo(w, pane.row + pane.rows - 1, pane.col);
+    try cursorTo(w, pane.row + pane.rows - 1, pane.col, inline_mode);
     try w.writeAll("╰");
     i = 0;
     while (i + 2 < pane.cols) : (i += 1) try w.writeAll("─");
     try w.writeAll("╯");
 }
 
-fn drawVerticalSeparator(w: anytype, first_row: usize, rows: usize, col: usize) !void {
+fn drawVerticalSeparator(w: anytype, first_row: usize, rows: usize, col: usize, inline_mode: bool) !void {
     if (col == 0) return;
     var r: usize = 0;
     while (r < rows) : (r += 1) {
-        try cursorTo(w, first_row + r, col);
+        try cursorTo(w, first_row + r, col, inline_mode);
         try w.writeAll("\x1b[2m│\x1b[0m");
     }
 }
 
-fn drawHorizontalSeparator(w: anytype, row: usize, first_col: usize, cols: usize) !void {
+fn drawHorizontalSeparator(w: anytype, row: usize, first_col: usize, cols: usize, inline_mode: bool) !void {
     if (row == 0) return;
-    try cursorTo(w, row, first_col);
+    try cursorTo(w, row, first_col, inline_mode);
     try w.writeAll("\x1b[2m");
     var c: usize = 0;
     while (c < cols) : (c += 1) try w.writeAll("─");
@@ -1070,7 +1120,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var terminal = Terminal.open(init.io, options.mouse) catch {
+    var terminal = Terminal.open(init.io, options.mouse, options.height_percent) catch {
         // No controlling terminal: behave like --filter with the initial query.
         try filterMode(allocator, init.io, &index, &candidates, &options, options.query);
         return;
@@ -1229,12 +1279,34 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             try parseTiebreaks(o, args[i]);
             continue;
         }
+        if (std.mem.startsWith(u8, a, "--tail=")) {
+            const value = try std.fmt.parseInt(usize, a[7..], 10);
+            if (value == 0) return error.InvalidTailCount;
+            o.*.tail = value;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--tail")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            const value = try std.fmt.parseInt(usize, args[i], 10);
+            if (value == 0) return error.InvalidTailCount;
+            o.*.tail = value;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-tail")) {
+            o.*.tail = null;
+            continue;
+        }
         if (std.mem.eql(u8, a, "--tac")) {
             o.*.tac = true;
             continue;
         }
         if (std.mem.eql(u8, a, "--no-mouse")) {
             o.*.mouse = false;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--border")) {
+            o.*.border = true;
             continue;
         }
         if (std.mem.eql(u8, a, "--no-border")) {
@@ -1292,6 +1364,16 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
         }
         if (std.mem.startsWith(u8, a, "--height=")) {
             o.*.height_percent = parsePercent(a[9..]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--height")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.height_percent = parsePercent(args[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-height")) {
+            o.*.height_percent = 100;
             continue;
         }
         if (std.mem.startsWith(u8, a, "--preview=")) {
@@ -1533,30 +1615,115 @@ fn readCandidates(allocator: Allocator, io: Io, options: *const Options, default
         allocator.free(result.stderr);
         return candidatesFromOwnedBlob(allocator, result.stdout, options);
     }
+    if (options.tail) |tail| {
+        const blob = try readTailBlobStdin(allocator, tail, if (options.read0) 0 else '\n');
+        return candidatesFromOwnedBlob(allocator, blob, options);
+    }
     var buffer: [64 * 1024]u8 = undefined;
     var reader = Io.File.stdin().reader(io, &buffer);
     const blob = try reader.interface.allocRemaining(allocator, .unlimited);
     return candidatesFromOwnedBlob(allocator, blob, options);
 }
 
+const TailRing = struct {
+    allocator: Allocator,
+    slots: []?[]u8,
+    total: usize = 0,
+
+    fn push(self: *TailRing, record: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, record);
+        const slot = self.total % self.slots.len;
+        if (self.slots[slot]) |old| self.allocator.free(old);
+        self.slots[slot] = owned;
+        self.total += 1;
+    }
+
+    fn deinit(self: *TailRing) void {
+        for (self.slots) |record| if (record) |owned| self.allocator.free(owned);
+        self.allocator.free(self.slots);
+    }
+};
+
+fn readTailBlobStdin(allocator: Allocator, tail: usize, delim: u8) ![]u8 {
+    const slots = try allocator.alloc(?[]u8, tail);
+    @memset(slots, null);
+    var ring = TailRing{ .allocator = allocator, .slots = slots };
+    defer ring.deinit();
+
+    var current: std.ArrayList(u8) = .empty;
+    defer current.deinit(allocator);
+    var buffer: [64 * 1024]u8 = undefined;
+    var saw_any = false;
+    var last_was_delim = false;
+    while (true) {
+        const n = std.c.read(std.posix.STDIN_FILENO, &buffer, buffer.len);
+        if (n < 0) {
+            const e = std.c._errno().*;
+            if (e == @intFromEnum(std.posix.E.INTR)) continue;
+            return error.ReadFailed;
+        }
+        if (n == 0) break;
+        const count: usize = @intCast(n);
+        saw_any = true;
+        for (buffer[0..count]) |byte| {
+            if (byte == delim) {
+                try ring.push(current.items);
+                current.clearRetainingCapacity();
+                last_was_delim = true;
+            } else {
+                try current.append(allocator, byte);
+                last_was_delim = false;
+            }
+        }
+    }
+    if (saw_any and !last_was_delim) try ring.push(current.items);
+
+    const kept = @min(ring.total, tail);
+    if (kept == 0) return try allocator.alloc(u8, 0);
+    const first = if (ring.total > tail) ring.total % tail else 0;
+    var bytes: usize = kept;
+    for (0..kept) |i| bytes += ring.slots[(first + i) % tail].?.len;
+    const blob = try allocator.alloc(u8, bytes);
+    var at: usize = 0;
+    for (0..kept) |i| {
+        const record = ring.slots[(first + i) % tail].?;
+        @memcpy(blob[at .. at + record.len], record);
+        at += record.len;
+        blob[at] = delim;
+        at += 1;
+    }
+    return blob;
+}
+
 fn candidatesFromOwnedBlob(allocator: Allocator, blob: []u8, options: *const Options) !CandidateSet {
     errdefer allocator.free(blob);
     const delim: u8 = if (options.read0) 0 else '\n';
     var count: usize = 0;
-    var it_count = std.mem.splitScalar(u8, blob, delim);
-    while (it_count.next()) |part| {
-        if (part.len == 0 and it_count.index == null and blob.len != 0 and blob[blob.len - 1] == delim) break;
-        count += 1;
+    if (blob.len != 0) {
+        var it_count = std.mem.splitScalar(u8, blob, delim);
+        while (it_count.next()) |part| {
+            if (part.len == 0 and it_count.index == null and blob[blob.len - 1] == delim) break;
+            count += 1;
+        }
     }
-    const output = try allocator.alloc([]const u8, count);
+    const keep_count = if (options.tail) |tail| @min(count, tail) else count;
+    const skip_count = count - keep_count;
+    const output = try allocator.alloc([]const u8, keep_count);
     errdefer allocator.free(output);
     var it = std.mem.splitScalar(u8, blob, delim);
+    var source_index: usize = 0;
     var n: usize = 0;
     while (it.next()) |part| {
-        if (n >= count) break;
+        if (source_index < skip_count) {
+            source_index += 1;
+            continue;
+        }
+        if (n >= keep_count) break;
         output[n] = if (!options.read0 and part.len != 0 and part[part.len - 1] == '\r') part[0 .. part.len - 1] else part;
         n += 1;
+        source_index += 1;
     }
+    count = keep_count;
     if (options.tac) std.mem.reverse([]const u8, output);
 
     var display: [][]const u8 = output;
@@ -2515,6 +2682,7 @@ const usage =
     \\  -0, --exit-0             exit immediately when there is no match
     \\      --no-sort            preserve input order after filtering
     \\      --tiebreak=CRI       score tie-breaks: length/chunk/pathname/begin/end/index
+    \\      --tail=N             keep only the last N input items in memory
     \\  -d, --delimiter=STR      literal field delimiter
     \\  -n, --nth=EXPR           limit searchable fields
     \\      --with-nth=EXPR      transform displayed fields
@@ -2552,6 +2720,40 @@ const usage =
     \\  Enter accept, Esc/Ctrl-C abort, arrows/Ctrl-J/Ctrl-K move,
     \\  Tab toggle, Ctrl-A/E line edges, Ctrl-U clear, Ctrl-W erase word.
 ;
+
+
+test "tail retains last records and empty input stays empty" {
+    const a = std.testing.allocator;
+    var options: Options = .{ .tail = 2 };
+    defer options.deinit(a);
+    const blob = try a.dupe(u8, "one\ntwo\nthree\nfour\n");
+    var candidates = try candidatesFromOwnedBlob(a, blob, &options);
+    defer candidates.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), candidates.output.len);
+    try std.testing.expectEqualStrings("three", candidates.output[0]);
+    try std.testing.expectEqualStrings("four", candidates.output[1]);
+
+    var empty_options: Options = .{};
+    defer empty_options.deinit(a);
+    const empty_blob = try a.alloc(u8, 0);
+    var empty = try candidatesFromOwnedBlob(a, empty_blob, &empty_options);
+    defer empty.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), empty.output.len);
+}
+
+test "height and border option forms" {
+    const a = std.testing.allocator;
+    var options: Options = .{};
+    defer options.deinit(a);
+    const args = [_][]const u8{ "zfuzz", "--height", "40%", "--border" };
+    try parseOptionsInto(a, &options, &args, 1);
+    try std.testing.expectEqual(@as(u8, 40), options.height_percent);
+    try std.testing.expect(options.border);
+    const reset = [_][]const u8{ "zfuzz", "--no-height", "--no-border" };
+    try parseOptionsInto(a, &options, &reset, 1);
+    try std.testing.expectEqual(@as(u8, 100), options.height_percent);
+    try std.testing.expect(!options.border);
+}
 
 test "strip ANSI CSI" {
     const a = std.testing.allocator;
