@@ -2766,15 +2766,18 @@ pub const Index = struct {
                 }
 
                 const score = @max(match_value, gap_score);
-                const cell = j * 2;
-                current[cell] = score;
-                current[cell + 1] = consecutive;
-                current_mask |= @as(u64, 1) << @intCast(j);
+                if (pattern_index == m - 1) {
+                    max_score = @max(max_score, score);
+                } else {
+                    const cell = j * 2;
+                    current[cell] = score;
+                    current[cell + 1] = consecutive;
+                    current_mask |= @as(u64, 1) << @intCast(j);
+                }
                 have_current = true;
                 current_pos = j;
                 current_score = score;
                 current_consecutive = consecutive;
-                if (pattern_index == m - 1) max_score = @max(max_score, score);
             }
 
             previous_mask = current_mask;
