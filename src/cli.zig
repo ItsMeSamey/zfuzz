@@ -7,6 +7,7 @@ const Io = std.Io;
 const esc = "\x1b[";
 
 const Layout = enum { default, reverse };
+const CaseMode = enum { smart, ignore, respect };
 const PreviewPosition = enum { right, left, up, down };
 
 const PreviewOptions = struct {
@@ -63,6 +64,9 @@ const Options = struct {
     print_query: bool = false,
     no_sort: bool = false,
     disabled: bool = false,
+    extended: bool = true,
+    exact: bool = false,
+    case_mode: CaseMode = .smart,
     tac: bool = false,
     mouse: bool = true,
     border: bool = true,
@@ -294,7 +298,7 @@ const Ui = struct {
         if (self.options.no_sort) self.result_cap = n;
 
         const effective_query: []const u8 = if (self.options.disabled) "" else self.query.items;
-        const found = try self.index.search(effective_query, self.results[0..self.result_cap]);
+        const found = try searchCandidates(self.index, self.candidates, self.options, effective_query, self.results, self.result_cap);
         self.result_len = found.len;
         if (self.options.no_sort) std.mem.sort(usize, self.results[0..self.result_len], {}, comptime std.sort.asc(usize));
         if (self.result_len == 0) {
@@ -907,6 +911,30 @@ fn parseOptions(allocator: Allocator, args: []const []const u8) !Options {
             o.disabled = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "-x") or std.mem.eql(u8, a, "--extended")) {
+            o.extended = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "+x") or std.mem.eql(u8, a, "--no-extended")) {
+            o.extended = false;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "-e") or std.mem.eql(u8, a, "--exact")) {
+            o.exact = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "-i") or std.mem.eql(u8, a, "--ignore-case")) {
+            o.case_mode = .ignore;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "+i") or std.mem.eql(u8, a, "--no-ignore-case")) {
+            o.case_mode = .respect;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--smart-case")) {
+            o.case_mode = .smart;
+            continue;
+        }
         if (std.mem.eql(u8, a, "--tac")) {
             o.tac = true;
             continue;
@@ -1169,9 +1197,267 @@ fn candidatesFromOwnedBlob(allocator: Allocator, blob: []u8, options: *const Opt
     return .{ .blob = blob, .output = output, .display = display, .search = search, .owned_display = owned_display, .owned_search = true };
 }
 
+const TermKind = enum { fuzzy, exact, prefix, suffix, boundary_exact };
+
+const QueryTerm = struct {
+    text: []const u8,
+    kind: TermKind,
+    inverse: bool,
+    clause: u16,
+};
+
+const ParsedQuery = struct {
+    terms: []QueryTerm,
+    clause_count: usize,
+    driver: ?[]const u8,
+    direct: ?[]const u8,
+};
+
+fn searchCandidates(
+    index: *fuzzy.Index,
+    candidates: *const CandidateSet,
+    options: *const Options,
+    query: []const u8,
+    out: []usize,
+    limit: usize,
+) ![]usize {
+    const cap = @min(limit, out.len);
+    if (cap == 0) return out[0..0];
+    if (options.disabled or query.len == 0) {
+        const found = try index.search("", out[0..cap]);
+        return found;
+    }
+
+    var term_buf: [512]QueryTerm = undefined;
+    const parsed = try parseQuery(query, options, &term_buf);
+
+    if (parsed.direct) |direct| {
+        if (!termCaseSensitive(options.case_mode, direct)) {
+            return try index.search(direct, out[0..cap]);
+        }
+    }
+
+    // Any predicate beyond the direct folded fuzzy path can reject candidates
+    // after ranking, so generate a complete ranked stream before compacting.
+    var ranked: []usize = out;
+    if (parsed.driver) |driver| {
+        ranked = try index.search(driver, out);
+    } else {
+        for (out, 0..) |*slot, i| slot.* = i;
+    }
+
+    var write: usize = 0;
+    for (ranked) |idx| {
+        if (!queryMatches(parsed, candidates.search[idx], options.case_mode)) continue;
+        out[write] = idx;
+        write += 1;
+        if (write == cap) break;
+    }
+    return out[0..write];
+}
+
+fn parseQuery(query: []const u8, options: *const Options, storage: *[512]QueryTerm) !ParsedQuery {
+    if (!options.extended) {
+        if (storage.len == 0) return error.TooManyTerms;
+        storage[0] = .{
+            .text = query,
+            .kind = if (options.exact) .exact else .fuzzy,
+            .inverse = false,
+            .clause = 0,
+        };
+        return .{
+            .terms = storage[0..1],
+            .clause_count = 1,
+            .driver = if (!options.exact) query else null,
+            .direct = if (!options.exact) query else null,
+        };
+    }
+
+    var count: usize = 0;
+    var clause: usize = 0;
+    var have_term = false;
+    var join_next = false;
+    var i: usize = 0;
+    while (i < query.len) {
+        while (i < query.len and std.ascii.isWhitespace(query[i])) i += 1;
+        if (i >= query.len) break;
+        const start = i;
+        while (i < query.len and !std.ascii.isWhitespace(query[i])) i += 1;
+        const token = query[start..i];
+        if (std.mem.eql(u8, token, "|")) {
+            if (have_term) join_next = true;
+            continue;
+        }
+        if (count >= storage.len) return error.TooManyTerms;
+        if (have_term and !join_next) clause += 1;
+        join_next = false;
+        storage[count] = parseTerm(token, options.exact, @intCast(clause));
+        count += 1;
+        have_term = true;
+    }
+
+    if (count == 0) return .{ .terms = storage[0..0], .clause_count = 0, .driver = null, .direct = "" };
+
+    var driver: ?[]const u8 = null;
+    var driver_len: usize = 0;
+    var c: usize = 0;
+    while (c <= clause) : (c += 1) {
+        var terms_in_clause: usize = 0;
+        var only: ?QueryTerm = null;
+        for (storage[0..count]) |term| {
+            if (term.clause != c) continue;
+            terms_in_clause += 1;
+            only = term;
+        }
+        if (terms_in_clause == 1) {
+            const term = only.?;
+            if (!term.inverse and term.kind == .fuzzy and term.text.len > driver_len) {
+                driver = term.text;
+                driver_len = term.text.len;
+            }
+        }
+    }
+
+    const direct: ?[]const u8 = if (count == 1 and storage[0].kind == .fuzzy and !storage[0].inverse) storage[0].text else null;
+    return .{ .terms = storage[0..count], .clause_count = clause + 1, .driver = driver, .direct = direct };
+}
+
+fn parseTerm(raw: []const u8, exact_mode: bool, clause: u16) QueryTerm {
+    var text = raw;
+    var inverse = false;
+    if (text.len > 1 and text[0] == '!') {
+        inverse = true;
+        text = text[1..];
+    }
+
+    var kind: TermKind = if (exact_mode) .exact else .fuzzy;
+    if (text.len > 1 and text[0] == '\'') {
+        text = text[1..];
+        kind = if (exact_mode) .fuzzy else .exact;
+        if (!exact_mode and text.len > 1 and text[text.len - 1] == '\'') {
+            text = text[0 .. text.len - 1];
+            kind = .boundary_exact;
+        }
+    } else if (text.len > 1 and text[0] == '^') {
+        text = text[1..];
+        kind = .prefix;
+    } else if (text.len > 1 and text[text.len - 1] == '$') {
+        text = text[0 .. text.len - 1];
+        kind = .suffix;
+    } else if (inverse) {
+        // In extended mode !foo is inverse-exact, matching fzf syntax.
+        kind = .exact;
+    }
+    return .{ .text = text, .kind = kind, .inverse = inverse, .clause = clause };
+}
+
+fn queryMatches(parsed: ParsedQuery, line: []const u8, mode: CaseMode) bool {
+    if (parsed.terms.len == 0) return true;
+    var clause: usize = 0;
+    while (clause < parsed.clause_count) : (clause += 1) {
+        var any = false;
+        for (parsed.terms) |term| {
+            if (term.clause != clause) continue;
+            var matched = termMatches(term, line, mode);
+            if (term.inverse) matched = !matched;
+            if (matched) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) return false;
+    }
+    return true;
+}
+
+fn termMatches(term: QueryTerm, line: []const u8, mode: CaseMode) bool {
+    const sensitive = termCaseSensitive(mode, term.text);
+    return switch (term.kind) {
+        .fuzzy => fuzzySubsequence(line, term.text, sensitive),
+        .exact => containsText(line, term.text, sensitive),
+        .prefix => startsWithText(line, term.text, sensitive),
+        .suffix => endsWithText(line, term.text, sensitive),
+        .boundary_exact => containsBoundaryText(line, term.text, sensitive),
+    };
+}
+
+fn termCaseSensitive(mode: CaseMode, text: []const u8) bool {
+    return switch (mode) {
+        .ignore => false,
+        .respect => true,
+        .smart => blk: {
+            for (text) |c| if (c >= 'A' and c <= 'Z') break :blk true;
+            break :blk false;
+        },
+    };
+}
+
+fn foldAscii(c: u8) u8 {
+    return if (c >= 'A' and c <= 'Z') c + ('a' - 'A') else c;
+}
+
+fn byteEq(a: u8, b: u8, sensitive: bool) bool {
+    return if (sensitive) a == b else foldAscii(a) == foldAscii(b);
+}
+
+fn fuzzySubsequence(line: []const u8, needle: []const u8, sensitive: bool) bool {
+    if (needle.len == 0) return true;
+    var j: usize = 0;
+    for (line) |c| {
+        if (byteEq(c, needle[j], sensitive)) {
+            j += 1;
+            if (j == needle.len) return true;
+        }
+    }
+    return false;
+}
+
+fn containsText(line: []const u8, needle: []const u8, sensitive: bool) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > line.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= line.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len and byteEq(line[i + j], needle[j], sensitive)) : (j += 1) {}
+        if (j == needle.len) return true;
+    }
+    return false;
+}
+
+fn startsWithText(line: []const u8, needle: []const u8, sensitive: bool) bool {
+    if (needle.len > line.len) return false;
+    for (needle, 0..) |c, i| if (!byteEq(line[i], c, sensitive)) return false;
+    return true;
+}
+
+fn endsWithText(line: []const u8, needle: []const u8, sensitive: bool) bool {
+    if (needle.len > line.len) return false;
+    const start = line.len - needle.len;
+    for (needle, 0..) |c, i| if (!byteEq(line[start + i], c, sensitive)) return false;
+    return true;
+}
+
+fn containsBoundaryText(line: []const u8, needle: []const u8, sensitive: bool) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > line.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= line.len) : (i += 1) {
+        if (i != 0 and isWordByte(line[i - 1])) continue;
+        if (i + needle.len < line.len and isWordByte(line[i + needle.len])) continue;
+        var j: usize = 0;
+        while (j < needle.len and byteEq(line[i + j], needle[j], sensitive)) : (j += 1) {}
+        if (j == needle.len) return true;
+    }
+    return false;
+}
+
+fn isWordByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
 fn filterMode(allocator: Allocator, io: Io, index: *fuzzy.Index, candidates: *const CandidateSet, options: *const Options, query: []const u8) !void {
     const out = try allocator.alloc(usize, candidates.display.len);
-    const found = try index.search(query, out);
+    const found = try searchCandidates(index, candidates, options, query, out, out.len);
     if (options.no_sort) std.mem.sort(usize, found, {}, comptime std.sort.asc(usize));
     var stdout_buffer: [8192]u8 = undefined;
     var writer = Io.File.stdout().writerStreaming(io, &stdout_buffer);
@@ -1594,6 +1880,43 @@ test "field transforms" {
     const z = try transformFields(a, "one two three", null, "-1", 0);
     defer a.free(z);
     try std.testing.expectEqualStrings("three", z);
+}
+
+test "extended query syntax" {
+    var storage: [512]QueryTerm = undefined;
+    var options: Options = .{};
+    defer options.deinit(std.testing.allocator);
+    const parsed = try parseQuery("^core go$ | rb$ | py$ !fire", &options, &storage);
+    try std.testing.expectEqual(@as(usize, 3), parsed.clause_count);
+    try std.testing.expect(queryMatches(parsed, "core-tool.py", .smart));
+    try std.testing.expect(!queryMatches(parsed, "core-fire.py", .smart));
+    try std.testing.expect(!queryMatches(parsed, "other-tool.py", .smart));
+}
+
+test "exact inverse boundary and smart case" {
+    var storage: [512]QueryTerm = undefined;
+    var options: Options = .{};
+    defer options.deinit(std.testing.allocator);
+    var parsed = try parseQuery("'foo' !bar", &options, &storage);
+    try std.testing.expect(queryMatches(parsed, "xx foo yy", .smart));
+    try std.testing.expect(!queryMatches(parsed, "xx foobar yy", .smart));
+    try std.testing.expect(!queryMatches(parsed, "xx foo BAR yy", .ignore));
+
+    parsed = try parseQuery("Foo", &options, &storage);
+    try std.testing.expect(queryMatches(parsed, "xxFoo", .smart));
+    try std.testing.expect(!queryMatches(parsed, "xxfoo", .smart));
+    try std.testing.expect(queryMatches(parsed, "xxfoo", .ignore));
+}
+
+test "exact mode quote flips back to fuzzy" {
+    var storage: [512]QueryTerm = undefined;
+    var options: Options = .{ .exact = true };
+    defer options.deinit(std.testing.allocator);
+    const exact = try parseQuery("abc", &options, &storage);
+    try std.testing.expect(queryMatches(exact, "xxabcxx", .smart));
+    try std.testing.expect(!queryMatches(exact, "axbyc", .smart));
+    const fuzzy_term = try parseQuery("'abc", &options, &storage);
+    try std.testing.expect(queryMatches(fuzzy_term, "axbyc", .smart));
 }
 
 test "binding parser" {
