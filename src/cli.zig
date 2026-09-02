@@ -84,6 +84,7 @@ const Options = struct {
     case_mode: CaseMode = .smart,
     tac: bool = false,
     tail: ?usize = null,
+    sync: bool = false,
     mouse: bool = true,
     border: bool = true,
     height_percent: u8 = 100,
@@ -120,6 +121,121 @@ const CandidateSet = struct {
         }
         allocator.free(self.output);
         allocator.free(self.blob);
+    }
+};
+
+
+const StreamUpdate = struct {
+    changed: bool = false,
+    eof_became: bool = false,
+};
+
+const StreamInput = struct {
+    allocator: Allocator,
+    delim: u8,
+    tail: ?usize,
+    records: std.ArrayList([]u8) = .empty,
+    head: usize = 0,
+    partial: std.ArrayList(u8) = .empty,
+    eof: bool = false,
+
+    fn init(allocator: Allocator, delim: u8, tail: ?usize) StreamInput {
+        return .{ .allocator = allocator, .delim = delim, .tail = tail };
+    }
+
+    fn deinit(self: *StreamInput) void {
+        for (self.records.items[self.head..]) |record| self.allocator.free(record);
+        self.records.deinit(self.allocator);
+        self.partial.deinit(self.allocator);
+    }
+
+    fn activeRecords(self: *const StreamInput) []const []u8 {
+        return self.records.items[self.head..];
+    }
+
+    fn pushRecord(self: *StreamInput, record: []const u8) !void {
+        if (self.tail) |limit| {
+            while (self.records.items.len - self.head >= limit) {
+                self.allocator.free(self.records.items[self.head]);
+                self.head += 1;
+            }
+        }
+        const owned = try self.allocator.dupe(u8, record);
+        errdefer self.allocator.free(owned);
+        try self.records.append(self.allocator, owned);
+        if (self.head >= 4096 and self.head * 2 >= self.records.items.len) {
+            const active = self.records.items[self.head..];
+            std.mem.copyForwards([]u8, self.records.items[0..active.len], active);
+            self.records.shrinkRetainingCapacity(active.len);
+            self.head = 0;
+        }
+    }
+
+    fn consume(self: *StreamInput, bytes: []const u8) !bool {
+        var changed = false;
+        for (bytes) |byte| {
+            if (byte == self.delim) {
+                try self.pushRecord(self.partial.items);
+                self.partial.clearRetainingCapacity();
+                changed = true;
+            } else {
+                try self.partial.append(self.allocator, byte);
+            }
+        }
+        return changed;
+    }
+
+    fn finish(self: *StreamInput) !bool {
+        if (self.eof) return false;
+        self.eof = true;
+        if (self.partial.items.len == 0) return false;
+        try self.pushRecord(self.partial.items);
+        self.partial.clearRetainingCapacity();
+        return true;
+    }
+
+    fn readAvailable(self: *StreamInput) !StreamUpdate {
+        if (self.eof) return .{};
+        var update: StreamUpdate = .{};
+        var buffer: [64 * 1024]u8 = undefined;
+        var bytes_this_tick: usize = 0;
+        while (bytes_this_tick < 1024 * 1024) {
+            var fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = try std.posix.poll(&fds, 0);
+            if (ready == 0) break;
+            const revents = fds[0].revents;
+            if ((revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) == 0) break;
+            const n = std.c.read(std.posix.STDIN_FILENO, &buffer, buffer.len);
+            if (n < 0) {
+                const e = std.c._errno().*;
+                if (e == @intFromEnum(std.posix.E.INTR)) continue;
+                return error.ReadFailed;
+            }
+            if (n == 0) {
+                update.changed = (try self.finish()) or update.changed;
+                update.eof_became = true;
+                break;
+            }
+            const count: usize = @intCast(n);
+            bytes_this_tick += count;
+            update.changed = (try self.consume(buffer[0..count])) or update.changed;
+        }
+        return update;
+    }
+
+    fn materializeBlob(self: *const StreamInput) ![]u8 {
+        const records = self.activeRecords();
+        var len: usize = records.len;
+        for (records) |record| len += record.len;
+        const blob = try self.allocator.alloc(u8, len);
+        var at: usize = 0;
+        for (records) |record| {
+            @memcpy(blob[at .. at + record.len], record);
+            at += record.len;
+            blob[at] = self.delim;
+            at += 1;
+        }
+        return blob;
     }
 };
 
@@ -276,6 +392,7 @@ const Ui = struct {
     candidates: *CandidateSet,
     index: *fuzzy.Index,
     terminal: *Terminal,
+    stream: ?*StreamInput,
     query: std.ArrayList(u8) = .empty,
     cursor: usize = 0,
     results: []usize,
@@ -304,6 +421,7 @@ const Ui = struct {
         candidates: *CandidateSet,
         index: *fuzzy.Index,
         terminal: *Terminal,
+        stream: ?*StreamInput,
     ) !Ui {
         var query: std.ArrayList(u8) = .empty;
         try query.appendSlice(allocator, options.query);
@@ -320,6 +438,7 @@ const Ui = struct {
             .candidates = candidates,
             .index = index,
             .terminal = terminal,
+            .stream = stream,
             .query = query,
             .cursor = options.query.len,
             .results = results,
@@ -339,18 +458,28 @@ const Ui = struct {
 
     fn run(self: *Ui) !u8 {
         try self.refreshSearch(true);
-        if (self.options.select_1 and self.result_len == 1) {
+        const input_complete = self.stream == null or self.stream.?.eof;
+        if (input_complete and self.options.select_1 and self.result_len == 1) {
             try self.emitSelection(null);
             return 0;
         }
-        if (self.options.exit_0 and self.result_len == 0) return 1;
+        if (input_complete and self.options.exit_0 and self.result_len == 0) return 1;
 
         try self.terminal.enter();
         defer self.terminal.leave();
 
         if (try self.fireEvent("start")) |code| return code;
-        self.load_event_pending = true;
+        self.load_event_pending = input_complete;
         while (true) {
+            var stream_finished = false;
+            if (self.stream) |stream| {
+                const update = try stream.readAvailable();
+                if (update.changed) try self.refreshFromStream();
+                if (update.eof_became) {
+                    self.load_event_pending = true;
+                    stream_finished = true;
+                }
+            }
             if (self.load_event_pending) {
                 self.load_event_pending = false;
                 if (try self.fireEvent("load")) |code| return code;
@@ -360,6 +489,13 @@ const Ui = struct {
                 if (try self.fireEvent("change")) |code| return code;
             }
             if (self.dirty_search) try self.refreshSearch(false);
+            if (stream_finished) {
+                if (self.options.select_1 and self.result_len == 1) {
+                    try self.emitSelection(null);
+                    return 0;
+                }
+                if (self.options.exit_0 and self.result_len == 0) return 1;
+            }
             if (self.result_event_pending) {
                 self.result_event_pending = false;
                 if (try self.fireEvent("result")) |code| return code;
@@ -684,7 +820,66 @@ const Ui = struct {
         );
     }
 
+    fn replaceCandidates(self: *Ui, new_candidates: CandidateSet, new_index: fuzzy.Index, mark_load: bool) !void {
+        const new_results = try self.allocator.alloc(usize, new_candidates.display.len);
+        errdefer self.allocator.free(new_results);
+        const new_extended_ranks = try self.allocator.alloc(ExtendedRank, new_candidates.display.len);
+        errdefer self.allocator.free(new_extended_ranks);
+        const new_selected = try self.allocator.alloc(bool, new_candidates.display.len);
+        errdefer self.allocator.free(new_selected);
+        @memset(new_selected, false);
+
+        var new_order: std.ArrayList(usize) = .empty;
+        errdefer new_order.deinit(self.allocator);
+        for (self.selection_order.items) |old_idx| {
+            if (old_idx >= self.candidates.output.len or !self.selected[old_idx]) continue;
+            const old_value = self.candidates.output[old_idx];
+            for (new_candidates.output, 0..) |new_value, new_idx| {
+                if (new_selected[new_idx]) continue;
+                if (std.mem.eql(u8, old_value, new_value)) {
+                    new_selected[new_idx] = true;
+                    try new_order.append(self.allocator, new_idx);
+                    break;
+                }
+            }
+        }
+
+        self.index.deinit();
+        self.candidates.deinit(self.allocator);
+        self.allocator.free(self.results);
+        self.allocator.free(self.extended_ranks);
+        self.allocator.free(self.selected);
+        self.selection_order.deinit(self.allocator);
+
+        self.candidates.* = new_candidates;
+        self.index.* = new_index;
+        self.results = new_results;
+        self.extended_ranks = new_extended_ranks;
+        self.selected = new_selected;
+        self.selection_order = new_order;
+        self.selected_count = self.selection_order.items.len;
+        self.result_len = 0;
+        self.result_cap = 0;
+        self.focus = 0;
+        self.scroll = 0;
+        self.dirty_search = true;
+        self.preview_cache_key = null;
+        if (mark_load) self.load_event_pending = true;
+        self.focus_event_pending = true;
+    }
+
+    fn refreshFromStream(self: *Ui) !void {
+        const stream = self.stream orelse return;
+        const blob = try stream.materializeBlob();
+        var new_candidates = try candidatesFromOwnedBlob(self.allocator, blob, self.options);
+        errdefer new_candidates.deinit(self.allocator);
+        var new_index = try fuzzy.init(self.allocator, new_candidates.search);
+        errdefer new_index.deinit();
+        try self.replaceCandidates(new_candidates, new_index, false);
+    }
+
     fn reloadFromCommand(self: *Ui, command: []const u8) !void {
+        self.stream = null;
         const expanded = try self.expandedCommand(command);
         defer self.allocator.free(expanded);
         const result = try std.process.run(self.allocator, self.io, .{
@@ -693,36 +888,11 @@ const Ui = struct {
             .stderr_limit = .limited(1024 * 1024),
         });
         defer self.allocator.free(result.stderr);
-        var new_candidates = candidatesFromOwnedBlob(self.allocator, result.stdout, self.options) catch |err| {
-            self.allocator.free(result.stdout);
-            return err;
-        };
+        var new_candidates = try candidatesFromOwnedBlob(self.allocator, result.stdout, self.options);
         errdefer new_candidates.deinit(self.allocator);
         var new_index = try fuzzy.init(self.allocator, new_candidates.search);
         errdefer new_index.deinit();
-        const new_results = try self.allocator.alloc(usize, new_candidates.display.len);
-        const new_selected = try self.allocator.alloc(bool, new_candidates.display.len);
-        @memset(new_selected, false);
-
-        self.index.deinit();
-        self.candidates.deinit(self.allocator);
-        self.allocator.free(self.results);
-        self.allocator.free(self.extended_ranks);
-        self.allocator.free(self.selected);
-        self.candidates.* = new_candidates;
-        self.index.* = new_index;
-        self.results = new_results;
-        self.selected = new_selected;
-        self.selected_count = 0;
-        self.selection_order.clearRetainingCapacity();
-        self.result_len = 0;
-        self.result_cap = 0;
-        self.focus = 0;
-        self.scroll = 0;
-        self.dirty_search = true;
-        self.preview_cache_key = null;
-        self.load_event_pending = true;
-        self.focus_event_pending = true;
+        try self.replaceCandidates(new_candidates, new_index, true);
     }
 
     fn executeCommand(self: *Ui, command: []const u8, silent: bool) !void {
@@ -1078,7 +1248,7 @@ fn drawHorizontalSeparator(w: anytype, row: usize, first_col: usize, cols: usize
 }
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.arena.allocator();
+    const allocator = std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(allocator);
     var options: Options = .{};
     if (init.environ_map.get("FZF_DEFAULT_OPTS")) |defaults_text| {
@@ -1109,7 +1279,24 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var candidates = try readCandidates(allocator, init.io, &options, init.environ_map.get("FZF_DEFAULT_COMMAND"));
+    var terminal_opt: ?Terminal = if (options.filter == null)
+        Terminal.open(init.io, options.mouse, options.height_percent) catch null
+    else
+        null;
+    defer if (terminal_opt) |*terminal| terminal.close(init.io);
+
+    const live_stdin = terminal_opt != null and std.c.isatty(std.posix.STDIN_FILENO) != 1 and !options.sync;
+    var stream_input: ?StreamInput = if (live_stdin)
+        StreamInput.init(allocator, if (options.read0) 0 else '\n', options.tail)
+    else
+        null;
+    defer if (stream_input) |*stream| stream.deinit();
+
+    var candidates = if (stream_input) |*stream| blk: {
+        _ = try stream.readAvailable();
+        const blob = try stream.materializeBlob();
+        break :blk try candidatesFromOwnedBlob(allocator, blob, &options);
+    } else try readCandidates(allocator, init.io, &options, init.environ_map.get("FZF_DEFAULT_COMMAND"));
     defer candidates.deinit(allocator);
 
     var index = try fuzzy.init(allocator, candidates.search);
@@ -1120,14 +1307,13 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var terminal = Terminal.open(init.io, options.mouse, options.height_percent) catch {
+    const terminal = if (terminal_opt) |*value| value else {
         // No controlling terminal: behave like --filter with the initial query.
         try filterMode(allocator, init.io, &index, &candidates, &options, options.query);
         return;
     };
-    defer terminal.close(init.io);
 
-    var ui = try Ui.init(allocator, init.io, &options, &candidates, &index, &terminal);
+    var ui = try Ui.init(allocator, init.io, &options, &candidates, &index, terminal, if (stream_input) |*stream| stream else null);
     defer ui.deinit();
     const code = try ui.run();
     if (code != 0) std.process.exit(code);
@@ -1194,8 +1380,11 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "--version") or
-            std.mem.eql(u8, a, "--bash") or std.mem.eql(u8, a, "--zsh") or std.mem.eql(u8, a, "--fish") or
-            std.mem.eql(u8, a, "--sync")) continue;
+            std.mem.eql(u8, a, "--bash") or std.mem.eql(u8, a, "--zsh") or std.mem.eql(u8, a, "--fish")) continue;
+        if (std.mem.eql(u8, a, "--sync")) {
+            o.*.sync = true;
+            continue;
+        }
         if (std.mem.eql(u8, a, "-m") or std.mem.eql(u8, a, "--multi")) {
             o.*.multi = true;
             continue;
@@ -2722,6 +2911,21 @@ const usage =
 ;
 
 
+test "stream input retains bounded tail across partial records" {
+    const a = std.testing.allocator;
+    var stream = StreamInput.init(a, '\n', 2);
+    defer stream.deinit();
+    try std.testing.expect(try stream.consume("a\nb\nc\n"));
+    var blob = try stream.materializeBlob();
+    try std.testing.expectEqualStrings("b\nc\n", blob);
+    a.free(blob);
+    try std.testing.expect(!(try stream.consume("d")));
+    try std.testing.expect(try stream.finish());
+    blob = try stream.materializeBlob();
+    defer a.free(blob);
+    try std.testing.expectEqualStrings("c\nd\n", blob);
+}
+
 test "tail retains last records and empty input stays empty" {
     const a = std.testing.allocator;
     var options: Options = .{ .tail = 2 };
@@ -2745,10 +2949,11 @@ test "height and border option forms" {
     const a = std.testing.allocator;
     var options: Options = .{};
     defer options.deinit(a);
-    const args = [_][]const u8{ "zfuzz", "--height", "40%", "--border" };
+    const args = [_][]const u8{ "zfuzz", "--height", "40%", "--border", "--sync" };
     try parseOptionsInto(a, &options, &args, 1);
     try std.testing.expectEqual(@as(u8, 40), options.height_percent);
     try std.testing.expect(options.border);
+    try std.testing.expect(options.sync);
     const reset = [_][]const u8{ "zfuzz", "--no-height", "--no-border" };
     try parseOptionsInto(a, &options, &reset, 1);
     try std.testing.expectEqual(@as(u8, 100), options.height_percent);
