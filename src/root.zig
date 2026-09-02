@@ -110,6 +110,75 @@ const bound_bonus4 = makeBoundBonusTable(4);
 const bound_bonus5 = makeBoundBonusTable(5);
 const bound_bonus6 = makeBoundBonusTable(6);
 
+fn categoryBonusValue(category: u2) u8 {
+    return switch (category) {
+        0 => 0,
+        1 => 8,
+        2 => 9,
+        3 => 10,
+    };
+}
+
+fn makeBoundFirst4Sum() [256]u8 {
+    @setEvalBranchQuota(20000);
+    var out: [256]u8 = undefined;
+    for (0..256) |packed_value| {
+        var x = packed_value;
+        var prefix: u2 = 0;
+        var total: u8 = 0;
+        for (0..4) |i| {
+            const category: u2 = @truncate(x);
+            x >>= 2;
+            prefix = @max(prefix, category);
+            const b = categoryBonusValue(prefix);
+            total += if (i == 0) b * bonus_first_char_multiplier else @max(b, bonus_consecutive);
+        }
+        out[packed_value] = total;
+    }
+    return out;
+}
+
+fn makeBoundFirst4Out() [256]u8 {
+    @setEvalBranchQuota(10000);
+    var out: [256]u8 = undefined;
+    for (0..256) |packed_value| {
+        var x = packed_value;
+        var prefix: u2 = 0;
+        for (0..4) |_| {
+            const category: u2 = @truncate(x);
+            x >>= 2;
+            prefix = @max(prefix, category);
+        }
+        out[packed_value] = prefix;
+    }
+    return out;
+}
+
+fn makeBoundNextSum(comptime count: usize) [4][1 << (2 * count)]u8 {
+    @setEvalBranchQuota(100000);
+    var out: [4][1 << (2 * count)]u8 = undefined;
+    for (0..4) |incoming| {
+        for (0..out[incoming].len) |packed_value| {
+            var x = packed_value;
+            var prefix: u2 = @intCast(incoming);
+            var total: u8 = 0;
+            for (0..count) |_| {
+                const category: u2 = @truncate(x);
+                x >>= 2;
+                prefix = @max(prefix, category);
+                total += @max(categoryBonusValue(prefix), bonus_consecutive);
+            }
+            out[incoming][packed_value] = total;
+        }
+    }
+    return out;
+}
+
+const bound_first4_sum = makeBoundFirst4Sum();
+const bound_first4_out = makeBoundFirst4Out();
+const bound_next3_sum = makeBoundNextSum(3);
+const bound_next4_sum = makeBoundNextSum(4);
+
 fn bonusCategoryRaw(caps: BonusCaps, class: u6) u2 {
     const class_index: usize = @intCast(class);
     const word = class_index >> 5;
@@ -932,6 +1001,22 @@ pub const Index = struct {
         return upper - @min(gap_cost, first_upper);
     }
 
+    noinline fn scoreUpperBound78(q: *const Query, caps: BonusCaps) i32 {
+        const m = q.bytes.len;
+        const packed_index = if (m == 7)
+            packedBoundIndex(7, caps, q.classes)
+        else
+            packedBoundIndex(8, caps, q.classes);
+        const low = packed_index & 0xff;
+        const first_sum = bound_first4_sum[low];
+        const incoming: usize = bound_first4_out[low];
+        const tail_sum = if (m == 7)
+            bound_next3_sum[incoming][(packed_index >> 8) & 0x3f]
+        else
+            bound_next4_sum[incoming][packed_index >> 8];
+        return @as(i32, @intCast(m)) * score_match + @as(i32, first_sum) + @as(i32, tail_sum);
+    }
+
     /// Safe upper bound for any fzf V2 alignment of this query/candidate.
     ///
     /// Candidate preprocessing stores the maximum raw fzf bonus for each of
@@ -949,6 +1034,7 @@ pub const Index = struct {
             4 => return 4 * score_match + @as(i32, bound_bonus4[packedBoundIndex(4, caps, q.classes)]),
             5 => return 5 * score_match + @as(i32, bound_bonus5[packedBoundIndex(5, caps, q.classes)]),
             6 => return 6 * score_match + @as(i32, bound_bonus6[packedBoundIndex(6, caps, q.classes)]),
+            7, 8 => return scoreUpperBound78(q, caps),
             else => {},
         }
         return scoreUpperBoundGeneric(q, caps);
