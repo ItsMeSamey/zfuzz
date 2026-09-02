@@ -519,6 +519,8 @@ pub const Index = struct {
         try self.ensureStage(top_k);
         const first_class: usize = @intCast(q.classes[0]);
         const first_slot: u8 = if (first_class < exact_signature_classes) self.last_slot_for_class[first_class] else 0xff;
+        const last_class: usize = @intCast(q.classes[q.classes.len - 1]);
+        const last_slot: u8 = if (last_class < exact_signature_classes) self.last_slot_for_class[last_class] else 0xff;
 
         if (q.bytes.len == 1 and top_k <= single_cache_limit) {
             const class: usize = @intCast(signatureClass(q.bytes[0]));
@@ -603,7 +605,10 @@ pub const Index = struct {
                 // that cache is allowed to be a superset, so future prefix
                 // extensions remain exact.
                 if (stage_len == top_k) {
-                    const upper = self.scoreUpperBound(&q, self.bonus_caps[entry_index]);
+                    var upper = self.scoreUpperBound(&q, self.bonus_caps[entry_index]);
+                    if (q.bytes.len >= 5) {
+                        upper = self.endpointSpanUpperBound(&q, entry, entry_index, first_slot, last_slot, self.bonus_caps[entry_index], upper);
+                    }
                     const worst = self.stage[0];
                     const worst_entry = self.entries[worst.entry];
                     if (upper < worst.score or
@@ -865,6 +870,39 @@ pub const Index = struct {
             if (pattern_index == q.bytes.len) return true;
         }
         return false;
+    }
+
+    /// Tighten an existing score ceiling using only endpoint occurrence metadata.
+    ///
+    /// Any ordered alignment must start no later than the candidate's last
+    /// occurrence of q[0] and end no earlier than its first occurrence of
+    /// q[m-1]. If those endpoints force more span than m matched bytes can
+    /// occupy, every alignment contains at least that many gap bytes. Charging
+    /// them as one gap run is the least-negative possible fzf gap penalty, so
+    /// subtracting it from an already-safe ceiling remains an upper bound.
+    fn endpointSpanUpperBound(
+        self: *const Index,
+        q: *const Query,
+        entry: Entry,
+        entry_index: usize,
+        first_slot: u8,
+        last_slot: u8,
+        caps: BonusCaps,
+        upper: i32,
+    ) i32 {
+        if (entry.len >= 256 or first_slot == 0xff or last_slot == 0xff) return upper;
+
+        const first_meta = self.last_positions[@as(usize, first_slot) * self.entries.len + entry_index];
+        const last_meta = self.last_positions[@as(usize, last_slot) * self.entries.len + entry_index];
+        if (first_meta.last == 0xff or last_meta.first == 0xff) return upper;
+        if (last_meta.first <= first_meta.last) return upper;
+
+        const forced_span = @as(usize, last_meta.first) - @as(usize, first_meta.last) + 1;
+        if (forced_span <= q.bytes.len) return upper;
+        const forced_gap = forced_span - q.bytes.len;
+        const gap_cost = -score_gap_start + @as(i32, @intCast(forced_gap - 1)) * -score_gap_extension;
+        const first_upper = score_match + bonusCap(caps, q.classes[0]) * bonus_first_char_multiplier;
+        return upper - @min(gap_cost, first_upper);
     }
 
     /// Safe upper bound for any fzf V2 alignment of this query/candidate.
@@ -2952,6 +2990,47 @@ test "score ceiling never underestimates representative V2 scores" {
             const actual = index.scoreV2(&q, entry) orelse continue;
             const ceiling = index.scoreUpperBound(&q, index.bonus_caps[i]);
             try std.testing.expect(actual <= ceiling);
+        }
+    }
+}
+
+test "endpoint-span ceiling remains above exact V2 after score floor" {
+    const values = [_][]const u8{
+        "a----------------------------------------bcde",
+        "a___b___c___d___e",
+        "alpha_beta_gamma_delta_epsilon",
+        "irxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxktq-",
+        "one/two/three/four/five/six/seven",
+        "abcdeabcdeabcde",
+    };
+    const queries = [_][]const u8{ "abcde", "abgde", "irktq-", "ottffs", "abcdea" };
+
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+
+    for (queries) |text| {
+        const q = index.compileQuery(text);
+        if (q.bytes.len < 5) continue;
+        const first_class: usize = @intCast(q.classes[0]);
+        const last_class: usize = @intCast(q.classes[q.classes.len - 1]);
+        if (first_class >= exact_signature_classes or last_class >= exact_signature_classes) continue;
+        const first_slot = index.last_slot_for_class[first_class];
+        const last_slot = index.last_slot_for_class[last_class];
+        if (first_slot == 0xff or last_slot == 0xff) continue;
+
+        for (index.entries, 0..) |entry, i| {
+            const actual = index.scoreV2(&q, entry) orelse continue;
+            const upper = index.scoreUpperBound(&q, index.bonus_caps[i]);
+            const tightened = index.endpointSpanUpperBound(
+                &q,
+                entry,
+                i,
+                first_slot,
+                last_slot,
+                index.bonus_caps[i],
+                upper,
+            );
+            try std.testing.expect(actual <= tightened);
         }
     }
 }
