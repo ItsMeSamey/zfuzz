@@ -1,5 +1,6 @@
 const std = @import("std");
 const fuzzy = @import("fuzzy");
+const fuzzy_engine = @import("engine");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -9,6 +10,7 @@ const esc = "\x1b[";
 const Layout = enum { default, reverse };
 const CaseMode = enum { smart, ignore, respect };
 const PreviewPosition = enum { right, left, up, down };
+const TieBreak = enum { length, chunk, pathname, begin, end };
 
 const PreviewOptions = struct {
     command: ?[]const u8 = null,
@@ -74,6 +76,8 @@ const Options = struct {
     exit_0: bool = false,
     print_query: bool = false,
     no_sort: bool = false,
+    tiebreaks: [3]TieBreak = .{ .length, .length, .length },
+    tiebreak_count: u2 = 1,
     disabled: bool = false,
     extended: bool = true,
     exact: bool = false,
@@ -238,6 +242,7 @@ const Ui = struct {
     query: std.ArrayList(u8) = .empty,
     cursor: usize = 0,
     results: []usize,
+    extended_ranks: []ExtendedRank,
     result_len: usize = 0,
     result_cap: usize = 0,
     focus: usize = 0,
@@ -267,6 +272,8 @@ const Ui = struct {
         try query.appendSlice(allocator, options.query);
         const results = try allocator.alloc(usize, candidates.display.len);
         errdefer allocator.free(results);
+        const extended_ranks = try allocator.alloc(ExtendedRank, candidates.display.len);
+        errdefer allocator.free(extended_ranks);
         const selected = try allocator.alloc(bool, candidates.display.len);
         @memset(selected, false);
         return .{
@@ -279,6 +286,7 @@ const Ui = struct {
             .query = query,
             .cursor = options.query.len,
             .results = results,
+            .extended_ranks = extended_ranks,
             .selected = selected,
         };
     }
@@ -286,6 +294,7 @@ const Ui = struct {
     fn deinit(self: *Ui) void {
         self.query.deinit(self.allocator);
         self.allocator.free(self.results);
+        self.allocator.free(self.extended_ranks);
         self.allocator.free(self.selected);
         self.selection_order.deinit(self.allocator);
         if (self.preview_text.len != 0) self.allocator.free(self.preview_text);
@@ -338,7 +347,7 @@ const Ui = struct {
 
         const effective_query: []const u8 = if (self.options.disabled) "" else self.query.items;
         const old_focus_idx: ?usize = if (self.result_len == 0) null else self.results[self.focus];
-        const found = try searchCandidates(self.index, self.candidates, self.options, effective_query, self.results, self.result_cap);
+        const found = try searchCandidates(self.index, self.candidates, self.options, effective_query, self.results, self.extended_ranks, self.result_cap);
         self.result_len = found.len;
         if (self.options.no_sort) std.mem.sort(usize, self.results[0..self.result_len], {}, comptime std.sort.asc(usize));
         if (self.result_len == 0) {
@@ -661,6 +670,7 @@ const Ui = struct {
         self.index.deinit();
         self.candidates.deinit(self.allocator);
         self.allocator.free(self.results);
+        self.allocator.free(self.extended_ranks);
         self.allocator.free(self.selected);
         self.candidates.* = new_candidates;
         self.index.* = new_index;
@@ -1209,6 +1219,16 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.case_mode = .smart;
             continue;
         }
+        if (std.mem.startsWith(u8, a, "--tiebreak=")) {
+            try parseTiebreaks(o, a[11..]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--tiebreak")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            try parseTiebreaks(o, args[i]);
+            continue;
+        }
         if (std.mem.eql(u8, a, "--tac")) {
             o.*.tac = true;
             continue;
@@ -1357,6 +1377,52 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
         return error.UnknownOption;
     }
     return;
+}
+
+fn parseTiebreaks(options: *Options, spec: []const u8) !void {
+    var seen_length = false;
+    var seen_chunk = false;
+    var seen_pathname = false;
+    var seen_begin = false;
+    var seen_end = false;
+    var seen_index = false;
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, spec, ',');
+    while (it.next()) |raw| {
+        const token = std.mem.trim(u8, raw, " \t");
+        if (token.len == 0) return error.InvalidSortCriterion;
+        if (seen_index) return error.IndexMustBeLastCriterion;
+        if (std.ascii.eqlIgnoreCase(token, "index")) {
+            if (seen_index) return error.DuplicateSortCriterion;
+            seen_index = true;
+            continue;
+        }
+        if (count == options.tiebreaks.len) return error.TooManySortCriteria;
+        const kind: TieBreak = if (std.ascii.eqlIgnoreCase(token, "length")) blk: {
+            if (seen_length) return error.DuplicateSortCriterion;
+            seen_length = true;
+            break :blk .length;
+        } else if (std.ascii.eqlIgnoreCase(token, "chunk")) blk: {
+            if (seen_chunk) return error.DuplicateSortCriterion;
+            seen_chunk = true;
+            break :blk .chunk;
+        } else if (std.ascii.eqlIgnoreCase(token, "pathname")) blk: {
+            if (seen_pathname) return error.DuplicateSortCriterion;
+            seen_pathname = true;
+            break :blk .pathname;
+        } else if (std.ascii.eqlIgnoreCase(token, "begin")) blk: {
+            if (seen_begin) return error.DuplicateSortCriterion;
+            seen_begin = true;
+            break :blk .begin;
+        } else if (std.ascii.eqlIgnoreCase(token, "end")) blk: {
+            if (seen_end) return error.DuplicateSortCriterion;
+            seen_end = true;
+            break :blk .end;
+        } else return error.InvalidSortCriterion;
+        options.tiebreaks[count] = kind;
+        count += 1;
+    }
+    options.tiebreak_count = @intCast(count);
 }
 
 fn parseBindings(allocator: Allocator, out: *std.ArrayList(Binding), spec: []const u8) !void {
@@ -1534,7 +1600,7 @@ fn candidatesFromOwnedBlob(allocator: Allocator, blob: []u8, options: *const Opt
     return .{ .blob = blob, .output = output, .display = display, .search = search, .owned_display = owned_display, .owned_search = true };
 }
 
-const TermKind = enum { fuzzy, exact, prefix, suffix, boundary_exact };
+const TermKind = enum { fuzzy, exact, prefix, suffix, boundary_exact, equal };
 
 const QueryTerm = struct {
     text: []const u8,
@@ -1548,7 +1614,112 @@ const ParsedQuery = struct {
     clause_count: usize,
     driver: ?[]const u8,
     direct: ?[]const u8,
+    sortable: bool,
 };
+
+const CandidateScore = struct {
+    score: i32 = 0,
+    min_begin: usize = std.math.maxInt(usize),
+    min_end: usize = std.math.maxInt(usize),
+    max_end: usize = 0,
+    valid_offset: bool = false,
+
+    fn add(self: *CandidateScore, matched: fuzzy_engine.CliMatch) void {
+        self.score += matched.score;
+        if (matched.start < matched.end) {
+            self.min_begin = @min(self.min_begin, matched.start);
+            self.min_end = @min(self.min_end, matched.end);
+            self.max_end = @max(self.max_end, matched.end);
+            self.valid_offset = true;
+        }
+    }
+};
+
+const ExtendedRank = struct {
+    entry: usize,
+    score: CandidateScore,
+};
+
+const RankContext = struct {
+    candidates: *const CandidateSet,
+    options: *const Options,
+};
+
+fn trimLength(line: []const u8) usize {
+    var start: usize = 0;
+    var end = line.len;
+    while (start < end and std.ascii.isWhitespace(line[start])) start += 1;
+    while (end > start and std.ascii.isWhitespace(line[end - 1])) end -= 1;
+    return end - start;
+}
+
+fn tiebreakValue(kind: TieBreak, line: []const u8, score: CandidateScore) usize {
+    const invalid = std.math.maxInt(usize);
+    return switch (kind) {
+        .length => trimLength(line),
+        .chunk => blk: {
+            if (!score.valid_offset) break :blk invalid;
+            var begin = score.min_begin;
+            var end = score.max_end;
+            while (begin > 0 and !std.ascii.isWhitespace(line[begin - 1])) begin -= 1;
+            while (end < line.len and !std.ascii.isWhitespace(line[end])) end += 1;
+            break :blk end - begin;
+        },
+        .pathname => blk: {
+            if (!score.valid_offset) break :blk invalid;
+            var last_delim: ?usize = null;
+            var i = line.len;
+            while (i > 0) {
+                i -= 1;
+                if (line[i] == '/' or line[i] == '\\') {
+                    last_delim = i;
+                    break;
+                }
+            }
+            if (last_delim) |delim| {
+                if (delim > score.min_begin) break :blk invalid;
+                break :blk score.min_begin - delim;
+            }
+            // fzf models a missing delimiter as position -1.
+            break :blk score.min_begin + 1;
+        },
+        .begin => blk: {
+            if (!score.valid_offset) break :blk invalid;
+            var white_prefix: usize = 0;
+            var i: usize = 0;
+            while (i < line.len) : (i += 1) {
+                white_prefix = i;
+                if (i == score.min_begin or !std.ascii.isWhitespace(line[i])) break;
+            }
+            break :blk score.min_end -| white_prefix;
+        },
+        .end => blk: {
+            if (!score.valid_offset) break :blk invalid;
+            var white_prefix: usize = 0;
+            var i: usize = 0;
+            while (i < line.len) : (i += 1) {
+                white_prefix = i;
+                if (i == score.min_begin or !std.ascii.isWhitespace(line[i])) break;
+            }
+            const trimmed = trimLength(line);
+            const span = score.max_end -| white_prefix;
+            // Same monotonic integer metric as fzf's uint16 rank formula.
+            break :blk std.math.maxInt(u16) - (@as(usize, std.math.maxInt(u16)) * span / (trimmed + 1));
+        },
+    };
+}
+
+fn betterExtended(ctx: RankContext, a: ExtendedRank, b: ExtendedRank) bool {
+    if (a.score.score != b.score.score) return a.score.score > b.score.score;
+    var i: usize = 0;
+    while (i < ctx.options.tiebreak_count) : (i += 1) {
+        const kind = ctx.options.tiebreaks[i];
+        const av = tiebreakValue(kind, ctx.candidates.search[a.entry], a.score);
+        const bv = tiebreakValue(kind, ctx.candidates.search[b.entry], b.score);
+        if (av != bv) return av < bv;
+    }
+    return a.entry < b.entry;
+}
 
 fn searchCandidates(
     index: *fuzzy.Index,
@@ -1556,6 +1727,7 @@ fn searchCandidates(
     options: *const Options,
     query: []const u8,
     out: []usize,
+    rank_scratch: []ExtendedRank,
     limit: usize,
 ) ![]usize {
     const cap = @min(limit, out.len);
@@ -1569,28 +1741,85 @@ fn searchCandidates(
     const parsed = try parseQuery(query, options, &term_buf);
 
     if (parsed.direct) |direct| {
-        if (!termCaseSensitive(options.case_mode, direct)) {
+        if (!termCaseSensitive(options.case_mode, direct) and options.tiebreak_count == 1 and options.tiebreaks[0] == .length) {
             return try index.search(direct, out[0..cap]);
         }
     }
 
-    // Any predicate beyond the direct folded fuzzy path can reject candidates
-    // after ranking, so generate a complete ranked stream before compacting.
-    var ranked: []usize = out;
+    // fzf does not sort inverse-only extended queries. --no-sort likewise
+    // preserves input order after filtering.
+    if (options.no_sort or !parsed.sortable) {
+        var write: usize = 0;
+        for (candidates.search, 0..) |line, idx| {
+            if (scoreParsedCandidate(index, parsed, line, idx, options.case_mode) == null) continue;
+            out[write] = idx;
+            write += 1;
+            if (write == cap) break;
+        }
+        return out[0..write];
+    }
+
+    var source: []usize = out;
     if (parsed.driver) |driver| {
-        ranked = try index.search(driver, out);
+        // A driver is chosen only from a mandatory singleton fuzzy clause, so
+        // folded Index.search is a safe prefilter even for case-sensitive terms.
+        source = try index.search(driver, out);
     } else {
         for (out, 0..) |*slot, i| slot.* = i;
     }
 
-    var write: usize = 0;
-    for (ranked) |idx| {
-        if (!queryMatches(parsed, candidates.search[idx], options.case_mode)) continue;
-        out[write] = idx;
-        write += 1;
-        if (write == cap) break;
+    var rank_len: usize = 0;
+    for (source) |idx| {
+        const score = scoreParsedCandidate(index, parsed, candidates.search[idx], idx, options.case_mode) orelse continue;
+        rank_scratch[rank_len] = .{ .entry = idx, .score = score };
+        rank_len += 1;
     }
-    return out[0..write];
+    std.mem.sort(ExtendedRank, rank_scratch[0..rank_len], RankContext{ .candidates = candidates, .options = options }, betterExtended);
+
+    const take = @min(cap, rank_len);
+    for (rank_scratch[0..take], 0..) |rank, i| out[i] = rank.entry;
+    return out[0..take];
+}
+
+fn scoreParsedCandidate(index: *fuzzy.Index, parsed: ParsedQuery, line: []const u8, entry_index: usize, mode: CaseMode) ?CandidateScore {
+    if (parsed.terms.len == 0) return .{};
+    var total: CandidateScore = .{};
+    var clause: usize = 0;
+    while (clause < parsed.clause_count) : (clause += 1) {
+        var matched = false;
+        var contribution: ?fuzzy_engine.CliMatch = null;
+        for (parsed.terms) |term| {
+            if (term.clause != clause) continue;
+            const term_match = scoreTerm(index, term, line, entry_index, mode);
+            if (term_match) |value| {
+                if (term.inverse) continue;
+                contribution = value;
+                matched = true;
+                break;
+            } else if (term.inverse) {
+                contribution = null;
+                matched = true;
+                // fzf keeps checking later OR alternatives, allowing a later
+                // positive term to contribute its score and offsets.
+                continue;
+            }
+        }
+        if (!matched) return null;
+        if (contribution) |value| total.add(value);
+    }
+    return total;
+}
+
+fn scoreTerm(index: *fuzzy.Index, term: QueryTerm, line: []const u8, entry_index: usize, mode: CaseMode) ?fuzzy_engine.CliMatch {
+    const sensitive = termCaseSensitive(mode, term.text);
+    return switch (term.kind) {
+        .fuzzy => fuzzy_engine.matchFuzzyForCli(index, term.text, line, entry_index, sensitive),
+        .exact => fuzzy_engine.scoreExactForCli(index, term.text, line, entry_index, sensitive, false),
+        .boundary_exact => fuzzy_engine.scoreExactForCli(index, term.text, line, entry_index, sensitive, true),
+        .prefix => fuzzy_engine.scorePrefixForCli(index, term.text, line, entry_index, sensitive),
+        .suffix => fuzzy_engine.scoreSuffixForCli(index, term.text, line, entry_index, sensitive),
+        .equal => fuzzy_engine.scoreEqualForCli(index, term.text, line, entry_index, sensitive),
+    };
 }
 
 fn parseQuery(query: []const u8, options: *const Options, storage: *[512]QueryTerm) !ParsedQuery {
@@ -1607,6 +1836,7 @@ fn parseQuery(query: []const u8, options: *const Options, storage: *[512]QueryTe
             .clause_count = 1,
             .driver = if (!options.exact) query else null,
             .direct = if (!options.exact) query else null,
+            .sortable = true,
         };
     }
 
@@ -1633,7 +1863,7 @@ fn parseQuery(query: []const u8, options: *const Options, storage: *[512]QueryTe
         have_term = true;
     }
 
-    if (count == 0) return .{ .terms = storage[0..0], .clause_count = 0, .driver = null, .direct = "" };
+    if (count == 0) return .{ .terms = storage[0..0], .clause_count = 0, .driver = null, .direct = "", .sortable = false };
 
     var driver: ?[]const u8 = null;
     var driver_len: usize = 0;
@@ -1656,35 +1886,43 @@ fn parseQuery(query: []const u8, options: *const Options, storage: *[512]QueryTe
     }
 
     const direct: ?[]const u8 = if (count == 1 and storage[0].kind == .fuzzy and !storage[0].inverse) storage[0].text else null;
-    return .{ .terms = storage[0..count], .clause_count = clause + 1, .driver = driver, .direct = direct };
+    var sortable = false;
+    for (storage[0..count]) |term| {
+        if (!term.inverse) {
+            sortable = true;
+            break;
+        }
+    }
+    return .{ .terms = storage[0..count], .clause_count = clause + 1, .driver = driver, .direct = direct, .sortable = sortable };
 }
 
 fn parseTerm(raw: []const u8, exact_mode: bool, clause: u16) QueryTerm {
     var text = raw;
     var inverse = false;
+    var kind: TermKind = if (exact_mode) .exact else .fuzzy;
+
     if (text.len > 1 and text[0] == '!') {
         inverse = true;
+        kind = .exact;
         text = text[1..];
     }
 
-    var kind: TermKind = if (exact_mode) .exact else .fuzzy;
-    if (text.len > 1 and text[0] == '\'') {
-        text = text[1..];
-        kind = if (exact_mode) .fuzzy else .exact;
-        if (!exact_mode and text.len > 1 and text[text.len - 1] == '\'') {
-            text = text[0 .. text.len - 1];
-            kind = .boundary_exact;
-        }
-    } else if (text.len > 1 and text[0] == '^') {
-        text = text[1..];
-        kind = .prefix;
-    } else if (text.len > 1 and text[text.len - 1] == '$') {
+    if (text.len > 1 and text[text.len - 1] == '$') {
         text = text[0 .. text.len - 1];
         kind = .suffix;
-    } else if (inverse) {
-        // In extended mode !foo is inverse-exact, matching fzf syntax.
-        kind = .exact;
     }
+
+    if (text.len > 2 and text[0] == '\'' and text[text.len - 1] == '\'') {
+        text = text[1 .. text.len - 1];
+        kind = .boundary_exact;
+    } else if (text.len > 1 and text[0] == '\'') {
+        text = text[1..];
+        kind = if (!exact_mode and !inverse) .exact else .fuzzy;
+    } else if (text.len > 1 and text[0] == '^') {
+        text = text[1..];
+        kind = if (kind == .suffix) .equal else .prefix;
+    }
+
     return .{ .text = text, .kind = kind, .inverse = inverse, .clause = clause };
 }
 
@@ -1715,7 +1953,23 @@ fn termMatches(term: QueryTerm, line: []const u8, mode: CaseMode) bool {
         .prefix => startsWithText(line, term.text, sensitive),
         .suffix => endsWithText(line, term.text, sensitive),
         .boundary_exact => containsBoundaryText(line, term.text, sensitive),
+        .equal => equalText(line, term.text, sensitive),
     };
+}
+
+fn equalText(line: []const u8, needle: []const u8, sensitive: bool) bool {
+    if (needle.len == 0) return false;
+    var start: usize = 0;
+    var end = line.len;
+    if (!std.ascii.isWhitespace(needle[0])) {
+        while (start < end and std.ascii.isWhitespace(line[start])) start += 1;
+    }
+    if (!std.ascii.isWhitespace(needle[needle.len - 1])) {
+        while (end > start and std.ascii.isWhitespace(line[end - 1])) end -= 1;
+    }
+    if (end - start != needle.len) return false;
+    for (needle, 0..) |c, i| if (!byteEq(line[start + i], c, sensitive)) return false;
+    return true;
 }
 
 fn termCaseSensitive(mode: CaseMode, text: []const u8) bool {
@@ -1794,7 +2048,10 @@ fn isWordByte(c: u8) bool {
 
 fn filterMode(allocator: Allocator, io: Io, index: *fuzzy.Index, candidates: *const CandidateSet, options: *const Options, query: []const u8) !void {
     const out = try allocator.alloc(usize, candidates.display.len);
-    const found = try searchCandidates(index, candidates, options, query, out, out.len);
+    defer allocator.free(out);
+    const ranks = try allocator.alloc(ExtendedRank, candidates.display.len);
+    defer allocator.free(ranks);
+    const found = try searchCandidates(index, candidates, options, query, out, ranks, out.len);
     if (options.no_sort) std.mem.sort(usize, found, {}, comptime std.sort.asc(usize));
     var stdout_buffer: [8192]u8 = undefined;
     var writer = Io.File.stdout().writerStreaming(io, &stdout_buffer);
@@ -2247,11 +2504,17 @@ const usage =
     \\Interactive fuzzy finder backed by zig_fuzzy's exact fzf-V2 ranking core.
     \\
     \\Search
+    \\  -e, --exact              exact-match mode; quote prefix flips to fuzzy
+    \\  -i, --ignore-case        force case-insensitive matching
+    \\  +i, --no-ignore-case     force case-sensitive matching
+    \\      --smart-case         smart-case matching (default)
+    \\  +x, --no-extended        disable extended query grammar
     \\  -q, --query=STR          start with query
     \\  -f, --filter=STR         non-interactive filter mode
     \\  -1, --select-1           accept when there is exactly one match
     \\  -0, --exit-0             exit immediately when there is no match
     \\      --no-sort            preserve input order after filtering
+    \\      --tiebreak=CRI       score tie-breaks: length/chunk/pathname/begin/end/index
     \\  -d, --delimiter=STR      literal field delimiter
     \\  -n, --nth=EXPR           limit searchable fields
     \\      --with-nth=EXPR      transform displayed fields
@@ -2399,4 +2662,46 @@ test "binding parser" {
     try std.testing.expectEqualStrings("printf 'a,b'", bindings.items[0].action.reload);
     try std.testing.expectEqualStrings("ready", bindings.items[1].action.change_header);
     try std.testing.expect(bindings.items[2].action == .accept);
+}
+
+test "fzf parser equal inverse fuzzy and boundary exact" {
+    var storage: [512]QueryTerm = undefined;
+    var options: Options = .{};
+    defer options.deinit(std.testing.allocator);
+
+    var parsed = try parseQuery("^foo$", &options, &storage);
+    try std.testing.expectEqual(TermKind.equal, parsed.terms[0].kind);
+    try std.testing.expect(queryMatches(parsed, "  foo  ", .smart));
+    try std.testing.expect(!queryMatches(parsed, "foo bar", .smart));
+
+    parsed = try parseQuery("!'fb", &options, &storage);
+    try std.testing.expect(parsed.terms[0].inverse);
+    try std.testing.expectEqual(TermKind.fuzzy, parsed.terms[0].kind);
+    try std.testing.expect(!queryMatches(parsed, "fuzzy-blurry", .smart));
+    try std.testing.expect(queryMatches(parsed, "bar", .smart));
+
+    options.exact = true;
+    parsed = try parseQuery("'foo'", &options, &storage);
+    try std.testing.expectEqual(TermKind.boundary_exact, parsed.terms[0].kind);
+    try std.testing.expect(queryMatches(parsed, "x foo y", .smart));
+    try std.testing.expect(!queryMatches(parsed, "x foobar y", .smart));
+}
+
+test "tiebreak parser matches fzf constraints" {
+    var options: Options = .{};
+    defer options.deinit(std.testing.allocator);
+    try parseTiebreaks(&options, "chunk,begin,index");
+    try std.testing.expectEqual(@as(u2, 2), options.tiebreak_count);
+    try std.testing.expectEqual(TieBreak.chunk, options.tiebreaks[0]);
+    try std.testing.expectEqual(TieBreak.begin, options.tiebreaks[1]);
+    try std.testing.expectError(error.IndexMustBeLastCriterion, parseTiebreaks(&options, "index,length"));
+    try std.testing.expectError(error.DuplicateSortCriterion, parseTiebreaks(&options, "length,length"));
+    try std.testing.expectError(error.TooManySortCriteria, parseTiebreaks(&options, "length,chunk,begin,end"));
+}
+
+test "fzf tiebreak values use match bounds" {
+    const score = CandidateScore{ .score = 42, .min_begin = 3, .min_end = 5, .max_end = 7, .valid_offset = true };
+    try std.testing.expectEqual(@as(usize, 7), tiebreakValue(.length, "  abcdefg  ", score));
+    try std.testing.expectEqual(@as(usize, 7), tiebreakValue(.chunk, "  abcdefg  ", score));
+    try std.testing.expectEqual(@as(usize, 1), tiebreakValue(.pathname, "xx/abcdefg", score));
 }

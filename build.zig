@@ -4,10 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const engine_module = b.createModule(.{
+        .root_source_file = b.path("src/engine.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const fuzzy_module = b.addModule("fuzzy", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "engine", .module = engine_module }},
     });
 
     const exe = b.addExecutable(.{
@@ -16,7 +23,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/cli.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "fuzzy", .module = fuzzy_module }},
+            .imports = &.{
+                .{ .name = "fuzzy", .module = fuzzy_module },
+                .{ .name = "engine", .module = engine_module },
+            },
             .link_libc = true,
         }),
     });
@@ -35,7 +45,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/cli.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "fuzzy", .module = fuzzy_module }},
+            .imports = &.{
+                .{ .name = "fuzzy", .module = fuzzy_module },
+                .{ .name = "engine", .module = engine_module },
+            },
             .link_libc = true,
         }),
     });
