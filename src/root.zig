@@ -2964,7 +2964,9 @@ pub const Index = struct {
 
     fn gapAwareUpperPrepared(self: *const Index, q: *const Query, caps: BonusCaps) i32 {
         var prefix_bonus = bonusCap(caps, q.classes[0]);
-        var upper = score_match + prefix_bonus * bonus_first_char_multiplier;
+        const first_upper = score_match + prefix_bonus * bonus_first_char_multiplier;
+        var upper = first_upper;
+        var base_upper = first_upper;
         for (1..q.bytes.len) |i| {
             const latest_previous = self.last_position_scratch[i - 1];
             const earliest_current = self.position_scratch[i];
@@ -2974,7 +2976,27 @@ pub const Index = struct {
                 upper = @max(0, upper + penalty);
             }
             prefix_bonus = @max(prefix_bonus, bonusCap(caps, q.classes[i]));
-            upper += score_match + @max(prefix_bonus, bonus_consecutive);
+            const match_upper = score_match + @max(prefix_bonus, bonus_consecutive);
+            upper += match_upper;
+            base_upper += match_upper;
+        }
+
+        // Forward greedy fixes the earliest feasible final match; reverse
+        // greedy fixes the latest feasible first match. Every alignment spans
+        // at least that interval, hence contains at least span-m gap bytes.
+        // Charge those bytes as one gap run, the least-negative arrangement,
+        // and cap the reduction by the maximum first-match prefix because V2
+        // floors a sufficiently damaged prefix at zero.
+        const latest_first = self.last_position_scratch[0];
+        const earliest_last = self.position_scratch[q.bytes.len - 1];
+        if (earliest_last >= latest_first) {
+            const span = earliest_last - latest_first + 1;
+            if (span > q.bytes.len) {
+                const forced_gap = span - q.bytes.len;
+                const gap_cost = -score_gap_start + @as(i32, @intCast(forced_gap - 1)) * -score_gap_extension;
+                const span_upper = base_upper - @min(gap_cost, first_upper);
+                upper = @min(upper, span_upper);
+            }
         }
         return upper;
     }
