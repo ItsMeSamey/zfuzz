@@ -689,13 +689,9 @@ pub const Index = struct {
                         upper = self.scoreUpperBound(&q, self.bonus_caps[entry_index]);
                     }
                     if (q.bytes.len >= 4) {
-                        if (q.bytes.len >= 6) {
-                            var final_last: u8 = 0xff;
-                            upper = self.endpointSpanUpperBoundWithLast(&q, entry, entry_index, first_slot, last_slot, self.bonus_caps[entry_index], upper, &final_last);
-                            if (final_last != 0xff) subsequence_end = @as(usize, final_last) + 1;
-                        } else {
-                            upper = self.endpointSpanUpperBound(&q, entry, entry_index, first_slot, last_slot, self.bonus_caps[entry_index], upper);
-                        }
+                        var final_last: u8 = 0xff;
+                        upper = self.endpointSpanUpperBoundWithLast(&q, entry, entry_index, first_slot, last_slot, self.bonus_caps[entry_index], upper, &final_last);
+                        if (final_last != 0xff) subsequence_end = @as(usize, final_last) + 1;
                     }
                     const worst = self.stage[0];
                     const worst_entry = self.entries[worst.entry];
