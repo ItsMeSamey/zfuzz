@@ -216,6 +216,18 @@ const Mouse = struct {
     release: bool,
 };
 
+const Pane = struct {
+    row: usize,
+    col: usize,
+    rows: usize,
+    cols: usize,
+};
+
+const PaneGeometry = struct {
+    main: Pane,
+    preview: ?Pane,
+};
+
 const Ui = struct {
     allocator: Allocator,
     io: Io,
@@ -350,20 +362,61 @@ const Ui = struct {
         try self.refreshSearch(false);
     }
 
+    fn paneGeometry(self: *Ui, size: anytype) PaneGeometry {
+        var main_pane = Pane{ .row = 1, .col = 1, .rows = size.rows, .cols = size.cols };
+        const preview_active = self.options.preview.command != null and !self.options.preview.hidden;
+        if (!preview_active) return .{ .main = main_pane, .preview = null };
+
+        switch (self.options.preview.position) {
+            .left, .right => {
+                if (size.cols < 40) return .{ .main = main_pane, .preview = null };
+                var width = size.cols * self.options.preview.percent / 100;
+                width = std.math.clamp(width, 12, size.cols - 20);
+                if (self.options.preview.position == .left) {
+                    main_pane.col = width + 2;
+                    main_pane.cols = size.cols - width - 1;
+                    return .{ .main = main_pane, .preview = .{ .row = 1, .col = 1, .rows = size.rows, .cols = width } };
+                }
+                main_pane.cols = size.cols - width - 1;
+                return .{ .main = main_pane, .preview = .{ .row = 1, .col = main_pane.cols + 2, .rows = size.rows, .cols = width } };
+            },
+            .up, .down => {
+                if (size.rows < 8) return .{ .main = main_pane, .preview = null };
+                var height = size.rows * self.options.preview.percent / 100;
+                height = std.math.clamp(height, 3, size.rows - 4);
+                if (self.options.preview.position == .up) {
+                    main_pane.row = height + 2;
+                    main_pane.rows = size.rows - height - 1;
+                    return .{ .main = main_pane, .preview = .{ .row = 1, .col = 1, .rows = height, .cols = size.cols } };
+                }
+                main_pane.rows = size.rows - height - 1;
+                return .{ .main = main_pane, .preview = .{ .row = main_pane.rows + 2, .col = 1, .rows = height, .cols = size.cols } };
+            },
+        }
+    }
+
+    fn contentPane(self: *Ui, pane: Pane) Pane {
+        if (!self.options.border or pane.rows < 3 or pane.cols < 5) return pane;
+        return .{ .row = pane.row + 1, .col = pane.col + 2, .rows = pane.rows - 2, .cols = pane.cols - 4 };
+    }
+
+    fn visibleListRows(self: *Ui) usize {
+        const geom = self.paneGeometry(self.terminal.size());
+        return self.listRows(self.contentPane(geom.main).rows);
+    }
+
     fn ensureVisible(self: *Ui) void {
-        const size = self.terminal.size();
-        const list_rows = self.listRows(size.rows);
+        const list_rows = self.visibleListRows();
         if (list_rows == 0) return;
         if (self.focus < self.scroll) self.scroll = self.focus;
         if (self.focus >= self.scroll + list_rows) self.scroll = self.focus + 1 - list_rows;
     }
 
     fn listRows(self: *Ui, rows: usize) usize {
-        var fixed: usize = 2;
+        var fixed: usize = 1;
         if (self.options.header != null) fixed += 1;
         if (self.options.footer != null) fixed += 1;
-        if (self.options.border) fixed += 2;
-        const effective = @max(@as(usize, 4), rows * self.options.height_percent / 100);
+        const effective = @max(@as(usize, 3), rows * self.options.height_percent / 100);
         return if (effective > fixed) effective - fixed else 1;
     }
 
@@ -678,10 +731,15 @@ const Ui = struct {
             return;
         }
         if (m.button != 0) return;
-        const size = self.terminal.size();
-        const rows = self.listRows(size.rows);
-        const list_start = if (self.options.layout == .reverse) self.listStartReverse() else 1 + @intFromBool(self.options.border);
+        const geom = self.paneGeometry(self.terminal.size());
+        const content = self.contentPane(geom.main);
+        const rows = self.listRows(content.rows);
+        const list_start = if (self.options.layout == .reverse)
+            content.row + 1 + @intFromBool(self.options.header != null)
+        else
+            content.row;
         if (m.y < list_start or m.y >= list_start + rows) return;
+        if (m.x < content.col or m.x >= content.col + content.cols) return;
         const rel = m.y - list_start;
         const item = if (self.options.layout == .reverse) self.scroll + rel else self.scroll + (rows - 1 - rel);
         if (item < self.result_len) {
@@ -690,13 +748,6 @@ const Ui = struct {
             self.ensureVisible();
             self.preview_cache_key = null;
         }
-    }
-
-    fn listStartReverse(self: *Ui) usize {
-        var y: usize = 1 + @intFromBool(self.options.border);
-        y += 1;
-        if (self.options.header != null) y += 1;
-        return y;
     }
 
     fn move(self: *Ui, delta: isize) void {
@@ -722,7 +773,7 @@ const Ui = struct {
     }
 
     fn page(self: *Ui, delta: isize) void {
-        const rows = @max(@as(usize, 1), self.listRows(self.terminal.size().rows));
+        const rows = @max(@as(usize, 1), self.visibleListRows());
         self.move(delta * @as(isize, @intCast(rows)));
     }
 
@@ -789,40 +840,45 @@ const Ui = struct {
 
     fn render(self: *Ui) !void {
         const size = self.terminal.size();
+        const geom = self.paneGeometry(size);
         var frame: Io.Writer.Allocating = .init(self.allocator);
         defer frame.deinit();
         const w = &frame.writer;
         try w.writeAll("\x1b[H\x1b[2J");
 
-        const preview_active = self.options.preview.command != null and !self.options.preview.hidden and size.cols >= 60;
-        const preview_cols: usize = if (preview_active and (self.options.preview.position == .left or self.options.preview.position == .right))
-            size.cols * self.options.preview.percent / 100
-        else
-            0;
-        const main_cols = if (preview_cols > 0) size.cols - preview_cols - 1 else size.cols;
-
+        if (self.options.border) try drawPaneBorder(w, geom.main);
+        const content = self.contentPane(geom.main);
+        var row = content.row;
         if (self.options.layout == .reverse) {
-            try self.renderPrompt(w, main_cols);
-            if (self.options.header) |h| try self.renderPlainLine(w, h, main_cols);
-            try self.renderList(w, main_cols, true);
-            if (self.options.footer) |f| try self.renderPlainLine(w, f, main_cols);
+            try self.renderPrompt(w, row, content.col, content.cols);
+            row += 1;
+            if (self.options.header) |h| {
+                try self.renderPlainLine(w, row, content.col, h, content.cols);
+                row += 1;
+            }
+            row = try self.renderList(w, row, content, true);
+            if (self.options.footer) |f| try self.renderPlainLine(w, row, content.col, f, content.cols);
         } else {
-            try self.renderList(w, main_cols, false);
-            if (self.options.header) |h| try self.renderPlainLine(w, h, main_cols);
-            try self.renderPrompt(w, main_cols);
-            if (self.options.footer) |f| try self.renderPlainLine(w, f, main_cols);
+            row = try self.renderList(w, row, content, false);
+            if (self.options.header) |h| {
+                try self.renderPlainLine(w, row, content.col, h, content.cols);
+                row += 1;
+            }
+            try self.renderPrompt(w, row, content.col, content.cols);
+            row += 1;
+            if (self.options.footer) |f| try self.renderPlainLine(w, row, content.col, f, content.cols);
         }
 
-        if (preview_cols > 0) {
+        if (geom.preview) |preview| {
             try self.ensurePreview();
-            try self.renderPreviewOverlay(&frame, size, preview_cols);
+            try self.renderPreviewOverlay(&frame, size, geom, preview);
         }
 
         try self.terminal.write(frame.written());
     }
 
-    fn renderPrompt(self: *Ui, w: anytype, cols: usize) !void {
-        _ = cols;
+    fn renderPrompt(self: *Ui, w: anytype, row: usize, col: usize, cols: usize) !void {
+        try cursorTo(w, row, col);
         try w.print("\x1b[1m{s}\x1b[0m", .{self.options.prompt});
         try w.writeAll(self.query.items[0..self.cursor]);
         if (self.cursor < self.query.items.len) {
@@ -842,24 +898,24 @@ const Ui = struct {
         if (self.options.multi) {
             try w.print("\x1b[2m{s} ({d})\x1b[0m", .{ shown, self.selected_count });
         } else try w.print("\x1b[2m{s}\x1b[0m", .{shown});
-        try w.writeByte('\n');
+        _ = cols;
     }
 
-    fn renderPlainLine(self: *Ui, w: anytype, text: []const u8, cols: usize) !void {
+    fn renderPlainLine(self: *Ui, w: anytype, row: usize, col: usize, text: []const u8, cols: usize) !void {
         _ = self;
+        try cursorTo(w, row, col);
         try writeTruncated(w, text, cols, false, "");
-        try w.writeByte('\n');
     }
 
-    fn renderList(self: *Ui, w: anytype, cols: usize, top_down: bool) !void {
-        const rows = self.listRows(self.terminal.size().rows);
+    fn renderList(self: *Ui, w: anytype, start_row: usize, content: Pane, top_down: bool) !usize {
+        const rows = self.listRows(content.rows);
         var line: usize = 0;
         while (line < rows) : (line += 1) {
+            const row = start_row + line;
+            if (row >= content.row + content.rows) break;
+            try cursorTo(w, row, content.col);
             const logical = if (top_down) self.scroll + line else self.scroll + (rows - 1 - line);
-            if (logical >= self.result_len) {
-                try w.writeByte('\n');
-                continue;
-            }
+            if (logical >= self.result_len) continue;
             const idx = self.results[logical];
             const focused = logical == self.focus;
             const marked = self.selected[idx];
@@ -868,10 +924,10 @@ const Ui = struct {
                 if (focused) self.options.pointer else " ",
                 if (marked) self.options.marker else " ",
             });
-            try writeHighlighted(w, self.candidates.display[idx], self.query.items, if (cols > 4) cols - 4 else cols, self.options.wrap, self.options.ansi);
+            try writeHighlighted(w, self.candidates.display[idx], self.query.items, if (content.cols > 4) content.cols - 4 else content.cols, self.options.wrap, self.options.ansi);
             if (focused) try w.writeAll("\x1b[0m");
-            try w.writeByte('\n');
         }
+        return start_row + rows;
     }
 
     fn ensurePreview(self: *Ui) !void {
@@ -899,19 +955,67 @@ const Ui = struct {
         self.preview_cache_query_hash = qhash;
     }
 
-    fn renderPreviewOverlay(self: *Ui, frame: *Io.Writer.Allocating, size: anytype, preview_cols: usize) !void {
-        if (self.options.preview.position != .right) return; // right pane is the high-value default
-        const start_col = size.cols - preview_cols + 1;
+    fn renderPreviewOverlay(self: *Ui, frame: *Io.Writer.Allocating, size: anytype, geom: PaneGeometry, preview: Pane) !void {
+        const w = &frame.writer;
+        switch (self.options.preview.position) {
+            .right => try drawVerticalSeparator(w, 1, size.rows, preview.col - 1),
+            .left => try drawVerticalSeparator(w, 1, size.rows, geom.main.col - 1),
+            .down => try drawHorizontalSeparator(w, preview.row - 1, 1, size.cols),
+            .up => try drawHorizontalSeparator(w, geom.main.row - 1, 1, size.cols),
+        }
+
         var lines = std.mem.splitScalar(u8, self.preview_text, '\n');
-        var row: usize = 1;
-        while (row <= size.rows) : (row += 1) {
+        var row: usize = 0;
+        while (row < preview.rows) : (row += 1) {
             const line = lines.next() orelse break;
-            try frame.writer.print("\x1b[{d};{d}H\x1b[2m│\x1b[0m", .{ row, start_col - 1 });
-            try frame.writer.print("\x1b[{d};{d}H", .{ row, start_col });
-            try writeTruncated(&frame.writer, line, preview_cols, self.options.preview.wrap, "");
+            try cursorTo(w, preview.row + row, preview.col);
+            try writeTruncated(w, line, preview.cols, self.options.preview.wrap, "");
         }
     }
 };
+
+fn cursorTo(w: anytype, row: usize, col: usize) !void {
+    try w.print("\x1b[{d};{d}H", .{ row, col });
+}
+
+fn drawPaneBorder(w: anytype, pane: Pane) !void {
+    if (pane.rows < 2 or pane.cols < 2) return;
+    try cursorTo(w, pane.row, pane.col);
+    try w.writeAll("╭");
+    var i: usize = 0;
+    while (i + 2 < pane.cols) : (i += 1) try w.writeAll("─");
+    try w.writeAll("╮");
+    var r: usize = 1;
+    while (r + 1 < pane.rows) : (r += 1) {
+        try cursorTo(w, pane.row + r, pane.col);
+        try w.writeAll("│");
+        try cursorTo(w, pane.row + r, pane.col + pane.cols - 1);
+        try w.writeAll("│");
+    }
+    try cursorTo(w, pane.row + pane.rows - 1, pane.col);
+    try w.writeAll("╰");
+    i = 0;
+    while (i + 2 < pane.cols) : (i += 1) try w.writeAll("─");
+    try w.writeAll("╯");
+}
+
+fn drawVerticalSeparator(w: anytype, first_row: usize, rows: usize, col: usize) !void {
+    if (col == 0) return;
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
+        try cursorTo(w, first_row + r, col);
+        try w.writeAll("\x1b[2m│\x1b[0m");
+    }
+}
+
+fn drawHorizontalSeparator(w: anytype, row: usize, first_col: usize, cols: usize) !void {
+    if (row == 0) return;
+    try cursorTo(w, row, first_col);
+    try w.writeAll("\x1b[2m");
+    var c: usize = 0;
+    while (c < cols) : (c += 1) try w.writeAll("─");
+    try w.writeAll("\x1b[0m");
+}
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
