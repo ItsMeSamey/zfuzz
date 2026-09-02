@@ -32,6 +32,7 @@ const Query = struct {
     bytes: []const u8,
     classes: []const u6,
     planes: []const u8,
+    cap_word_mask: u2,
     use_cache: bool,
     impossible: bool,
 };
@@ -521,6 +522,7 @@ pub const Index = struct {
                 .bytes = self.query_bytes[0..0],
                 .classes = self.query_classes[0..0],
                 .planes = self.query_planes[0..0],
+                .cap_word_mask = 0,
                 .use_cache = false,
                 .impossible = true,
             };
@@ -529,6 +531,7 @@ pub const Index = struct {
         var use_cache = self.previous_query_len != 0 and text.len >= self.previous_query_len;
         var once: u64 = 0;
         var twice: u64 = 0;
+        var cap_word_mask: u2 = 0;
 
         for (text, 0..) |c, i| {
             const folded = lower(c);
@@ -540,6 +543,7 @@ pub const Index = struct {
             }
 
             const class = self.query_classes[i];
+            cap_word_mask |= @as(u2, 1) << @intCast(@as(usize, @intCast(class)) >> 5);
             const bit = @as(u64, 1) << class;
             if ((once & bit) != 0) {
                 twice |= bit;
@@ -554,6 +558,7 @@ pub const Index = struct {
             .bytes = self.query_bytes[0..text.len],
             .classes = self.query_classes[0..text.len],
             .planes = self.query_planes[0..plane_count],
+            .cap_word_mask = cap_word_mask,
             .use_cache = use_cache,
             .impossible = false,
         };
@@ -1001,9 +1006,25 @@ pub const Index = struct {
         return upper - @min(gap_cost, first_upper);
     }
 
+    fn packedBoundIndexWord(comptime m: usize, caps_word: u64, classes: []const u6, comptime word: usize) usize {
+        var index: usize = 0;
+        inline for (0..m) |i| {
+            const class_index: usize = @intCast(classes[i]);
+            const local_class = class_index - word * 32;
+            const shift: u6 = @intCast(local_class * 2);
+            const category: u2 = @truncate(caps_word >> shift);
+            index |= @as(usize, category) << @intCast(2 * i);
+        }
+        return index;
+    }
+
     noinline fn scoreUpperBound78(q: *const Query, caps: BonusCaps) i32 {
         const m = q.bytes.len;
-        const packed_index = if (m == 7)
+        const packed_index = if (q.cap_word_mask == 1)
+            (if (m == 7) packedBoundIndexWord(7, caps[0], q.classes, 0) else packedBoundIndexWord(8, caps[0], q.classes, 0))
+        else if (q.cap_word_mask == 2)
+            (if (m == 7) packedBoundIndexWord(7, caps[1], q.classes, 1) else packedBoundIndexWord(8, caps[1], q.classes, 1))
+        else if (m == 7)
             packedBoundIndex(7, caps, q.classes)
         else
             packedBoundIndex(8, caps, q.classes);
