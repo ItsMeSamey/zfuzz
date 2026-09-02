@@ -21,9 +21,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(exe);
-    b.installFile("shell/zfuzz.bash", "share/zfuzz/zfuzz.bash");
-    b.installFile("shell/zfuzz.zsh", "share/zfuzz/zfuzz.zsh");
-    b.installFile("shell/zfuzz.fish", "share/zfuzz/zfuzz.fish");
+    b.installFile("src/shell/zfuzz.bash", "share/zfuzz/zfuzz.bash");
+    b.installFile("src/shell/zfuzz.zsh", "share/zfuzz/zfuzz.zsh");
+    b.installFile("src/shell/zfuzz.fish", "share/zfuzz/zfuzz.fish");
 
     const run_exe = b.addRunArtifact(exe);
     if (b.args) |args| run_exe.addArgs(args);

@@ -492,7 +492,17 @@ const Ui = struct {
     }
 
     fn expandedCommand(self: *Ui, command: []const u8) ![]u8 {
-        return expandPreviewCommand(self.allocator, command, self.currentItem(), self.query.items);
+        const current_idx: ?usize = if (self.result_len == 0) null else self.results[self.focus];
+        return expandCommand(
+            self.allocator,
+            command,
+            self.query.items,
+            self.candidates,
+            self.options,
+            current_idx,
+            self.selection_order.items,
+            self.selected,
+        );
     }
 
     fn reloadFromCommand(self: *Ui, command: []const u8) !void {
@@ -784,7 +794,7 @@ const Ui = struct {
         const idx = self.results[self.focus];
         const qhash = std.hash.Wyhash.hash(0, self.query.items);
         if (self.preview_cache_key == idx and self.preview_cache_query_hash == qhash) return;
-        const expanded = try expandPreviewCommand(self.allocator, cmd_template, self.candidates.display[idx], self.query.items);
+        const expanded = try self.expandedCommand(cmd_template);
         defer self.allocator.free(expanded);
         const result = std.process.run(self.allocator, self.io, .{
             .argv = &.{ "/bin/sh", "-c", expanded },
@@ -820,7 +830,12 @@ const Ui = struct {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
-    var options = try parseOptions(allocator, args);
+    var options: Options = .{};
+    if (init.environ_map.get("FZF_DEFAULT_OPTS")) |defaults_text| {
+        const default_args = try shellSplitArgs(allocator, defaults_text);
+        try parseOptionsInto(allocator, &options, default_args, 0);
+    }
+    try parseOptionsInto(allocator, &options, args, 1);
     defer options.deinit(allocator);
 
     if (hasArg(args, "--help") or hasArg(args, "-h")) {
@@ -828,11 +843,23 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (hasArg(args, "--version")) {
-        try Io.File.stdout().writeStreamingAll(init.io, "zfuzz 0.1.0\n");
+        try Io.File.stdout().writeStreamingAll(init.io, "zfuzz 0.2.0\n");
+        return;
+    }
+    if (hasArg(args, "--bash")) {
+        try Io.File.stdout().writeStreamingAll(init.io, @embedFile("shell/zfuzz.bash"));
+        return;
+    }
+    if (hasArg(args, "--zsh")) {
+        try Io.File.stdout().writeStreamingAll(init.io, @embedFile("shell/zfuzz.zsh"));
+        return;
+    }
+    if (hasArg(args, "--fish")) {
+        try Io.File.stdout().writeStreamingAll(init.io, @embedFile("shell/zfuzz.fish"));
         return;
     }
 
-    var candidates = try readCandidates(allocator, init.io, &options);
+    var candidates = try readCandidates(allocator, init.io, &options, init.environ_map.get("FZF_DEFAULT_COMMAND"));
     defer candidates.deinit(allocator);
 
     var index = try fuzzy.init(allocator, candidates.search);
@@ -856,210 +883,290 @@ pub fn main(init: std.process.Init) !void {
     if (code != 0) std.process.exit(code);
 }
 
+fn shellSplitArgs(allocator: Allocator, text: []const u8) ![][]const u8 {
+    var args: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (args.items) |arg| allocator.free(arg);
+        args.deinit(allocator);
+    }
+    var token: std.ArrayList(u8) = .empty;
+    defer token.deinit(allocator);
+    var quote: u8 = 0;
+    var escaped = false;
+    var have = false;
+    for (text) |c| {
+        if (escaped) {
+            try token.append(allocator, c);
+            escaped = false;
+            have = true;
+            continue;
+        }
+        if (c == '\\' and quote != '\'') {
+            escaped = true;
+            have = true;
+            continue;
+        }
+        if (quote != 0) {
+            if (c == quote) quote = 0 else try token.append(allocator, c);
+            have = true;
+            continue;
+        }
+        if (c == '\'' or c == '"') {
+            quote = c;
+            have = true;
+            continue;
+        }
+        if (std.ascii.isWhitespace(c)) {
+            if (have) {
+                try args.append(allocator, try allocator.dupe(u8, token.items));
+                token.clearRetainingCapacity();
+                have = false;
+            }
+            continue;
+        }
+        try token.append(allocator, c);
+        have = true;
+    }
+    if (escaped) try token.append(allocator, '\\');
+    if (quote != 0) return error.UnterminatedQuote;
+    if (have) try args.append(allocator, try allocator.dupe(u8, token.items));
+    return try args.toOwnedSlice(allocator);
+}
+
 fn parseOptions(allocator: Allocator, args: []const []const u8) !Options {
     var o: Options = .{};
-    var i: usize = 1;
+    try parseOptionsInto(allocator, &o, args, 1);
+    return o;
+}
+
+fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8, start_index: usize) !void {
+    var i: usize = start_index;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "--version")) continue;
+        if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "--version") or
+            std.mem.eql(u8, a, "--bash") or std.mem.eql(u8, a, "--zsh") or std.mem.eql(u8, a, "--fish") or
+            std.mem.eql(u8, a, "--sync")) continue;
         if (std.mem.eql(u8, a, "-m") or std.mem.eql(u8, a, "--multi")) {
-            o.multi = true;
+            o.*.multi = true;
             continue;
         }
         if (std.mem.startsWith(u8, a, "--multi=")) {
-            o.multi = true;
-            o.multi_max = try std.fmt.parseInt(usize, a[8..], 10);
+            o.*.multi = true;
+            o.*.multi_max = try std.fmt.parseInt(usize, a[8..], 10);
             continue;
         }
         if (std.mem.eql(u8, a, "--read0")) {
-            o.read0 = true;
+            o.*.read0 = true;
             continue;
         }
         if (std.mem.eql(u8, a, "--print0")) {
-            o.print0 = true;
+            o.*.print0 = true;
             continue;
         }
         if (std.mem.eql(u8, a, "--ansi")) {
-            o.ansi = true;
+            o.*.ansi = true;
             continue;
         }
         if (std.mem.eql(u8, a, "--cycle")) {
-            o.cycle = true;
+            o.*.cycle = true;
             continue;
         }
         if (std.mem.eql(u8, a, "--wrap")) {
-            o.wrap = true;
+            o.*.wrap = true;
             continue;
         }
         if (std.mem.eql(u8, a, "--select-1") or std.mem.eql(u8, a, "-1")) {
-            o.select_1 = true;
+            o.*.select_1 = true;
             continue;
         }
         if (std.mem.eql(u8, a, "--exit-0") or std.mem.eql(u8, a, "-0")) {
-            o.exit_0 = true;
+            o.*.exit_0 = true;
             continue;
         }
         if (std.mem.eql(u8, a, "--print-query")) {
-            o.print_query = true;
+            o.*.print_query = true;
             continue;
         }
         if (std.mem.eql(u8, a, "--no-sort") or std.mem.eql(u8, a, "+s")) {
-            o.no_sort = true;
+            o.*.no_sort = true;
             continue;
         }
         if (std.mem.eql(u8, a, "--disabled")) {
-            o.disabled = true;
+            o.*.disabled = true;
             continue;
         }
         if (std.mem.eql(u8, a, "-x") or std.mem.eql(u8, a, "--extended")) {
-            o.extended = true;
+            o.*.extended = true;
             continue;
         }
         if (std.mem.eql(u8, a, "+x") or std.mem.eql(u8, a, "--no-extended")) {
-            o.extended = false;
+            o.*.extended = false;
             continue;
         }
         if (std.mem.eql(u8, a, "-e") or std.mem.eql(u8, a, "--exact")) {
-            o.exact = true;
+            o.*.exact = true;
             continue;
         }
         if (std.mem.eql(u8, a, "-i") or std.mem.eql(u8, a, "--ignore-case")) {
-            o.case_mode = .ignore;
+            o.*.case_mode = .ignore;
             continue;
         }
         if (std.mem.eql(u8, a, "+i") or std.mem.eql(u8, a, "--no-ignore-case")) {
-            o.case_mode = .respect;
+            o.*.case_mode = .respect;
             continue;
         }
         if (std.mem.eql(u8, a, "--smart-case")) {
-            o.case_mode = .smart;
+            o.*.case_mode = .smart;
             continue;
         }
         if (std.mem.eql(u8, a, "--tac")) {
-            o.tac = true;
+            o.*.tac = true;
             continue;
         }
         if (std.mem.eql(u8, a, "--no-mouse")) {
-            o.mouse = false;
+            o.*.mouse = false;
             continue;
         }
         if (std.mem.eql(u8, a, "--no-border")) {
-            o.border = false;
+            o.*.border = false;
             continue;
         }
         if (std.mem.eql(u8, a, "--reverse") or std.mem.eql(u8, a, "--layout=reverse")) {
-            o.layout = .reverse;
+            o.*.layout = .reverse;
             continue;
         }
         if (std.mem.eql(u8, a, "--layout=default")) {
-            o.layout = .default;
+            o.*.layout = .default;
             continue;
         }
 
         if (std.mem.startsWith(u8, a, "--query=")) {
-            o.query = a[8..];
+            o.*.query = a[8..];
             continue;
         }
         if (std.mem.eql(u8, a, "-q") or std.mem.eql(u8, a, "--query")) {
             i += 1;
             if (i >= args.len) return error.MissingArgument;
-            o.query = args[i];
+            o.*.query = args[i];
             continue;
         }
         if (std.mem.startsWith(u8, a, "--filter=")) {
-            o.filter = a[9..];
+            o.*.filter = a[9..];
             continue;
         }
         if (std.mem.eql(u8, a, "-f") or std.mem.eql(u8, a, "--filter")) {
             i += 1;
             if (i >= args.len) return error.MissingArgument;
-            o.filter = args[i];
+            o.*.filter = args[i];
             continue;
         }
         if (std.mem.startsWith(u8, a, "--prompt=")) {
-            o.prompt = a[9..];
+            o.*.prompt = a[9..];
             continue;
         }
         if (std.mem.startsWith(u8, a, "--pointer=")) {
-            o.pointer = a[10..];
+            o.*.pointer = a[10..];
             continue;
         }
         if (std.mem.startsWith(u8, a, "--marker=")) {
-            o.marker = a[9..];
+            o.*.marker = a[9..];
             continue;
         }
         if (std.mem.startsWith(u8, a, "--header=")) {
-            o.header = a[9..];
+            o.*.header = a[9..];
             continue;
         }
         if (std.mem.startsWith(u8, a, "--footer=")) {
-            o.footer = a[9..];
+            o.*.footer = a[9..];
             continue;
         }
         if (std.mem.startsWith(u8, a, "--height=")) {
-            o.height_percent = parsePercent(a[9..]);
+            o.*.height_percent = parsePercent(a[9..]);
             continue;
         }
         if (std.mem.startsWith(u8, a, "--preview=")) {
-            o.preview.command = a[10..];
+            o.*.preview.command = a[10..];
             continue;
         }
         if (std.mem.eql(u8, a, "--preview")) {
             i += 1;
             if (i >= args.len) return error.MissingArgument;
-            o.preview.command = args[i];
+            o.*.preview.command = args[i];
             continue;
         }
         if (std.mem.startsWith(u8, a, "--preview-window=")) {
-            parsePreviewWindow(&o.preview, a[17..]);
+            parsePreviewWindow(&o.*.preview, a[17..]);
             continue;
         }
         if (std.mem.startsWith(u8, a, "--delimiter=")) {
-            o.delimiter = a[12..];
+            o.*.delimiter = a[12..];
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "-d") and a.len > 2) {
+            o.*.delimiter = a[2..];
             continue;
         }
         if (std.mem.eql(u8, a, "-d") or std.mem.eql(u8, a, "--delimiter")) {
             i += 1;
             if (i >= args.len) return error.MissingArgument;
-            o.delimiter = args[i];
+            o.*.delimiter = args[i];
             continue;
         }
         if (std.mem.startsWith(u8, a, "--nth=")) {
-            o.nth = a[6..];
+            o.*.nth = a[6..];
             continue;
         }
         if (std.mem.eql(u8, a, "-n") or std.mem.eql(u8, a, "--nth")) {
             i += 1;
             if (i >= args.len) return error.MissingArgument;
-            o.nth = args[i];
+            o.*.nth = args[i];
             continue;
         }
         if (std.mem.startsWith(u8, a, "--with-nth=")) {
-            o.with_nth = a[11..];
+            o.*.with_nth = a[11..];
             continue;
         }
         if (std.mem.startsWith(u8, a, "--accept-nth=")) {
-            o.accept_nth = a[13..];
+            o.*.accept_nth = a[13..];
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--with-nth")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.with_nth = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--accept-nth")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.accept_nth = args[i];
             continue;
         }
         if (std.mem.startsWith(u8, a, "--expect=")) {
             var it = std.mem.splitScalar(u8, a[9..], ',');
-            while (it.next()) |k| if (k.len != 0) try o.expect.append(allocator, k);
+            while (it.next()) |k| if (k.len != 0) try o.*.expect.append(allocator, k);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--expect")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            var it = std.mem.splitScalar(u8, args[i], ',');
+            while (it.next()) |k| if (k.len != 0) try o.*.expect.append(allocator, k);
             continue;
         }
         if (std.mem.startsWith(u8, a, "--bind=")) {
-            try parseBindings(allocator, &o.bindings, a[7..]);
+            try parseBindings(allocator, &o.*.bindings, a[7..]);
             continue;
         }
         if (std.mem.eql(u8, a, "--bind")) {
             i += 1;
             if (i >= args.len) return error.MissingArgument;
-            try parseBindings(allocator, &o.bindings, args[i]);
+            try parseBindings(allocator, &o.*.bindings, args[i]);
             continue;
         }
         return error.UnknownOption;
     }
-    return o;
+    return;
 }
 
 fn parseBindings(allocator: Allocator, out: *std.ArrayList(Binding), spec: []const u8) !void {
@@ -1129,7 +1236,18 @@ fn parsePreviewWindow(p: *PreviewOptions, spec: []const u8) void {
     }
 }
 
-fn readCandidates(allocator: Allocator, io: Io, options: *const Options) !CandidateSet {
+fn readCandidates(allocator: Allocator, io: Io, options: *const Options, default_command: ?[]const u8) !CandidateSet {
+    if (std.c.isatty(std.posix.STDIN_FILENO) == 1) {
+        const command = default_command orelse
+            "find . -path './.git' -prune -o -path './node_modules' -prune -o \\( -type f -o -type d \\) -print";
+        const result = try std.process.run(allocator, io, .{
+            .argv = &.{ "/bin/sh", "-c", command },
+            .stdout_limit = .limited(256 * 1024 * 1024),
+            .stderr_limit = .limited(4 * 1024 * 1024),
+        });
+        allocator.free(result.stderr);
+        return candidatesFromOwnedBlob(allocator, result.stdout, options);
+    }
     var buffer: [64 * 1024]u8 = undefined;
     var reader = Io.File.stdin().reader(io, &buffer);
     const blob = try reader.interface.allocRemaining(allocator, .unlimited);
@@ -1773,19 +1891,25 @@ fn writeTruncated(w: anytype, text: []const u8, cols: usize, wrap: bool, prefix:
 }
 
 fn expandPreviewCommand(allocator: Allocator, template: []const u8, item: []const u8, query: []const u8) ![]u8 {
-    const item_q = try shellQuote(allocator, item);
-    defer allocator.free(item_q);
-    const query_q = try shellQuote(allocator, query);
-    defer allocator.free(query_q);
+    const items = [_][]const u8{item};
+    return expandCommandSimple(allocator, template, query, &items, 0);
+}
+
+fn expandCommandSimple(allocator: Allocator, template: []const u8, query: []const u8, items: []const []const u8, current: usize) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
+    const item = if (items.len == 0) "" else items[@min(current, items.len - 1)];
     var i: usize = 0;
     while (i < template.len) {
         if (std.mem.startsWith(u8, template[i..], "{q}")) {
-            try out.appendSlice(allocator, query_q);
+            const q = try shellQuote(allocator, query);
+            defer allocator.free(q);
+            try out.appendSlice(allocator, q);
             i += 3;
         } else if (std.mem.startsWith(u8, template[i..], "{}")) {
-            try out.appendSlice(allocator, item_q);
+            const q = try shellQuote(allocator, item);
+            defer allocator.free(q);
+            try out.appendSlice(allocator, q);
             i += 2;
         } else {
             try out.append(allocator, template[i]);
@@ -1793,6 +1917,98 @@ fn expandPreviewCommand(allocator: Allocator, template: []const u8, item: []cons
         }
     }
     return try out.toOwnedSlice(allocator);
+}
+
+fn expandCommand(
+    allocator: Allocator,
+    template: []const u8,
+    query: []const u8,
+    candidates: *const CandidateSet,
+    options: *const Options,
+    current_idx: ?usize,
+    selection_order: []const usize,
+    selected: []const bool,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < template.len) {
+        if (template[i] != '{') {
+            try out.append(allocator, template[i]);
+            i += 1;
+            continue;
+        }
+        const close = std.mem.indexOfScalarPos(u8, template, i + 1, '}') orelse {
+            try out.append(allocator, template[i]);
+            i += 1;
+            continue;
+        };
+        const expr = template[i + 1 .. close];
+        if (std.mem.eql(u8, expr, "q")) {
+            try appendShellQuoted(allocator, &out, query);
+        } else if (std.mem.eql(u8, expr, "")) {
+            if (current_idx) |idx| try appendShellQuoted(allocator, &out, candidates.output[idx]);
+        } else if (std.mem.eql(u8, expr, "n")) {
+            if (current_idx) |idx| try appendDecimal(allocator, &out, idx);
+        } else if (expr.len != 0 and expr[0] == '+') {
+            try appendSelectedPlaceholder(allocator, &out, expr[1..], candidates, options, current_idx, selection_order, selected);
+        } else if (current_idx) |idx| {
+            const transformed = try transformFields(allocator, candidates.output[idx], options.delimiter, expr, idx);
+            defer allocator.free(transformed);
+            try appendShellQuoted(allocator, &out, transformed);
+        }
+        i = close + 1;
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn appendSelectedPlaceholder(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    expr: []const u8,
+    candidates: *const CandidateSet,
+    options: *const Options,
+    current_idx: ?usize,
+    selection_order: []const usize,
+    selected: []const bool,
+) !void {
+    var wrote = false;
+    for (selection_order) |idx| {
+        if (idx >= selected.len or !selected[idx]) continue;
+        if (wrote) try out.append(allocator, ' ');
+        if (expr.len == 0) {
+            try appendShellQuoted(allocator, out, candidates.output[idx]);
+        } else if (std.mem.eql(u8, expr, "n")) {
+            try appendDecimal(allocator, out, idx);
+        } else {
+            const transformed = try transformFields(allocator, candidates.output[idx], options.delimiter, expr, idx);
+            defer allocator.free(transformed);
+            try appendShellQuoted(allocator, out, transformed);
+        }
+        wrote = true;
+    }
+    if (wrote) return;
+    if (current_idx) |idx| {
+        if (expr.len == 0) try appendShellQuoted(allocator, out, candidates.output[idx]) else if (std.mem.eql(u8, expr, "n")) {
+            try appendDecimal(allocator, out, idx);
+        } else {
+            const transformed = try transformFields(allocator, candidates.output[idx], options.delimiter, expr, idx);
+            defer allocator.free(transformed);
+            try appendShellQuoted(allocator, out, transformed);
+        }
+    }
+}
+
+fn appendShellQuoted(allocator: Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    const quoted = try shellQuote(allocator, s);
+    defer allocator.free(quoted);
+    try out.appendSlice(allocator, quoted);
+}
+
+fn appendDecimal(allocator: Allocator, out: *std.ArrayList(u8), n: usize) !void {
+    var buf: [32]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, "{d}", .{n});
+    try out.appendSlice(allocator, text);
 }
 
 fn shellQuote(allocator: Allocator, s: []const u8) ![]u8 {
@@ -1869,6 +2085,20 @@ test "preview placeholder quoting" {
     try std.testing.expectEqualStrings("echo 'a'\\''b' 'x y'", got);
 }
 
+test "selected and field command placeholders" {
+    const a = std.testing.allocator;
+    const blob = try a.dupe(u8, "one,two\nthree,four\n");
+    var options: Options = .{ .delimiter = "," };
+    defer options.deinit(a);
+    var candidates = try candidatesFromOwnedBlob(a, blob, &options);
+    defer candidates.deinit(a);
+    const selected = [_]bool{ true, true };
+    const order = [_]usize{ 1, 0 };
+    const got = try expandCommand(a, "echo {n} {1} {+} {+2} {q}", "x y", &candidates, &options, 0, &order, &selected);
+    defer a.free(got);
+    try std.testing.expectEqualStrings("echo 0 'one' 'three,four' 'one,two' 'four' 'two' 'x y'", got);
+}
+
 test "field transforms" {
     const a = std.testing.allocator;
     const x = try transformFields(a, "one,two,three", ",", "2..", 7);
@@ -1917,6 +2147,18 @@ test "exact mode quote flips back to fuzzy" {
     try std.testing.expect(!queryMatches(exact, "axbyc", .smart));
     const fuzzy_term = try parseQuery("'abc", &options, &storage);
     try std.testing.expect(queryMatches(fuzzy_term, "axbyc", .smart));
+}
+
+test "shell option splitting" {
+    const a = std.testing.allocator;
+    const args = try shellSplitArgs(a, "--reverse --prompt='pick > ' --bind=ctrl-r:reload\\(echo\\ x\\)");
+    defer {
+        for (args) |arg| a.free(arg);
+        a.free(args);
+    }
+    try std.testing.expectEqual(@as(usize, 3), args.len);
+    try std.testing.expectEqualStrings("--prompt=pick > ", args[1]);
+    try std.testing.expectEqualStrings("--bind=ctrl-r:reload(echo x)", args[2]);
 }
 
 test "binding parser" {
