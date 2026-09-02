@@ -679,8 +679,15 @@ pub const Index = struct {
                 // that cache is allowed to be a superset, so future prefix
                 // extensions remain exact.
                 var subsequence_end = entry.len;
+                var packed6: u16 = 0;
                 if (stage_len == top_k) {
-                    var upper = self.scoreUpperBound(&q, self.bonus_caps[entry_index]);
+                    var upper: i32 = undefined;
+                    if (q.bytes.len == 6) {
+                        packed6 = @intCast(packedBoundIndex(6, self.bonus_caps[entry_index], q.classes));
+                        upper = 6 * score_match + @as(i32, bound_bonus6[packed6]);
+                    } else {
+                        upper = self.scoreUpperBound(&q, self.bonus_caps[entry_index]);
+                    }
                     if (q.bytes.len >= 4) {
                         if (q.bytes.len >= 6) {
                             var final_last: u8 = 0xff;
@@ -726,7 +733,7 @@ pub const Index = struct {
                 var score: i32 = undefined;
                 if (q.bytes.len == 6 and stage_len == top_k) {
                     self.prepareLastPositions(&q, entry, entry_index);
-                    const tightened = self.gapAwareUpperPrepared(&q, self.bonus_caps[entry_index]);
+                    const tightened = self.gapAwareUpperPrepared6(&q, packed6);
                     if (tightened < self.stage[0].score) continue;
                     score = self.scoreV2SixPreparedFromFirst(&q, entry);
                 } else if (q.bytes.len >= 7 and q.bytes.len <= 1000 and stage_len == top_k) {
@@ -2935,6 +2942,28 @@ pub const Index = struct {
             reverse_pattern -= 1;
             last[reverse_pattern] = reverse_col;
         }
+    }
+
+    fn gapAwareUpperPrepared6(self: *const Index, q: *const Query, packed_bits: u16) i32 {
+        std.debug.assert(q.bytes.len == 6);
+        var categories: u16 = packed_bits;
+        var prefix_category: u2 = @truncate(categories);
+        categories >>= 2;
+        var upper = score_match + @as(i32, categoryBonusValue(prefix_category)) * bonus_first_char_multiplier;
+        for (1..6) |i| {
+            const latest_previous = self.last_position_scratch[i - 1];
+            const earliest_current = self.position_scratch[i];
+            if (latest_previous + 1 < earliest_current) {
+                const gap = earliest_current - latest_previous - 1;
+                const penalty = score_gap_start + @as(i32, @intCast(gap - 1)) * score_gap_extension;
+                upper = @max(0, upper + penalty);
+            }
+            const category: u2 = @truncate(categories);
+            categories >>= 2;
+            prefix_category = @max(prefix_category, category);
+            upper += score_match + @max(@as(i32, categoryBonusValue(prefix_category)), bonus_consecutive);
+        }
+        return upper;
     }
 
     fn gapAwareUpperPrepared(self: *const Index, q: *const Query, caps: BonusCaps) i32 {
