@@ -566,7 +566,7 @@ pub const Index = struct {
 
                 const entry = self.entries[entry_index];
                 if (q.bytes.len > entry.len) continue;
-                if (!self.subsequenceIndexed(&q, entry, entry_index, first_slot)) continue;
+                if (!self.subsequenceIndexed(&q, entry, entry_index, first_slot, entry.len)) continue;
                 self.next_survivors[word] |= row_bit;
 
                 self.addStage(.{
@@ -604,10 +604,17 @@ pub const Index = struct {
                 // Rows skipped here stay in the prefix cache as "possible";
                 // that cache is allowed to be a superset, so future prefix
                 // extensions remain exact.
+                var subsequence_end = entry.len;
                 if (stage_len == top_k) {
                     var upper = self.scoreUpperBound(&q, self.bonus_caps[entry_index]);
                     if (q.bytes.len >= 4) {
-                        upper = self.endpointSpanUpperBound(&q, entry, entry_index, first_slot, last_slot, self.bonus_caps[entry_index], upper);
+                        if (q.bytes.len >= 6) {
+                            var final_last: u8 = 0xff;
+                            upper = self.endpointSpanUpperBoundWithLast(&q, entry, entry_index, first_slot, last_slot, self.bonus_caps[entry_index], upper, &final_last);
+                            if (final_last != 0xff) subsequence_end = @as(usize, final_last) + 1;
+                        } else {
+                            upper = self.endpointSpanUpperBound(&q, entry, entry_index, first_slot, last_slot, self.bonus_caps[entry_index], upper);
+                        }
                     }
                     const worst = self.stage[0];
                     const worst_entry = self.entries[worst.entry];
@@ -628,7 +635,7 @@ pub const Index = struct {
                     continue;
                 }
                 if (q.bytes.len == 2) {
-                    if (!self.subsequenceIndexed(&q, entry, entry_index, first_slot)) continue;
+                    if (!self.subsequenceIndexed(&q, entry, entry_index, first_slot, entry.len)) continue;
                     self.next_survivors[word] |= row_bit;
                     self.addStage(.{
                         .entry = entry_index,
@@ -639,7 +646,7 @@ pub const Index = struct {
 
                 // Longer queries still use the exact subsequence pass to
                 // populate the first-feasible position of every query byte.
-                if (!self.subsequenceIndexed(&q, entry, entry_index, first_slot)) continue;
+                if (!self.subsequenceIndexed(&q, entry, entry_index, first_slot, subsequence_end)) continue;
                 self.next_survivors[word] |= row_bit;
 
                 var score: i32 = undefined;
@@ -851,7 +858,7 @@ pub const Index = struct {
         return false;
     }
 
-    fn subsequenceIndexed(self: *Index, q: *const Query, entry: Entry, entry_index: usize, first_slot: u8) bool {
+    fn subsequenceIndexed(self: *Index, q: *const Query, entry: Entry, entry_index: usize, first_slot: u8, text_end: usize) bool {
         const text = self.candidateLower(entry);
         if (q.bytes.len == 0) return true;
         if (q.bytes.len > text.len) return false;
@@ -863,7 +870,8 @@ pub const Index = struct {
             if (pattern_index == q.bytes.len) return true;
             text_start = position + 1;
         }
-        for (text[text_start..], text_start..) |c, i| {
+        if (text_start >= text_end) return false;
+        for (text[text_start..text_end], text_start..) |c, i| {
             if (c != q.bytes[pattern_index]) continue;
             self.position_scratch[pattern_index] = i;
             pattern_index += 1;
@@ -890,10 +898,26 @@ pub const Index = struct {
         caps: BonusCaps,
         upper: i32,
     ) i32 {
+        var ignored_last: u8 = 0xff;
+        return self.endpointSpanUpperBoundWithLast(q, entry, entry_index, first_slot, last_slot, caps, upper, &ignored_last);
+    }
+
+    fn endpointSpanUpperBoundWithLast(
+        self: *const Index,
+        q: *const Query,
+        entry: Entry,
+        entry_index: usize,
+        first_slot: u8,
+        last_slot: u8,
+        caps: BonusCaps,
+        upper: i32,
+        final_last: *u8,
+    ) i32 {
         if (entry.len >= 256 or first_slot == 0xff or last_slot == 0xff) return upper;
 
         const first_meta = self.last_positions[@as(usize, first_slot) * self.entries.len + entry_index];
         const last_meta = self.last_positions[@as(usize, last_slot) * self.entries.len + entry_index];
+        final_last.* = last_meta.last;
         if (first_meta.last == 0xff or last_meta.first == 0xff) return upper;
         if (last_meta.first <= first_meta.last) return upper;
 
@@ -3273,4 +3297,38 @@ test "prefix extension reuses exact survivor cache and backspace resets it" {
 
     const backspace = index.compileQuery("f");
     try std.testing.expect(!backspace.use_cache);
+}
+
+test "indexed final occurrence bound preserves subsequence search" {
+    const values = [_][]const u8{
+        "zzaxbyczdefyy",
+        "abcdef",
+        "a---b---c---d---e---f",
+        "fedcbaabcdef",
+        "aaaaabbbbbcccccdddddeeeeefffff",
+    };
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+
+    const queries = [_][]const u8{ "abcdef", "abczef", "aaaaaf", "fedcba" };
+    for (queries) |text| {
+        index.resetHistory();
+        const q = index.compileQuery(text);
+        const first_class: usize = @intCast(q.classes[0]);
+        const first_slot: u8 = if (first_class < exact_signature_classes) index.last_slot_for_class[first_class] else 0xff;
+        const last_class: usize = @intCast(q.classes[q.classes.len - 1]);
+        const last_slot: u8 = if (last_class < exact_signature_classes) index.last_slot_for_class[last_class] else 0xff;
+
+        for (index.entries, 0..) |entry, entry_index| {
+            if (q.bytes.len > entry.len) continue;
+            const full = index.subsequenceIndexed(&q, entry, entry_index, first_slot, entry.len);
+            var end = entry.len;
+            if (entry.len < 256 and last_slot != 0xff) {
+                const meta = index.last_positions[@as(usize, last_slot) * index.entries.len + entry_index];
+                if (meta.last != 0xff) end = @as(usize, meta.last) + 1;
+            }
+            const bounded = index.subsequenceIndexed(&q, entry, entry_index, first_slot, end);
+            try std.testing.expectEqual(full, bounded);
+        }
+    }
 }
