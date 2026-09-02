@@ -712,12 +712,9 @@ pub const Index = struct {
                     continue;
                 }
                 if (q.bytes.len == 2) {
-                    if (!self.subsequenceIndexed(&q, entry, entry_index, first_slot, entry.len)) continue;
+                    const score = self.scoreV2TwoIndexedOrdered(&q, entry, entry_index, first_slot) orelse continue;
                     self.next_survivors[word] |= row_bit;
-                    self.addStage(.{
-                        .entry = entry_index,
-                        .score = self.scoreV2TwoIndexed(&q, entry, entry_index),
-                    }, top_k, &stage_len);
+                    self.addStage(.{ .entry = entry_index, .score = score }, top_k, &stage_len);
                     continue;
                 }
 
@@ -1096,6 +1093,38 @@ pub const Index = struct {
         const last_col = std.mem.findScalarLast(u8, text, q.bytes[1]).?;
 
         return self.scoreV2TwoWindow(q, text, bonus, first0, first1, last_col);
+    }
+
+    fn scoreV2TwoIndexedOrdered(self: *Index, q: *const Query, entry: Entry, entry_index: usize, first_slot: u8) ?i32 {
+        const first0 = self.indexedFirstPositionForSlot(entry, entry_index, first_slot) orelse {
+            if (!self.subsequenceIndexed(q, entry, entry_index, first_slot, entry.len)) return null;
+            return self.scoreV2TwoIndexed(q, entry, entry_index);
+        };
+        self.position_scratch[0] = first0;
+
+        const class: usize = @intCast(q.classes[1]);
+        if (entry.len < 256 and class < exact_signature_classes) {
+            const slot = self.last_slot_for_class[class];
+            if (slot != 0xff) {
+                const meta = self.last_positions[@as(usize, slot) * self.entries.len + entry_index];
+                if (meta.last == 0xff or @as(usize, meta.last) <= first0) return null;
+                const last_col: usize = meta.last;
+                var first1: usize = undefined;
+                if (@as(usize, meta.first) > first0) {
+                    first1 = meta.first;
+                } else {
+                    const text = self.candidateLower(entry);
+                    var j = first0 + 1;
+                    while (text[j] != q.bytes[1]) : (j += 1) {}
+                    first1 = j;
+                }
+                self.position_scratch[1] = first1;
+                return self.scoreV2TwoWindow(q, self.candidateLower(entry), self.candidateBonuses(entry), first0, first1, last_col);
+            }
+        }
+
+        if (!self.subsequenceIndexed(q, entry, entry_index, first_slot, entry.len)) return null;
+        return self.scoreV2TwoIndexed(q, entry, entry_index);
     }
 
     fn scoreV2TwoIndexed(self: *const Index, q: *const Query, entry: Entry, entry_index: usize) i32 {
