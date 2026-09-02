@@ -23,6 +23,8 @@ const Action = union(enum) {
     down,
     page_up,
     page_down,
+    first,
+    last,
     toggle,
     toggle_up,
     select_all,
@@ -32,6 +34,15 @@ const Action = union(enum) {
     abort,
     toggle_preview,
     refresh_preview,
+    toggle_sort,
+    enable_search,
+    disable_search,
+    toggle_search,
+    change_query: []const u8,
+    change_prompt: []const u8,
+    change_header: []const u8,
+    change_footer: []const u8,
+    change_preview: []const u8,
     reload: []const u8,
     execute: []const u8,
     execute_silent: []const u8,
@@ -228,6 +239,9 @@ const Ui = struct {
     preview_text: []u8 = &.{},
     accepted_key: ?[]const u8 = null,
     change_event_pending: bool = false,
+    load_event_pending: bool = false,
+    result_event_pending: bool = false,
+    focus_event_pending: bool = false,
 
     fn init(
         allocator: Allocator,
@@ -277,12 +291,25 @@ const Ui = struct {
         defer self.terminal.leave();
 
         if (try self.fireEvent("start")) |code| return code;
+        self.load_event_pending = true;
         while (true) {
+            if (self.load_event_pending) {
+                self.load_event_pending = false;
+                if (try self.fireEvent("load")) |code| return code;
+            }
             if (self.change_event_pending) {
                 self.change_event_pending = false;
                 if (try self.fireEvent("change")) |code| return code;
             }
             if (self.dirty_search) try self.refreshSearch(false);
+            if (self.result_event_pending) {
+                self.result_event_pending = false;
+                if (try self.fireEvent("result")) |code| return code;
+            }
+            if (self.focus_event_pending) {
+                self.focus_event_pending = false;
+                if (try self.fireEvent("focus")) |code| return code;
+            }
             try self.render();
             const key = try readKey(self.terminal);
             if (try self.handleKey(key)) |code| return code;
@@ -298,6 +325,7 @@ const Ui = struct {
         if (self.options.no_sort) self.result_cap = n;
 
         const effective_query: []const u8 = if (self.options.disabled) "" else self.query.items;
+        const old_focus_idx: ?usize = if (self.result_len == 0) null else self.results[self.focus];
         const found = try searchCandidates(self.index, self.candidates, self.options, effective_query, self.results, self.result_cap);
         self.result_len = found.len;
         if (self.options.no_sort) std.mem.sort(usize, self.results[0..self.result_len], {}, comptime std.sort.asc(usize));
@@ -310,6 +338,9 @@ const Ui = struct {
         }
         self.dirty_search = false;
         self.preview_cache_key = null;
+        self.result_event_pending = true;
+        const new_focus_idx: ?usize = if (self.result_len == 0) null else self.results[self.focus];
+        if (old_focus_idx != new_focus_idx) self.focus_event_pending = true;
     }
 
     fn growResults(self: *Ui) !void {
@@ -338,7 +369,9 @@ const Ui = struct {
 
     fn handleKey(self: *Ui, key: Key) !?u8 {
         for (self.options.bindings.items) |binding| {
-            if (std.mem.eql(u8, binding.trigger, "start") or std.mem.eql(u8, binding.trigger, "change") or std.mem.eql(u8, binding.trigger, "focus")) continue;
+            if (std.mem.eql(u8, binding.trigger, "start") or std.mem.eql(u8, binding.trigger, "load") or
+                std.mem.eql(u8, binding.trigger, "change") or std.mem.eql(u8, binding.trigger, "result") or
+                std.mem.eql(u8, binding.trigger, "focus")) continue;
             if (keyMatchesName(key, binding.trigger)) return try self.runAction(binding.action);
         }
         for (self.options.expect.items) |expected| {
@@ -441,6 +474,19 @@ const Ui = struct {
             .down => self.move(1),
             .page_up => self.page(-1),
             .page_down => self.page(1),
+            .first => if (self.result_len != 0) {
+                if (self.focus != 0) self.focus_event_pending = true;
+                self.focus = 0;
+                self.ensureVisible();
+                self.preview_cache_key = null;
+            },
+            .last => if (self.result_len != 0) {
+                const target = self.result_len - 1;
+                if (self.focus != target) self.focus_event_pending = true;
+                self.focus = target;
+                self.ensureVisible();
+                self.preview_cache_key = null;
+            },
             .toggle => try self.toggleCurrent(),
             .toggle_up => {
                 try self.toggleCurrent();
@@ -478,6 +524,40 @@ const Ui = struct {
                 self.preview_cache_key = null;
             },
             .refresh_preview => self.preview_cache_key = null,
+            .toggle_sort => {
+                self.options.no_sort = !self.options.no_sort;
+                self.dirty_search = true;
+            },
+            .enable_search => {
+                if (self.options.disabled) {
+                    self.options.disabled = false;
+                    self.dirty_search = true;
+                }
+            },
+            .disable_search => {
+                if (!self.options.disabled) {
+                    self.options.disabled = true;
+                    self.dirty_search = true;
+                }
+            },
+            .toggle_search => {
+                self.options.disabled = !self.options.disabled;
+                self.dirty_search = true;
+            },
+            .change_query => |value| {
+                self.query.clearRetainingCapacity();
+                try self.query.appendSlice(self.allocator, value);
+                self.cursor = self.query.items.len;
+                self.markQueryChanged();
+            },
+            .change_prompt => |value| self.options.prompt = value,
+            .change_header => |value| self.options.header = value,
+            .change_footer => |value| self.options.footer = value,
+            .change_preview => |value| {
+                self.options.preview.command = value;
+                self.options.preview.hidden = false;
+                self.preview_cache_key = null;
+            },
             .reload => |cmd| try self.reloadFromCommand(cmd),
             .execute => |cmd| try self.executeCommand(cmd, false),
             .execute_silent => |cmd| try self.executeCommand(cmd, true),
@@ -541,6 +621,8 @@ const Ui = struct {
         self.scroll = 0;
         self.dirty_search = true;
         self.preview_cache_key = null;
+        self.load_event_pending = true;
+        self.focus_event_pending = true;
     }
 
     fn executeCommand(self: *Ui, command: []const u8, silent: bool) !void {
@@ -603,8 +685,10 @@ const Ui = struct {
         const rel = m.y - list_start;
         const item = if (self.options.layout == .reverse) self.scroll + rel else self.scroll + (rows - 1 - rel);
         if (item < self.result_len) {
+            if (self.focus != item) self.focus_event_pending = true;
             self.focus = item;
             self.ensureVisible();
+            self.preview_cache_key = null;
         }
     }
 
@@ -617,6 +701,7 @@ const Ui = struct {
 
     fn move(self: *Ui, delta: isize) void {
         if (self.result_len == 0) return;
+        const old_focus = self.focus;
         if (delta < 0) {
             const amount: usize = @intCast(-delta);
             if (amount > self.focus) {
@@ -633,6 +718,7 @@ const Ui = struct {
         }
         self.ensureVisible();
         self.preview_cache_key = null;
+        if (self.focus != old_focus) self.focus_event_pending = true;
     }
 
     fn page(self: *Ui, delta: isize) void {
@@ -1186,6 +1272,24 @@ fn parseBindings(allocator: Allocator, out: *std.ArrayList(Binding), spec: []con
         const colon = std.mem.indexOfScalar(u8, part, ':') orelse return error.InvalidBinding;
         const trigger = std.mem.trim(u8, part[0..colon], " \t");
         const action_text = std.mem.trim(u8, part[colon + 1 ..], " \t");
+        try appendBindingActions(allocator, out, trigger, action_text);
+    }
+}
+
+fn appendBindingActions(allocator: Allocator, out: *std.ArrayList(Binding), trigger: []const u8, text: []const u8) !void {
+    var start: usize = 0;
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i <= text.len) : (i += 1) {
+        const at_end = i == text.len;
+        const c: u8 = if (at_end) '+' else text[i];
+        if (!at_end) {
+            if (c == '(') depth += 1 else if (c == ')' and depth != 0) depth -= 1;
+        }
+        if (c != '+' or depth != 0) continue;
+        const action_text = std.mem.trim(u8, text[start..i], " \t");
+        start = i + 1;
+        if (action_text.len == 0) continue;
         try out.append(allocator, .{ .trigger = trigger, .action = try parseAction(action_text) });
     }
 }
@@ -1195,6 +1299,8 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "down")) return .down;
     if (std.mem.eql(u8, s, "page-up")) return .page_up;
     if (std.mem.eql(u8, s, "page-down")) return .page_down;
+    if (std.mem.eql(u8, s, "first")) return .first;
+    if (std.mem.eql(u8, s, "last")) return .last;
     if (std.mem.eql(u8, s, "toggle")) return .toggle;
     if (std.mem.eql(u8, s, "toggle-up")) return .toggle_up;
     if (std.mem.eql(u8, s, "select-all")) return .select_all;
@@ -1204,6 +1310,15 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "abort")) return .abort;
     if (std.mem.eql(u8, s, "toggle-preview")) return .toggle_preview;
     if (std.mem.eql(u8, s, "refresh-preview")) return .refresh_preview;
+    if (std.mem.eql(u8, s, "toggle-sort")) return .toggle_sort;
+    if (std.mem.eql(u8, s, "enable-search")) return .enable_search;
+    if (std.mem.eql(u8, s, "disable-search")) return .disable_search;
+    if (std.mem.eql(u8, s, "toggle-search")) return .toggle_search;
+    if (commandAction(s, "change-query")) |value| return .{ .change_query = value };
+    if (commandAction(s, "change-prompt")) |value| return .{ .change_prompt = value };
+    if (commandAction(s, "change-header")) |value| return .{ .change_header = value };
+    if (commandAction(s, "change-footer")) |value| return .{ .change_footer = value };
+    if (commandAction(s, "change-preview")) |value| return .{ .change_preview = value };
     if (commandAction(s, "reload")) |cmd| return .{ .reload = cmd };
     if (commandAction(s, "execute-silent")) |cmd| return .{ .execute_silent = cmd };
     if (commandAction(s, "execute")) |cmd| return .{ .execute = cmd };
@@ -2161,13 +2276,23 @@ test "shell option splitting" {
     try std.testing.expectEqualStrings("--bind=ctrl-r:reload(echo x)", args[2]);
 }
 
+test "stateful binding actions parse" {
+    try std.testing.expect((try parseAction("toggle-sort")) == .toggle_sort);
+    try std.testing.expect((try parseAction("enable-search")) == .enable_search);
+    const q = try parseAction("change-query(foo bar)");
+    try std.testing.expectEqualStrings("foo bar", q.change_query);
+    const h = try parseAction("change-header:ready");
+    try std.testing.expectEqualStrings("ready", h.change_header);
+}
+
 test "binding parser" {
     const a = std.testing.allocator;
     var bindings: std.ArrayList(Binding) = .empty;
     defer bindings.deinit(a);
-    try parseBindings(a, &bindings, "ctrl-r:reload(printf 'a,b'),enter:accept");
-    try std.testing.expectEqual(@as(usize, 2), bindings.items.len);
+    try parseBindings(a, &bindings, "ctrl-r:reload(printf 'a,b')+change-header(ready),enter:accept");
+    try std.testing.expectEqual(@as(usize, 3), bindings.items.len);
     try std.testing.expectEqualStrings("ctrl-r", bindings.items[0].trigger);
     try std.testing.expectEqualStrings("printf 'a,b'", bindings.items[0].action.reload);
-    try std.testing.expect(bindings.items[1].action == .accept);
+    try std.testing.expectEqualStrings("ready", bindings.items[1].action.change_header);
+    try std.testing.expect(bindings.items[2].action == .accept);
 }
