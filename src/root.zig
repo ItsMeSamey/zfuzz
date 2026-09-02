@@ -606,7 +606,7 @@ pub const Index = struct {
                 // extensions remain exact.
                 if (stage_len == top_k) {
                     var upper = self.scoreUpperBound(&q, self.bonus_caps[entry_index]);
-                    if (q.bytes.len >= 5) {
+                    if (q.bytes.len >= 4) {
                         upper = self.endpointSpanUpperBound(&q, entry, entry_index, first_slot, last_slot, self.bonus_caps[entry_index], upper);
                     }
                     const worst = self.stage[0];
