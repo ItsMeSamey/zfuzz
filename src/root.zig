@@ -32,6 +32,7 @@ const Query = struct {
     bytes: []const u8,
     classes: []const u6,
     planes: []const u8,
+    plane_offsets: []const usize,
     cap_word_mask: u2,
     use_cache: bool,
     impossible: bool,
@@ -226,6 +227,7 @@ pub const Index = struct {
     query_bytes: []u8,
     query_classes: []u6,
     query_planes: [signature_classes]u8,
+    query_plane_offsets: [signature_classes]usize,
     previous_query: []u8,
     previous_query_len: usize,
     survivors: []u64,
@@ -480,6 +482,7 @@ pub const Index = struct {
             .query_bytes = query_bytes,
             .query_classes = query_classes,
             .query_planes = undefined,
+            .query_plane_offsets = undefined,
             .previous_query = previous_query,
             .previous_query_len = 0,
             .survivors = survivors,
@@ -522,6 +525,7 @@ pub const Index = struct {
                 .bytes = self.query_bytes[0..0],
                 .classes = self.query_classes[0..0],
                 .planes = self.query_planes[0..0],
+                .plane_offsets = self.query_plane_offsets[0..0],
                 .cap_word_mask = 0,
                 .use_cache = false,
                 .impossible = true,
@@ -553,11 +557,15 @@ pub const Index = struct {
         }
 
         const plane_count = self.compilePlanes(once, twice, &self.query_planes);
+        for (self.query_planes[0..plane_count], 0..) |plane, i| {
+            self.query_plane_offsets[i] = @as(usize, @intCast(plane)) * self.words;
+        }
 
         return .{
             .bytes = self.query_bytes[0..text.len],
             .classes = self.query_classes[0..text.len],
             .planes = self.query_planes[0..plane_count],
+            .plane_offsets = self.query_plane_offsets[0..plane_count],
             .cap_word_mask = cap_word_mask,
             .use_cache = use_cache,
             .impossible = false,
@@ -652,11 +660,11 @@ pub const Index = struct {
 
         var word: usize = 0;
         while (word < self.words) : (word += 1) {
-            var bits = self.planes[@as(usize, @intCast(q.planes[0])) * self.words + word];
+            var bits = self.planes[q.plane_offsets[0] + word];
 
             var p: usize = 1;
-            while (p < q.planes.len and bits != 0) : (p += 1) {
-                bits &= self.planes[@as(usize, @intCast(q.planes[p])) * self.words + word];
+            while (p < q.plane_offsets.len and bits != 0) : (p += 1) {
+                bits &= self.planes[q.plane_offsets[p] + word];
             }
 
             if (q.use_cache) bits &= self.survivors[word];
