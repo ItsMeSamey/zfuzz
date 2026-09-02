@@ -659,7 +659,10 @@ pub const Index = struct {
                     self.prepareLastPositions(&q, entry, entry_index);
                     const tightened = self.gapAwareUpperPrepared(&q, self.bonus_caps[entry_index]);
                     if (tightened < self.stage[0].score) continue;
-                    score = self.scoreV2GeneralFromFirst(&q, entry, null, true);
+                    score = if (q.bytes.len <= 8 and entry.len <= 64)
+                        self.scoreV2Sparse64Prepared(&q, entry)
+                    else
+                        self.scoreV2GeneralFromFirst(&q, entry, null, true);
                 } else {
                     score = self.scoreV2IndexedFromFirst(&q, entry, entry_index);
                 }
@@ -2585,6 +2588,117 @@ pub const Index = struct {
 
     /// General exact score-only fzf V2 DP. Kept separate from the small-query
     /// kernels both as the 7+ byte production path and as a parity reference.
+    fn sparseGapScore(score: i16, consecutive: i16, distance: usize) i16 {
+        if (distance == 0) return score;
+        const distance_i: i16 = @intCast(distance);
+        const penalty = if (consecutive != 0) distance_i + 2 else distance_i;
+        return @max(score - penalty, 0);
+    }
+
+    /// Exact sparse V2 DP for prepared 7/8-byte queries on candidates that fit
+    /// in a u64 position mask. Dense V2 updates every feasible column even when
+    /// the row character does not match. Between match columns those cells are
+    /// only a deterministic gap decay, so keep state at match columns and
+    /// reconstruct the score at j-1 analytically for the next row.
+    fn scoreV2Sparse64Prepared(self: *Index, q: *const Query, entry: Entry) i32 {
+        const text = self.candidateLower(entry);
+        const bonus = self.candidateBonuses(entry);
+        const m = q.bytes.len;
+        const first = self.position_scratch[0..m];
+        const last = self.last_position_scratch[0..m];
+        std.debug.assert((m == 7 or m == 8) and text.len <= 64);
+
+        var previous = self.dp[0 .. text.len * 2];
+        var current = self.dp[text.len * 2 .. text.len * 4];
+
+        const match_score_base: i16 = score_match;
+        const boundary: i16 = bonus_boundary;
+        const consecutive_bonus: i16 = bonus_consecutive;
+        const first_multiplier: i16 = bonus_first_char_multiplier;
+
+        // First row. Only q[0] occurrences need materialized state; scores in
+        // between are recoverable as gap decay from the latest occurrence.
+        var previous_mask: u64 = 0;
+        const first_char = q.bytes[0];
+        var j = first[0];
+        while (j < last[1]) : (j += 1) {
+            if (text[j] != first_char) continue;
+            const bit = @as(u64, 1) << @intCast(j);
+            previous_mask |= bit;
+            const cell = j * 2;
+            previous[cell] = match_score_base + @as(i16, @intCast(bonus[j])) * first_multiplier;
+            previous[cell + 1] = 1;
+        }
+
+        var max_score: i16 = 0;
+        var pattern_index: usize = 1;
+        while (pattern_index < m) : (pattern_index += 1) {
+            const pattern_char = q.bytes[pattern_index];
+            const row_end = if (pattern_index + 1 < m) last[pattern_index + 1] - 1 else last[pattern_index];
+            var current_mask: u64 = 0;
+            var have_current = false;
+            var current_pos: usize = 0;
+            var current_score: i16 = 0;
+            var current_consecutive: i16 = 0;
+
+            j = first[pattern_index];
+            while (j <= row_end) : (j += 1) {
+                if (text[j] != pattern_char) continue;
+
+                const gap_score: i16 = if (have_current)
+                    sparseGapScore(current_score, current_consecutive, j - current_pos)
+                else
+                    0;
+
+                // A feasible row match always has a previous-row occurrence
+                // before it. Find the latest one in O(1) from the sparse mask.
+                const before_mask = previous_mask & ((@as(u64, 1) << @intCast(j)) - 1);
+                std.debug.assert(before_mask != 0);
+                const previous_pos: usize = 63 - @as(usize, @intCast(@clz(before_mask)));
+                const previous_cell = previous_pos * 2;
+                const distance = (j - 1) - previous_pos;
+                const previous_score = sparseGapScore(previous[previous_cell], previous[previous_cell + 1], distance);
+                const previous_consecutive: i16 = if (distance == 0) previous[previous_cell + 1] else 0;
+
+                var match_value = previous_score + match_score_base;
+                var b: i16 = @intCast(bonus[j]);
+                var consecutive = previous_consecutive + 1;
+                if (consecutive > 1) {
+                    const run_start = j + 1 - @as(usize, @intCast(consecutive));
+                    const first_bonus: i16 = @intCast(bonus[run_start]);
+                    if (b >= boundary and b > first_bonus) {
+                        consecutive = 1;
+                    } else {
+                        b = @max(b, @max(consecutive_bonus, first_bonus));
+                    }
+                }
+                if (match_value + b < gap_score) {
+                    match_value += @intCast(bonus[j]);
+                    consecutive = 0;
+                } else {
+                    match_value += b;
+                }
+
+                const score = @max(match_value, gap_score);
+                const cell = j * 2;
+                current[cell] = score;
+                current[cell + 1] = consecutive;
+                current_mask |= @as(u64, 1) << @intCast(j);
+                have_current = true;
+                current_pos = j;
+                current_score = score;
+                current_consecutive = consecutive;
+                if (pattern_index == m - 1) max_score = @max(max_score, score);
+            }
+
+            previous_mask = current_mask;
+            const temp = previous;
+            previous = current;
+            current = temp;
+        }
+        return @intCast(max_score);
+    }
+
     fn scoreV2GeneralFromFirst(self: *Index, q: *const Query, entry: Entry, last_hint: ?usize, last_prepared: bool) i32 {
         const text = self.candidateLower(entry);
         const bonus = self.candidateBonuses(entry);
