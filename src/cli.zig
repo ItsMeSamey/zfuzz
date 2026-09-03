@@ -108,6 +108,7 @@ const Action = union(enum) {
     kill_subword,
     kill_line,
     unix_line_discard,
+    unix_word_rubout,
     yank,
     cancel,
     print_query,
@@ -1839,6 +1840,7 @@ const Ui = struct {
             .kill_subword => _ = try self.killSubwordForward(),
             .kill_line => _ = try self.killLine(),
             .unix_line_discard => _ = try self.unixLineDiscard(),
+            .unix_word_rubout => _ = try self.unixWordRubout(),
             .yank => _ = try self.yankQuery(),
             .cancel => {
                 if (self.query.items.len == 0) return 130;
@@ -3085,6 +3087,17 @@ const Ui = struct {
     fn killWordBackward(self: *Ui) !bool {
         if (self.cursor == 0) return false;
         const begin = self.queryWordBoundaryBackward();
+        if (begin == self.cursor) return false;
+        try self.setYanked(self.query.items[begin..self.cursor]);
+        try self.query.replaceRange(self.allocator, begin, self.cursor - begin, &.{});
+        self.cursor = begin;
+        self.markQueryChanged();
+        return true;
+    }
+
+    fn unixWordRubout(self: *Ui) !bool {
+        if (self.cursor == 0) return false;
+        const begin = unixWordBoundaryBackward(self.query.items, self.cursor);
         if (begin == self.cursor) return false;
         try self.setYanked(self.query.items[begin..self.cursor]);
         try self.query.replaceRange(self.allocator, begin, self.cursor - begin, &.{});
@@ -5007,7 +5020,7 @@ fn parseAction(s: []const u8) !Action {
     if (std.ascii.eqlIgnoreCase(s, "kill-subword")) return .kill_subword;
     if (std.ascii.eqlIgnoreCase(s, "kill-line")) return .kill_line;
     if (std.ascii.eqlIgnoreCase(s, "unix-line-discard") or std.ascii.eqlIgnoreCase(s, "line-discard")) return .unix_line_discard;
-    if (std.ascii.eqlIgnoreCase(s, "unix-word-rubout") or std.ascii.eqlIgnoreCase(s, "word-rubout")) return .backward_kill_word;
+    if (std.ascii.eqlIgnoreCase(s, "unix-word-rubout") or std.ascii.eqlIgnoreCase(s, "word-rubout")) return .unix_word_rubout;
     if (std.ascii.eqlIgnoreCase(s, "yank")) return .yank;
     if (std.ascii.eqlIgnoreCase(s, "cancel")) return .cancel;
     if (std.ascii.eqlIgnoreCase(s, "print-query")) return .print_query;
@@ -6276,43 +6289,86 @@ fn appendPastedByte(allocator: Allocator, out: *std.ArrayList(u8), b: u8) !void 
     }
 }
 
+fn asciiWordAlnum(b: u8) bool {
+    return std.ascii.isAlphabetic(b) or std.ascii.isDigit(b);
+}
+
 fn wordBoundaryBackward(s: []const u8, pos: usize) usize {
-    var p = pos;
-    while (p > 0 and std.ascii.isWhitespace(s[p - 1])) p -= 1;
-    while (p > 0 and !std.ascii.isWhitespace(s[p - 1])) p -= 1;
-    return p;
+    const end = @min(pos, s.len);
+    if (end == 0) return 0;
+    if (!std.unicode.utf8ValidateSlice(s[0..end])) {
+        var last: usize = 0;
+        var i: usize = 1;
+        while (i < end) : (i += 1) {
+            if (!asciiWordAlnum(s[i - 1]) and asciiWordAlnum(s[i])) last = i;
+        }
+        return last;
+    }
+
+    var it = std.unicode.Utf8Iterator{ .bytes = s[0..end], .i = 0 };
+    var left = it.nextCodepoint() orelse return 0;
+    var last: usize = 0;
+    while (it.i < end) {
+        const boundary = it.i;
+        const right = it.nextCodepoint() orelse break;
+        if (!subwordAlnum(left) and subwordAlnum(right)) last = boundary;
+        left = right;
+    }
+    return last;
 }
 
 fn wordBoundaryForward(s: []const u8, pos: usize) usize {
-    var p = pos;
-    while (p < s.len and std.ascii.isWhitespace(s[p])) p += 1;
-    while (p < s.len and !std.ascii.isWhitespace(s[p])) p += 1;
-    return p;
+    const start = @min(pos, s.len);
+    if (start >= s.len) return s.len;
+    if (!std.unicode.utf8ValidateSlice(s[start..])) {
+        var i = start + 1;
+        while (i < s.len) : (i += 1) {
+            if (asciiWordAlnum(s[i - 1]) and !asciiWordAlnum(s[i])) return i;
+        }
+        return s.len;
+    }
+
+    var it = std.unicode.Utf8Iterator{ .bytes = s[start..], .i = 0 };
+    var left = it.nextCodepoint() orelse return s.len;
+    while (it.i < s.len - start) {
+        const boundary = start + it.i;
+        const right = it.nextCodepoint() orelse break;
+        if (subwordAlnum(left) and !subwordAlnum(right)) return boundary;
+        left = right;
+    }
+    return s.len;
+}
+
+fn fzfUnixWhitespace(b: u8) bool {
+    return b == ' ' or b == '\t' or b == '\n' or b == '\r' or b == 0x0c;
+}
+
+fn unixWordBoundaryBackward(s: []const u8, pos: usize) usize {
+    const end = @min(pos, s.len);
+    var last: usize = 0;
+    var i: usize = 1;
+    while (i < end) : (i += 1) {
+        if (fzfUnixWhitespace(s[i - 1]) and !fzfUnixWhitespace(s[i])) last = i;
+    }
+    return last;
 }
 
 fn filepathWordBoundaryBackward(s: []const u8, pos: usize) usize {
     const end = @min(pos, s.len);
-    if (end == 0) return 0;
-    var slash = end;
-    while (slash > 0) {
-        slash -= 1;
-        if (s[slash] != '/') continue;
-        // fzf's /[^/] expression only treats this slash as a boundary when
-        // there is a following path-segment byte before the current cursor.
-        if (slash + 1 < end) return slash + 1;
+    var last: usize = 0;
+    var i: usize = 1;
+    while (i < end) : (i += 1) {
+        if (s[i - 1] == '/' and s[i] != '/') last = i;
     }
-    return 0;
+    return last;
 }
 
 fn filepathWordBoundaryForward(s: []const u8, pos: usize) usize {
     const start = @min(pos, s.len);
     if (start >= s.len) return s.len;
-    var slash = start;
-    while (slash < s.len) : (slash += 1) {
-        if (s[slash] != '/') continue;
-        // fzf's [^/]/ match starts on the byte immediately before the slash;
-        // a slash at the current cursor therefore belongs to the next segment.
-        if (slash > start) return slash;
+    var i = start + 1;
+    while (i < s.len) : (i += 1) {
+        if (s[i - 1] != '/' and s[i] == '/') return i;
     }
     return s.len;
 }
@@ -7790,8 +7846,8 @@ test "stateful binding actions parse" {
     try std.testing.expect((try parseAction("kill-line")) == .kill_line);
     try std.testing.expect((try parseAction("unix-line-discard")) == .unix_line_discard);
     try std.testing.expect((try parseAction("line-discard")) == .unix_line_discard);
-    try std.testing.expect((try parseAction("unix-word-rubout")) == .backward_kill_word);
-    try std.testing.expect((try parseAction("word-rubout")) == .backward_kill_word);
+    try std.testing.expect((try parseAction("unix-word-rubout")) == .unix_word_rubout);
+    try std.testing.expect((try parseAction("word-rubout")) == .unix_word_rubout);
     try std.testing.expect((try parseAction("backward-subword")) == .backward_subword);
     try std.testing.expect((try parseAction("forward-subword")) == .forward_subword);
     try std.testing.expect((try parseAction("backward-kill-subword")) == .backward_kill_subword);
@@ -8077,9 +8133,22 @@ test "CSI decoder consumes modified keys and bracketed paste markers" {
     try std.testing.expect(decodeCsi("?2004;1$", 'y') == .unknown);
 }
 
-test "word boundaries follow whitespace-separated editing" {
+test "word boundaries match fzf letter number and unix semantics" {
+    try std.testing.expectEqual(@as(usize, 4), wordBoundaryBackward("foo-bar", "foo-bar".len));
+    try std.testing.expectEqual(@as(usize, 3), wordBoundaryForward("foo-bar", 0));
     try std.testing.expectEqual(@as(usize, 4), wordBoundaryBackward("foo bar baz", 7));
     try std.testing.expectEqual(@as(usize, 7), wordBoundaryForward("foo bar baz", 4));
+    try std.testing.expectEqual(@as(usize, "αβ-".len), wordBoundaryBackward("αβ-γδ", "αβ-γδ".len));
+    try std.testing.expectEqual(@as(usize, "αβ".len), wordBoundaryForward("αβ-γδ", 0));
+    try std.testing.expectEqual(@as(usize, 1), wordBoundaryBackward("_foo", "_foo".len));
+
+    try std.testing.expectEqual(@as(usize, 0), unixWordBoundaryBackward("foo-bar", "foo-bar".len));
+    try std.testing.expectEqual(@as(usize, 8), unixWordBoundaryBackward("foo-bar baz", "foo-bar baz".len));
+
+    try std.testing.expectEqual(@as(usize, 5), filepathWordBoundaryBackward("foo//bar", "foo//bar".len));
+    try std.testing.expectEqual(@as(usize, 0), filepathWordBoundaryBackward("foo//", "foo//".len));
+    try std.testing.expectEqual(@as(usize, 3), filepathWordBoundaryForward("foo//bar", 0));
+    try std.testing.expectEqual(@as(usize, "foo//bar".len), filepathWordBoundaryForward("foo//bar", 3));
 }
 
 test "every event interval parsing" {
