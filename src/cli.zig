@@ -258,6 +258,7 @@ const Options = struct {
     ansi: bool = false,
     cycle: bool = false,
     filepath_word: bool = false,
+    scroll_off: usize = 3,
     wrap: bool = false,
     raw: bool = false,
     select_1: bool = false,
@@ -1362,10 +1363,23 @@ const Ui = struct {
     }
 
     fn ensureVisible(self: *Ui) void {
-        const list_rows = self.visibleListRows();
-        if (list_rows == 0) return;
-        if (self.focus < self.scroll) self.scroll = self.focus;
-        if (self.focus >= self.scroll + list_rows) self.scroll = self.focus + 1 - list_rows;
+        const rows = self.visibleListRows();
+        if (rows == 0 or self.result_len == 0) return;
+        const visible = @min(rows, self.result_len);
+        const max_scroll = self.result_len - visible;
+        const scroll_off = @min(visible / 2, self.options.scroll_off);
+
+        // fzf first constrains the viewport so the current item is visible, then
+        // reserves up to --scroll-off rows on each side unless a list boundary
+        // makes that impossible. In the single-line list model this reduces to
+        // a closed interval for the logical scroll offset.
+        const min_visible_scroll = self.focus -| (visible - 1);
+        const max_visible_scroll = @min(max_scroll, self.focus);
+        const min_margin_scroll = self.focus -| (visible - 1 - scroll_off);
+        const max_margin_scroll = self.focus -| scroll_off;
+        const lower = @min(max_visible_scroll, @max(min_visible_scroll, min_margin_scroll));
+        const upper = @max(min_visible_scroll, @min(max_visible_scroll, max_margin_scroll));
+        self.scroll = std.math.clamp(self.scroll, lower, upper);
     }
 
     fn listRows(self: *Ui, rows: usize) usize {
@@ -2718,25 +2732,31 @@ const Ui = struct {
     fn shiftViewport(self: *Ui, delta: isize, rows: usize) void {
         if (delta == 0 or self.result_len == 0) return;
         const old_focus = self.focus;
-        var max_scroll = self.result_len -| @min(rows, self.result_len);
+        var visible = @min(rows, self.result_len);
+        var max_scroll = self.result_len - visible;
 
         if (delta > 0) {
             const amount: usize = @intCast(delta);
             if (self.scroll +| amount > max_scroll and self.result_len == self.result_cap and self.result_cap < self.candidates.display.len) {
                 self.growResults() catch {};
-                max_scroll = self.result_len -| @min(rows, self.result_len);
+                visible = @min(rows, self.result_len);
+                max_scroll = self.result_len - visible;
             }
             const target_scroll = @min(max_scroll, self.scroll +| amount);
             if (target_scroll == self.scroll) return;
             self.scroll = target_scroll;
-            if (self.focus < self.scroll) self.focus = self.scroll;
+            const scroll_off = @min(visible / 2, self.options.scroll_off);
+            if (self.focus < self.scroll + scroll_off) {
+                self.focus = @min(self.result_len - 1, self.focus +| amount);
+            }
         } else {
             const amount: usize = @intCast(-delta);
             const target_scroll = self.scroll -| amount;
             if (target_scroll == self.scroll) return;
             self.scroll = target_scroll;
-            const last_visible = @min(self.result_len - 1, self.scroll + rows - 1);
-            if (self.focus > last_visible) self.focus = last_visible;
+            const scroll_off = @min(visible / 2, self.options.scroll_off);
+            const high_margin = self.scroll + visible - 1 - scroll_off;
+            if (self.focus > high_margin) self.focus -|= amount;
         }
 
         if (self.focus != old_focus) {
@@ -4012,6 +4032,16 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
         }
         if (std.mem.eql(u8, a, "--filepath-word")) {
             o.*.filepath_word = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--scroll-off=")) {
+            o.*.scroll_off = try std.fmt.parseInt(usize, a[13..], 10);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--scroll-off")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.scroll_off = try std.fmt.parseInt(usize, args[i], 10);
             continue;
         }
         if (std.mem.eql(u8, a, "--wrap")) {
@@ -6647,6 +6677,7 @@ const usage =
     \\      --height=N%          constrain rendered height
     \\      --cycle              cycle list navigation
     \\      --filepath-word      word actions respect path separators
+    \\      --scroll-off=N       keep N rows around the current item (source default: 3)
     \\      --wrap               wrap long item display
     \\      --prompt=STR         prompt string
     \\      --pointer=STR        current-item pointer
@@ -6670,6 +6701,33 @@ const usage =
     \\  Ctrl-P/N history when --history is active, Tab toggle,
     \\  Ctrl-A/E line edges, Ctrl-U clear, Ctrl-W erase word.
 ;
+
+test "scroll-off viewport constraint matches single-line fzf semantics" {
+    // 20 visible rows, default scroll-off 3: keep the cursor three rows
+    // from either edge once list boundaries no longer make that impossible.
+    const rows: usize = 20;
+    const off: usize = 3;
+    const count: usize = 100;
+    const cases = [_]struct { focus: usize, prior: usize, expected: usize }{
+        .{ .focus = 0, .prior = 0, .expected = 0 },
+        .{ .focus = 3, .prior = 0, .expected = 0 },
+        .{ .focus = 16, .prior = 0, .expected = 0 },
+        .{ .focus = 17, .prior = 0, .expected = 1 },
+        .{ .focus = 50, .prior = 1, .expected = 34 },
+        .{ .focus = 98, .prior = 80, .expected = 80 },
+        .{ .focus = 99, .prior = 80, .expected = 80 },
+    };
+    for (cases) |case| {
+        const visible = @min(rows, count);
+        const max_scroll = count - visible;
+        const scroll_off = @min(visible / 2, off);
+        const base_min = case.focus -| (visible - 1);
+        const base_max = @min(max_scroll, case.focus);
+        const lower = @min(base_max, @max(base_min, case.focus -| (visible - 1 - scroll_off)));
+        const upper = @max(base_min, @min(base_max, case.focus -| scroll_off));
+        try std.testing.expectEqual(case.expected, std.math.clamp(case.prior, lower, upper));
+    }
+}
 
 test "filepath word boundaries match fzf path separators" {
     const q = "--/foo bar/foo-bar/baz";
@@ -7082,6 +7140,24 @@ test "multi modes match fzf zero and unlimited semantics" {
     defer options.deinit(a);
     try std.testing.expect(!options.multi);
     try std.testing.expect(options.multi_max == null);
+}
+
+test "scroll-off option uses fzf source default and accepts overrides" {
+    const a = std.testing.allocator;
+    const defaults = [_][]const u8{"zfuzz"};
+    var default_options = try parseOptions(a, &defaults);
+    defer default_options.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), default_options.scroll_off);
+
+    const equals_args = [_][]const u8{ "zfuzz", "--scroll-off=0" };
+    var equals_options = try parseOptions(a, &equals_args);
+    defer equals_options.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), equals_options.scroll_off);
+
+    const separate_args = [_][]const u8{ "zfuzz", "--scroll-off", "7" };
+    var separate_options = try parseOptions(a, &separate_args);
+    defer separate_options.deinit(a);
+    try std.testing.expectEqual(@as(usize, 7), separate_options.scroll_off);
 }
 
 test "stateful binding actions parse" {

@@ -89,7 +89,9 @@ Kill/yank editing follows the same query buffer: `kill-line`, `kill-word`,
 `unix-line-discard`, `cancel`, and `yank` preserve and restore the most recently
 removed text; Ctrl-U/Ctrl-W/Ctrl-Y use those same paths. `--filepath-word` makes the word actions use path-separator boundaries. `put(...)`, `replace-query`,
 `print-query`, `accept-non-empty`, and `accept-or-print-query` are also
-available with fzf-compatible query/output behavior. List bindings also include
+available with fzf-compatible query/output behavior. `--scroll-off=N` applies the
+fzf v0.74.3 source default of 3 rows and is shared by normal and offset navigation.
+List bindings also include
 `top`, `half-page-up`, `half-page-down`, `offset-up`, `offset-down`, `offset-middle`,
 `clear-screen`, `close`, and `bell`; `close`
 hides a visible preview before falling back to an interrupt exit. `bg-cancel` cancels all
