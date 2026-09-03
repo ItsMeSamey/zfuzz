@@ -328,6 +328,13 @@ fn parseMultiMode(value: []const u8) ?MultiMode {
     return .{ .enabled = max != 0, .max = if (max == 0) null else max };
 }
 
+fn parseCliMultiMode(value: []const u8) ?MultiMode {
+    if (value.len == 0) return .{ .enabled = true, .max = null };
+    const max = std.fmt.parseInt(isize, value, 10) catch return null;
+    if (max <= 0) return .{ .enabled = false, .max = null };
+    return .{ .enabled = true, .max = @intCast(max) };
+}
+
 const CandidateSet = struct {
     blob: []u8,
     header: [][]const u8,
@@ -4038,7 +4045,13 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             continue;
         }
         if (std.mem.eql(u8, a, "-m") or std.mem.eql(u8, a, "--multi")) {
-            o.*.multi = true;
+            var mode: MultiMode = .{ .enabled = true, .max = null };
+            if (i + 1 < args.len and args[i + 1].len > 0 and std.ascii.isDigit(args[i + 1][0])) {
+                i += 1;
+                mode = parseCliMultiMode(args[i]) orelse return error.InvalidMultiLimit;
+            }
+            o.*.multi = mode.enabled;
+            o.*.multi_max = mode.max;
             continue;
         }
         if (std.mem.eql(u8, a, "+m") or std.mem.eql(u8, a, "--no-multi")) {
@@ -4047,7 +4060,13 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             continue;
         }
         if (std.mem.startsWith(u8, a, "--multi=")) {
-            const mode = parseMultiMode(a[8..]) orelse return error.InvalidMultiLimit;
+            const mode = parseCliMultiMode(a[8..]) orelse return error.InvalidMultiLimit;
+            o.*.multi = mode.enabled;
+            o.*.multi_max = mode.max;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "-m") and a.len > 2) {
+            const mode = parseCliMultiMode(a[2..]) orelse return error.InvalidMultiLimit;
             o.*.multi = mode.enabled;
             o.*.multi_max = mode.max;
             continue;
@@ -7354,6 +7373,42 @@ test "multi modes match fzf zero and unlimited semantics" {
     defer options.deinit(a);
     try std.testing.expect(!options.multi);
     try std.testing.expect(options.multi_max == null);
+
+    const separate_args = [_][]const u8{ "zfuzz", "--multi", "2" };
+    var separate = try parseOptions(a, &separate_args);
+    defer separate.deinit(a);
+    try std.testing.expect(separate.multi);
+    try std.testing.expectEqual(@as(?usize, 2), separate.multi_max);
+
+    const short_separate_args = [_][]const u8{ "zfuzz", "-m", "3" };
+    var short_separate = try parseOptions(a, &short_separate_args);
+    defer short_separate.deinit(a);
+    try std.testing.expect(short_separate.multi);
+    try std.testing.expectEqual(@as(?usize, 3), short_separate.multi_max);
+
+    const compact_args = [_][]const u8{ "zfuzz", "-m4" };
+    var compact = try parseOptions(a, &compact_args);
+    defer compact.deinit(a);
+    try std.testing.expect(compact.multi);
+    try std.testing.expectEqual(@as(?usize, 4), compact.multi_max);
+
+    const separate_zero_args = [_][]const u8{ "zfuzz", "--multi", "0" };
+    var separate_zero = try parseOptions(a, &separate_zero_args);
+    defer separate_zero.deinit(a);
+    try std.testing.expect(!separate_zero.multi);
+    try std.testing.expect(separate_zero.multi_max == null);
+
+    const negative_equals_args = [_][]const u8{ "zfuzz", "--multi=-1" };
+    var negative_equals = try parseOptions(a, &negative_equals_args);
+    defer negative_equals.deinit(a);
+    try std.testing.expect(!negative_equals.multi);
+    try std.testing.expect(negative_equals.multi_max == null);
+
+    const negative_compact_args = [_][]const u8{ "zfuzz", "-m-1" };
+    var negative_compact = try parseOptions(a, &negative_compact_args);
+    defer negative_compact.deinit(a);
+    try std.testing.expect(!negative_compact.multi);
+    try std.testing.expect(negative_compact.multi_max == null);
 }
 
 test "no-input option starts the existing input visibility state hidden" {
