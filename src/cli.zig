@@ -3913,6 +3913,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.sync = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "--no-sync") or std.mem.eql(u8, a, "--async")) {
+            o.*.sync = false;
+            continue;
+        }
         if (std.mem.eql(u8, a, "--listen")) {
             if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
                 i += 1;
@@ -3974,6 +3978,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.history_file = args[i];
             continue;
         }
+        if (std.mem.eql(u8, a, "--no-history")) {
+            o.*.history_file = null;
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--history-size=")) {
             const value = try std.fmt.parseInt(usize, a[15..], 10);
             if (value == 0) return error.InvalidHistorySize;
@@ -4006,6 +4014,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.id_nth = args[i];
             continue;
         }
+        if (std.mem.eql(u8, a, "--no-id-nth")) {
+            o.*.id_nth = null;
+            continue;
+        }
         if (std.mem.eql(u8, a, "-m") or std.mem.eql(u8, a, "--multi")) {
             o.*.multi = true;
             continue;
@@ -4025,8 +4037,16 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.read0 = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "--no-read0")) {
+            o.*.read0 = false;
+            continue;
+        }
         if (std.mem.eql(u8, a, "--print0")) {
             o.*.print0 = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-print0")) {
+            o.*.print0 = false;
             continue;
         }
         if (std.mem.eql(u8, a, "--ansi")) {
@@ -4083,12 +4103,24 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.select_1 = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "+1") or std.mem.eql(u8, a, "--no-select-1")) {
+            o.*.select_1 = false;
+            continue;
+        }
         if (std.mem.eql(u8, a, "--exit-0") or std.mem.eql(u8, a, "-0")) {
             o.*.exit_0 = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "+0") or std.mem.eql(u8, a, "--no-exit-0")) {
+            o.*.exit_0 = false;
+            continue;
+        }
         if (std.mem.eql(u8, a, "--print-query")) {
             o.*.print_query = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-print-query")) {
+            o.*.print_query = false;
             continue;
         }
         if (std.mem.eql(u8, a, "--no-sort") or std.mem.eql(u8, a, "+s")) {
@@ -4113,6 +4145,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
         }
         if (std.mem.eql(u8, a, "-e") or std.mem.eql(u8, a, "--exact")) {
             o.*.exact = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "+e") or std.mem.eql(u8, a, "--no-exact")) {
+            o.*.exact = false;
             continue;
         }
         if (std.mem.eql(u8, a, "-i") or std.mem.eql(u8, a, "--ignore-case")) {
@@ -4175,6 +4211,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
         }
         if (std.mem.eql(u8, a, "--tac")) {
             o.*.tac = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-tac")) {
+            o.*.tac = false;
             continue;
         }
         if (std.mem.eql(u8, a, "--no-color")) {
@@ -6667,7 +6707,8 @@ const usage =
     \\Interactive fuzzy finder backed by zig_fuzzy's exact fzf-V2 ranking core.
     \\
     \\Search
-    \\  -e, --exact              exact-match mode; quote prefix flips to fuzzy
+    \\  -e, --exact / +e, --no-exact
+    \\                           enable / disable exact-match mode
     \\  -i, --ignore-case        force case-insensitive matching
     \\  +i, --no-ignore-case     force case-sensitive matching
     \\      --smart-case         smart-case matching (default)
@@ -6675,16 +6716,20 @@ const usage =
     \\  +x, --no-extended        disable extended query grammar
     \\  -q, --query=STR          start with query
     \\  -f, --filter=STR         non-interactive filter mode
-    \\  -1, --select-1           accept when there is exactly one match
-    \\  -0, --exit-0             exit immediately when there is no match
+    \\  -1, --select-1 / +1, --no-select-1
+    \\                           enable / disable single-match auto-accept
+    \\  -0, --exit-0 / +0, --no-exit-0
+    \\                           enable / disable no-match auto-exit
     \\      --no-sort            preserve input order after filtering
     \\      --raw                show non-matching items dimmed alongside matches
     \\      --tiebreak=CRI       score tie-breaks: length/chunk/pathname/begin/end/index
     \\      --scheme=SCHEME      ranking scheme: default/path/history
     \\      --tail=N             keep only the last N input items in memory
     \\      --track              keep current item focused across result updates
-    \\      --id-nth=EXPR        identity fields for tracking/reload selection
-    \\      --history=FILE       load and persist query history
+    \\      --id-nth=EXPR / --no-id-nth
+    \\                           set / clear identity fields for tracking/reload
+    \\      --history=FILE / --no-history
+    \\                           enable / disable persisted query history
     \\      --history-size=N     cap persisted history entries (default 1000)
     \\  -d, --delimiter=STR      literal field delimiter
     \\  -n, --nth=EXPR           limit searchable fields
@@ -6697,14 +6742,18 @@ const usage =
     \\Selection and I/O
     \\  -m, --multi[=MAX]        multi-select; Tab / Shift-Tab toggle
     \\  +m, --no-multi          disable multi-select
-    \\      --read0              NUL-delimited input
-    \\      --print0             NUL-delimited output
-    \\      --print-query        print query before selection
+    \\      --read0 / --no-read0 NUL / newline-delimited input
+    \\      --print0 / --no-print0
+    \\                           NUL / newline-delimited output
+    \\      --print-query / --no-print-query
+    \\                           enable / disable query output before selection
     \\      --expect=KEYS        print accepted key field
     \\      --bind=SPEC          key/event actions: reload/execute/become/toggle...
     \\                           includes dynamic multi/field, raw/match, and exclusion actions
     \\      --ansi / --no-ansi   enable / disable ANSI processing
-    \\      --tac                reverse input order
+    \\      --sync / --no-sync, --async
+    \\                           enable / disable synchronous input search
+    \\      --tac / --no-tac     enable / disable reversed input order
     \\
     \\UI
     \\      --reverse / --no-reverse
@@ -7202,6 +7251,40 @@ test "scroll-off option uses fzf source default and accepts overrides" {
     var separate_options = try parseOptions(a, &separate_args);
     defer separate_options.deinit(a);
     try std.testing.expectEqual(@as(usize, 7), separate_options.scroll_off);
+}
+
+test "search and io reset aliases are last-one-wins" {
+    const a = std.testing.allocator;
+
+    const exact_args = [_][]const u8{ "zfuzz", "--exact", "--no-exact", "-e", "+e" };
+    var exact = try parseOptions(a, &exact_args);
+    defer exact.deinit(a);
+    try std.testing.expect(!exact.exact);
+
+    const io_args = [_][]const u8{ "zfuzz", "--read0", "--no-read0", "--print0", "--no-print0", "--print-query", "--no-print-query" };
+    var io = try parseOptions(a, &io_args);
+    defer io.deinit(a);
+    try std.testing.expect(!io.read0);
+    try std.testing.expect(!io.print0);
+    try std.testing.expect(!io.print_query);
+
+    const auto_args = [_][]const u8{ "zfuzz", "-1", "+1", "-0", "+0" };
+    var auto = try parseOptions(a, &auto_args);
+    defer auto.deinit(a);
+    try std.testing.expect(!auto.select_1);
+    try std.testing.expect(!auto.exit_0);
+
+    const sync_args = [_][]const u8{ "zfuzz", "--sync", "--async", "--sync", "--no-sync" };
+    var sync = try parseOptions(a, &sync_args);
+    defer sync.deinit(a);
+    try std.testing.expect(!sync.sync);
+
+    const state_args = [_][]const u8{ "zfuzz", "--history=x", "--no-history", "--id-nth=1", "--no-id-nth", "--tac", "--no-tac" };
+    var state = try parseOptions(a, &state_args);
+    defer state.deinit(a);
+    try std.testing.expect(state.history_file == null);
+    try std.testing.expect(state.id_nth == null);
+    try std.testing.expect(!state.tac);
 }
 
 test "inverse option aliases reset existing state with last-one-wins semantics" {
