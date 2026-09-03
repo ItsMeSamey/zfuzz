@@ -146,6 +146,7 @@ const Action = union(enum) {
 
 const Binding = struct {
     trigger: []const u8,
+    name: []const u8,
     action: Action,
 };
 
@@ -661,6 +662,8 @@ const Ui = struct {
     print_queue: std.ArrayList([]u8) = .empty,
     input_hidden: bool = false,
     header_hidden: bool = false,
+    last_action: []const u8 = "",
+    last_key: []const u8 = "",
 
     fn init(
         allocator: Allocator,
@@ -940,13 +943,19 @@ const Ui = struct {
     }
 
     fn handleKey(self: *Ui, key: Key) !?u8 {
+        var binding_handled = false;
         for (self.options.bindings.items) |binding| {
             if (std.mem.eql(u8, binding.trigger, "start") or std.mem.eql(u8, binding.trigger, "load") or
                 std.mem.eql(u8, binding.trigger, "change") or std.mem.eql(u8, binding.trigger, "result") or
                 std.mem.eql(u8, binding.trigger, "result-final") or std.mem.eql(u8, binding.trigger, "zero") or
                 std.mem.eql(u8, binding.trigger, "one") or std.mem.eql(u8, binding.trigger, "focus")) continue;
-            if (keyMatchesName(key, binding.trigger)) return try self.runAction(binding.action);
+            if (!keyMatchesName(key, binding.trigger)) continue;
+            binding_handled = true;
+            self.last_action = binding.name;
+            self.last_key = binding.trigger;
+            if (try self.runAction(binding.action)) |code| return code;
         }
+        if (binding_handled) return null;
         for (self.options.expect.items) |expected| {
             if (keyMatchesName(key, expected)) {
                 self.accepted_key = expected;
@@ -1097,6 +1106,8 @@ const Ui = struct {
                     defer actions.deinit(self.allocator);
                     appendBindingActions(self.allocator, &actions, "http", body) catch continue;
                     for (actions.items) |binding| {
+                        self.last_action = binding.name;
+                        self.last_key = "";
                         if (try self.runAction(binding.action)) |code| return code;
                     }
                 },
@@ -1171,6 +1182,8 @@ const Ui = struct {
     fn fireEvent(self: *Ui, event: []const u8) !?u8 {
         for (self.options.bindings.items) |binding| {
             if (!std.mem.eql(u8, binding.trigger, event)) continue;
+            self.last_action = binding.name;
+            self.last_key = "";
             if (try self.runAction(binding.action)) |code| return code;
         }
         return null;
@@ -1358,12 +1371,38 @@ const Ui = struct {
         return null;
     }
 
+    fn commandEnvironment(self: *Ui) !std.process.Environ.Map {
+        var env = try self.child_env.clone(self.allocator);
+        errdefer env.deinit();
+        try env.put("FZF_QUERY", self.query.items);
+        try env.put("FZF_ACTION", self.last_action);
+        try env.put("FZF_KEY", self.last_key);
+        try env.put("FZF_INPUT_STATE", if (self.input_hidden) "hidden" else "enabled");
+        try env.put("FZF_DIRECTION", if (self.options.layout == .reverse) "down" else "up");
+        try env.put("FZF_PROMPT", self.options.prompt);
+        var total_buf: [32]u8 = undefined;
+        var match_buf: [32]u8 = undefined;
+        var select_buf: [32]u8 = undefined;
+        var pos_buf: [32]u8 = undefined;
+        try env.put("FZF_TOTAL_COUNT", try std.fmt.bufPrint(&total_buf, "{d}", .{self.candidates.display.len}));
+        try env.put("FZF_MATCH_COUNT", try std.fmt.bufPrint(&match_buf, "{d}", .{self.result_len}));
+        try env.put("FZF_SELECT_COUNT", try std.fmt.bufPrint(&select_buf, "{d}", .{self.selected_count}));
+        try env.put("FZF_POS", try std.fmt.bufPrint(&pos_buf, "{d}", .{if (self.result_len == 0) @as(usize, 0) else self.focus + 1}));
+        const item = self.currentItem();
+        if (item.len <= 64 * 1024 and std.mem.indexOfScalar(u8, item, 0) == null) try env.put("FZF_CURRENT_ITEM", item);
+        if (self.options.border_label) |value| try env.put("FZF_BORDER_LABEL", value);
+        if (self.options.preview.label) |value| try env.put("FZF_PREVIEW_LABEL", value);
+        return env;
+    }
+
     fn runTransformCommand(self: *Ui, command: []const u8) ![]u8 {
         const expanded = try self.expandedCommand(command);
         defer self.allocator.free(expanded);
+        var env = try self.commandEnvironment();
+        defer env.deinit();
         const result = try std.process.run(self.allocator, self.io, .{
             .argv = &.{ "/bin/sh", "-c", expanded },
-            .environ_map = self.child_env,
+            .environ_map = &env,
             .stdout_limit = .limited(1024 * 1024),
             .stderr_limit = .limited(1024 * 1024),
         });
@@ -1381,6 +1420,7 @@ const Ui = struct {
         defer actions.deinit(self.allocator);
         try appendBindingActions(self.allocator, &actions, "transform", text);
         for (actions.items) |binding| {
+            self.last_action = binding.name;
             if (try self.runAction(binding.action)) |code| return code;
         }
         return null;
@@ -1502,9 +1542,11 @@ const Ui = struct {
         self.stream = null;
         const expanded = try self.expandedCommand(command);
         defer self.allocator.free(expanded);
+        var env = try self.commandEnvironment();
+        defer env.deinit();
         const result = try std.process.run(self.allocator, self.io, .{
             .argv = &.{ "/bin/sh", "-c", expanded },
-            .environ_map = self.child_env,
+            .environ_map = &env,
             .stdout_limit = .limited(64 * 1024 * 1024),
             .stderr_limit = .limited(1024 * 1024),
         });
@@ -1519,10 +1561,12 @@ const Ui = struct {
     fn executeCommand(self: *Ui, command: []const u8, silent: bool) !void {
         const expanded = try self.expandedCommand(command);
         defer self.allocator.free(expanded);
+        var env = try self.commandEnvironment();
+        defer env.deinit();
         if (silent) {
             const result = try std.process.run(self.allocator, self.io, .{
                 .argv = &.{ "/bin/sh", "-c", expanded },
-                .environ_map = self.child_env,
+                .environ_map = &env,
                 .stdout_limit = .limited(1024 * 1024),
                 .stderr_limit = .limited(1024 * 1024),
             });
@@ -1534,7 +1578,7 @@ const Ui = struct {
         defer self.terminal.enter() catch {};
         var child = try std.process.spawn(self.io, .{
             .argv = &.{ "/bin/sh", "-c", expanded },
-            .environ_map = self.child_env,
+            .environ_map = &env,
             .stdin = .{ .file = self.terminal.file },
             .stdout = .{ .file = self.terminal.file },
             .stderr = .{ .file = self.terminal.file },
@@ -1546,10 +1590,12 @@ const Ui = struct {
     fn becomeCommand(self: *Ui, command: []const u8) !u8 {
         const expanded = try self.expandedCommand(command);
         defer self.allocator.free(expanded);
+        var env = try self.commandEnvironment();
+        defer env.deinit();
         self.terminal.leave();
         var child = try std.process.spawn(self.io, .{
             .argv = &.{ "/bin/sh", "-c", expanded },
-            .environ_map = self.child_env,
+            .environ_map = &env,
             .stdin = .{ .file = self.terminal.file },
             .stdout = .{ .file = self.terminal.file },
             .stderr = .{ .file = self.terminal.file },
@@ -3130,8 +3176,15 @@ fn appendBindingActions(allocator: Allocator, out: *std.ArrayList(Binding), trig
         const action_text = std.mem.trim(u8, text[start..i], " \t");
         start = i + 1;
         if (action_text.len == 0) continue;
-        try out.append(allocator, .{ .trigger = trigger, .action = try parseAction(action_text) });
+        try out.append(allocator, .{ .trigger = trigger, .name = actionName(action_text), .action = try parseAction(action_text) });
     }
+}
+
+fn actionName(text: []const u8) []const u8 {
+    const paren = std.mem.indexOfScalar(u8, text, '(');
+    const colon = std.mem.indexOfScalar(u8, text, ':');
+    const end = if (paren) |p| if (colon) |c| @min(p, c) else p else if (colon) |c| c else text.len;
+    return std.mem.trim(u8, text[0..end], " \t");
 }
 
 fn validateActionSequence(text: []const u8) bool {
@@ -4694,6 +4747,7 @@ test "binding parser" {
     try parseBindings(a, &bindings, "ctrl-r:reload(printf 'a,b')+change-header(ready),enter:accept");
     try std.testing.expectEqual(@as(usize, 3), bindings.items.len);
     try std.testing.expectEqualStrings("ctrl-r", bindings.items[0].trigger);
+    try std.testing.expectEqualStrings("reload", bindings.items[0].name);
     try std.testing.expectEqualStrings("printf 'a,b'", bindings.items[0].action.reload);
     try std.testing.expectEqualStrings("ready", bindings.items[1].action.change_header);
     try std.testing.expect(bindings.items[2].action == .accept);
