@@ -13,6 +13,19 @@ const PreviewPosition = enum { right, left, up, down };
 const TieBreak = enum { length, chunk, pathname, begin, end };
 const StylePreset = enum { default, minimal, full };
 const BorderStyle = enum { none, rounded, sharp, bold, double, dashed, horizontal, vertical, top, bottom, left, right };
+const InfoStyle = enum { default, right, hidden, inline_left, inline_right };
+
+const SizeSpec = struct {
+    value: u16 = 0,
+    percent: bool = false,
+};
+
+const Insets = struct {
+    top: SizeSpec = .{},
+    right: SizeSpec = .{},
+    bottom: SizeSpec = .{},
+    left: SizeSpec = .{},
+};
 
 const Color = union(enum) {
     ansi: u8,
@@ -126,6 +139,12 @@ const Options = struct {
     border_style: BorderStyle = .rounded,
     bold: bool = true,
     theme: Theme = .{},
+    info_style: InfoStyle = .default,
+    info_prefix: []const u8 = " < ",
+    separator: ?[]const u8 = "─",
+    ghost: ?[]const u8 = null,
+    margin: Insets = .{},
+    padding: Insets = .{ .right = .{ .value = 1 }, .left = .{ .value = 1 } },
     height_percent: u8 = 100,
     preview: PreviewOptions = .{},
     delimiter: ?[]const u8 = null,
@@ -583,52 +602,53 @@ const Ui = struct {
     }
 
     fn paneGeometry(self: *Ui, size: anytype) PaneGeometry {
-        var main_pane = Pane{ .row = 1, .col = 1, .rows = size.rows, .cols = size.cols };
+        const full = Pane{ .row = 1, .col = 1, .rows = size.rows, .cols = size.cols };
+        const area = insetPane(full, self.options.margin);
+        var main_pane = area;
         const preview_active = self.options.preview.command != null and !self.options.preview.hidden;
         if (!preview_active) return .{ .main = main_pane, .preview = null };
 
         switch (self.options.preview.position) {
             .left, .right => {
-                if (size.cols < 40) return .{ .main = main_pane, .preview = null };
-                var width = size.cols * self.options.preview.percent / 100;
-                width = std.math.clamp(width, 12, size.cols - 20);
+                if (area.cols < 40) return .{ .main = main_pane, .preview = null };
+                var width = area.cols * self.options.preview.percent / 100;
+                width = std.math.clamp(width, 12, area.cols - 20);
                 if (self.options.preview.position == .left) {
-                    main_pane.col = width + 2;
-                    main_pane.cols = size.cols - width - 1;
-                    return .{ .main = main_pane, .preview = .{ .row = 1, .col = 1, .rows = size.rows, .cols = width } };
+                    main_pane.col = area.col + width + 1;
+                    main_pane.cols = area.cols - width - 1;
+                    return .{ .main = main_pane, .preview = .{ .row = area.row, .col = area.col, .rows = area.rows, .cols = width } };
                 }
-                main_pane.cols = size.cols - width - 1;
-                return .{ .main = main_pane, .preview = .{ .row = 1, .col = main_pane.cols + 2, .rows = size.rows, .cols = width } };
+                main_pane.cols = area.cols - width - 1;
+                return .{ .main = main_pane, .preview = .{ .row = area.row, .col = main_pane.col + main_pane.cols + 1, .rows = area.rows, .cols = width } };
             },
             .up, .down => {
-                if (size.rows < 8) return .{ .main = main_pane, .preview = null };
-                var height = size.rows * self.options.preview.percent / 100;
-                height = std.math.clamp(height, 3, size.rows - 4);
+                if (area.rows < 8) return .{ .main = main_pane, .preview = null };
+                var height = area.rows * self.options.preview.percent / 100;
+                height = std.math.clamp(height, 3, area.rows - 4);
                 if (self.options.preview.position == .up) {
-                    main_pane.row = height + 2;
-                    main_pane.rows = size.rows - height - 1;
-                    return .{ .main = main_pane, .preview = .{ .row = 1, .col = 1, .rows = height, .cols = size.cols } };
+                    main_pane.row = area.row + height + 1;
+                    main_pane.rows = area.rows - height - 1;
+                    return .{ .main = main_pane, .preview = .{ .row = area.row, .col = area.col, .rows = height, .cols = area.cols } };
                 }
-                main_pane.rows = size.rows - height - 1;
-                return .{ .main = main_pane, .preview = .{ .row = main_pane.rows + 2, .col = 1, .rows = height, .cols = size.cols } };
+                main_pane.rows = area.rows - height - 1;
+                return .{ .main = main_pane, .preview = .{ .row = main_pane.row + main_pane.rows + 1, .col = area.col, .rows = height, .cols = area.cols } };
             },
         }
     }
 
     fn contentPane(self: *Ui, pane: Pane) Pane {
-        if (!self.options.border or self.options.border_style == .none) return pane;
-        const sides = borderSides(self.options.border_style);
-        const top: usize = @intFromBool(sides.top);
-        const bottom: usize = @intFromBool(sides.bottom);
-        const left: usize = if (sides.left) 2 else 0;
-        const right: usize = if (sides.right) 2 else 0;
-        if (pane.rows <= top + bottom or pane.cols <= left + right) return pane;
-        return .{
-            .row = pane.row + top,
-            .col = pane.col + left,
-            .rows = pane.rows - top - bottom,
-            .cols = pane.cols - left - right,
-        };
+        var content = pane;
+        if (self.options.border and self.options.border_style != .none) {
+            const sides = borderSides(self.options.border_style);
+            const border_insets = Insets{
+                .top = .{ .value = @intFromBool(sides.top) },
+                .right = .{ .value = @intFromBool(sides.right) },
+                .bottom = .{ .value = @intFromBool(sides.bottom) },
+                .left = .{ .value = @intFromBool(sides.left) },
+            };
+            content = insetPane(content, border_insets);
+        }
+        return insetPane(content, self.options.padding);
     }
 
     fn visibleListRows(self: *Ui) usize {
@@ -645,6 +665,7 @@ const Ui = struct {
 
     fn listRows(self: *Ui, rows: usize) usize {
         var fixed: usize = 1;
+        if (self.options.info_style == .default or self.options.info_style == .right) fixed += 1;
         if (self.options.header != null) fixed += 1;
         if (self.options.footer != null) fixed += 1;
         const effective = @max(@as(usize, 3), rows);
@@ -1126,6 +1147,10 @@ const Ui = struct {
         if (self.options.layout == .reverse) {
             try self.renderPrompt(w, row, content.col, content.cols);
             row += 1;
+            if (self.options.info_style == .default or self.options.info_style == .right) {
+                try self.renderInfo(w, row, content.col, content.cols);
+                row += 1;
+            }
             if (self.options.header) |h| {
                 try self.renderPlainLine(w, row, content.col, h, content.cols, self.options.theme.header);
                 row += 1;
@@ -1136,6 +1161,10 @@ const Ui = struct {
             row = try self.renderList(w, row, content, false);
             if (self.options.header) |h| {
                 try self.renderPlainLine(w, row, content.col, h, content.cols, self.options.theme.header);
+                row += 1;
+            }
+            if (self.options.info_style == .default or self.options.info_style == .right) {
+                try self.renderInfo(w, row, content.col, content.cols);
                 row += 1;
             }
             try self.renderPrompt(w, row, content.col, content.cols);
@@ -1149,6 +1178,38 @@ const Ui = struct {
         }
 
         try self.terminal.write(frame.written());
+    }
+
+    fn statusText(self: *Ui) ![]u8 {
+        if (self.result_len == self.result_cap and self.result_cap < self.candidates.display.len) {
+            if (self.options.multi) return try std.fmt.allocPrint(self.allocator, "{d}+/{d} ({d})", .{ self.result_len, self.candidates.display.len, self.selected_count });
+            return try std.fmt.allocPrint(self.allocator, "{d}+/{d}", .{ self.result_len, self.candidates.display.len });
+        }
+        if (self.options.multi) return try std.fmt.allocPrint(self.allocator, "{d}/{d} ({d})", .{ self.result_len, self.candidates.display.len, self.selected_count });
+        return try std.fmt.allocPrint(self.allocator, "{d}/{d}", .{ self.result_len, self.candidates.display.len });
+    }
+
+    fn renderInfo(self: *Ui, w: anytype, row: usize, col: usize, cols: usize) !void {
+        if (self.options.info_style == .hidden or self.options.info_style == .inline_left or self.options.info_style == .inline_right) return;
+        const status = try self.statusText();
+        defer self.allocator.free(status);
+        try writeRoleStyle(w, self.options.theme.info, self.options.theme.enabled, self.options.bold);
+        if (self.options.info_style == .right) {
+            const offset = if (cols > status.len) cols - status.len else 0;
+            try cursorTo(w, row, col + offset, self.terminal.inline_mode);
+            try writeTruncated(w, status, cols, false, "");
+        } else {
+            try cursorTo(w, row, col, self.terminal.inline_mode);
+            try writeTruncated(w, status, cols, false, "");
+            if (self.options.separator) |sep| {
+                if (sep.len != 0 and cols > status.len + 1) {
+                    try w.writeAll(" ");
+                    var used = status.len + 1;
+                    while (used < cols) : (used += 1) try w.writeAll(sep);
+                }
+            }
+        }
+        try writeReset(w);
     }
 
     fn renderPrompt(self: *Ui, w: anytype, row: usize, col: usize, cols: usize) !void {
@@ -1167,19 +1228,27 @@ const Ui = struct {
             try w.writeAll(self.query.items[next..]);
         } else {
             try w.writeAll("\x1b[7m \x1b[27m");
+            if (self.query.items.len == 0) {
+                if (self.options.ghost) |ghost| {
+                    try writeRoleStyle(w, self.options.theme.info, self.options.theme.enabled, self.options.bold);
+                    const available = if (cols > self.options.prompt.len + 1) cols - self.options.prompt.len - 1 else 0;
+                    try writeTruncated(w, ghost, available, false, "");
+                }
+            }
         }
         try writeReset(w);
-        const shown = if (self.result_len == self.result_cap and self.result_cap < self.candidates.display.len)
-            try std.fmt.allocPrint(self.allocator, "  {d}+/{d}", .{ self.result_len, self.candidates.display.len })
-        else
-            try std.fmt.allocPrint(self.allocator, "  {d}/{d}", .{ self.result_len, self.candidates.display.len });
-        defer self.allocator.free(shown);
-        try writeRoleStyle(w, self.options.theme.info, self.options.theme.enabled, self.options.bold);
-        if (self.options.multi) {
-            try w.print("{s} ({d})", .{ shown, self.selected_count });
-        } else try w.writeAll(shown);
-        try writeReset(w);
-        _ = cols;
+        if (self.options.info_style == .inline_left or self.options.info_style == .inline_right) {
+            const status = try self.statusText();
+            defer self.allocator.free(status);
+            const total_len = self.options.info_prefix.len + status.len;
+            if (self.options.info_style == .inline_right and cols > total_len) {
+                try cursorTo(w, row, col + cols - total_len, self.terminal.inline_mode);
+            }
+            try writeRoleStyle(w, self.options.theme.info, self.options.theme.enabled, self.options.bold);
+            try w.writeAll(self.options.info_prefix);
+            try w.writeAll(status);
+            try writeReset(w);
+        }
     }
 
     fn renderPlainLine(self: *Ui, w: anytype, row: usize, col: usize, text: []const u8, cols: usize, style: RoleStyle) !void {
@@ -1503,6 +1572,75 @@ fn parseBorderStyle(text: []const u8) !BorderStyle {
     return error.InvalidBorderStyle;
 }
 
+fn parseSizeSpec(text: []const u8) !SizeSpec {
+    if (text.len == 0) return error.InvalidSize;
+    if (text[text.len - 1] == '%') {
+        const value = try std.fmt.parseInt(u16, text[0 .. text.len - 1], 10);
+        if (value > 100) return error.InvalidSize;
+        return .{ .value = value, .percent = true };
+    }
+    return .{ .value = try std.fmt.parseInt(u16, text, 10) };
+}
+
+fn parseInsets(text: []const u8) !Insets {
+    var values: [4]SizeSpec = undefined;
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, text, ',');
+    while (it.next()) |part| {
+        if (count == values.len) return error.InvalidInsets;
+        values[count] = try parseSizeSpec(std.mem.trim(u8, part, " \t"));
+        count += 1;
+    }
+    if (count == 0) return error.InvalidInsets;
+    return switch (count) {
+        1 => .{ .top = values[0], .right = values[0], .bottom = values[0], .left = values[0] },
+        2 => .{ .top = values[0], .right = values[1], .bottom = values[0], .left = values[1] },
+        3 => .{ .top = values[0], .right = values[1], .bottom = values[2], .left = values[1] },
+        4 => .{ .top = values[0], .right = values[1], .bottom = values[2], .left = values[3] },
+        else => unreachable,
+    };
+}
+
+fn parseInfoOption(options: *Options, text: []const u8) !void {
+    if (std.ascii.eqlIgnoreCase(text, "default")) {
+        options.info_style = .default;
+        options.info_prefix = " < ";
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(text, "right")) {
+        options.info_style = .right;
+        options.info_prefix = " < ";
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(text, "hidden")) {
+        options.info_style = .hidden;
+        return;
+    }
+    const colon = std.mem.indexOfScalar(u8, text, ':');
+    const mode = if (colon) |at| text[0..at] else text;
+    const prefix = if (colon) |at| text[at + 1 ..] else " < ";
+    if (std.ascii.eqlIgnoreCase(mode, "inline")) options.info_style = .inline_left else if (std.ascii.eqlIgnoreCase(mode, "inline-right")) options.info_style = .inline_right else return error.InvalidInfoStyle;
+    options.info_prefix = prefix;
+}
+
+fn resolveSize(spec: SizeSpec, total: usize) usize {
+    return if (spec.percent) total * spec.value / 100 else spec.value;
+}
+
+fn insetPane(pane: Pane, insets: Insets) Pane {
+    if (pane.rows == 0 or pane.cols == 0) return pane;
+    const top = @min(resolveSize(insets.top, pane.rows), pane.rows - 1);
+    const bottom = @min(resolveSize(insets.bottom, pane.rows), pane.rows - top - 1);
+    const left = @min(resolveSize(insets.left, pane.cols), pane.cols - 1);
+    const right = @min(resolveSize(insets.right, pane.cols), pane.cols - left - 1);
+    return .{
+        .row = pane.row + top,
+        .col = pane.col + left,
+        .rows = pane.rows - top - bottom,
+        .cols = pane.cols - left - right,
+    };
+}
+
 fn applyStylePreset(options: *Options, text: []const u8) !void {
     var parts = std.mem.splitScalar(u8, text, ':');
     const preset = parts.next() orelse return error.InvalidStylePreset;
@@ -1800,6 +1938,64 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             i += 1;
             if (i >= args.len) return error.MissingArgument;
             try applyStylePreset(o, args[i]);
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--info=")) {
+            try parseInfoOption(o, a[7..]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--info")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            try parseInfoOption(o, args[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-info")) {
+            o.*.info_style = .hidden;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--separator=")) {
+            o.*.separator = a[12..];
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--separator")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.separator = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-separator")) {
+            o.*.separator = null;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--ghost=")) {
+            o.*.ghost = a[8..];
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--ghost")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.ghost = args[i];
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--margin=")) {
+            o.*.margin = try parseInsets(a[9..]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--margin")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.margin = try parseInsets(args[i]);
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--padding=")) {
+            o.*.padding = try parseInsets(a[10..]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--padding")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.padding = try parseInsets(args[i]);
             continue;
         }
         if (std.mem.eql(u8, a, "--no-mouse")) {
@@ -3478,4 +3674,47 @@ test "minimal style and no color disable decoration" {
     try std.testing.expect(!options.border);
     try std.testing.expectEqual(BorderStyle.none, options.border_style);
     try std.testing.expect(!options.theme.enabled);
+}
+
+test "info margin and padding option forms" {
+    const a = std.testing.allocator;
+    const args = [_][]const u8{
+        "zfuzz",
+        "--info=inline-right: / ",
+        "--separator=.",
+        "--ghost=type to search",
+        "--margin=1,2%,3,4%",
+        "--padding=5,6",
+    };
+    var options = try parseOptions(a, &args);
+    defer options.deinit(a);
+    try std.testing.expectEqual(InfoStyle.inline_right, options.info_style);
+    try std.testing.expectEqualStrings(" / ", options.info_prefix);
+    try std.testing.expectEqualStrings(".", options.separator.?);
+    try std.testing.expectEqualStrings("type to search", options.ghost.?);
+    try std.testing.expectEqual(@as(u16, 1), options.margin.top.value);
+    try std.testing.expectEqual(@as(u16, 2), options.margin.right.value);
+    try std.testing.expect(options.margin.right.percent);
+    try std.testing.expectEqual(@as(u16, 3), options.margin.bottom.value);
+    try std.testing.expectEqual(@as(u16, 4), options.margin.left.value);
+    try std.testing.expect(options.margin.left.percent);
+    try std.testing.expectEqual(@as(u16, 5), options.padding.top.value);
+    try std.testing.expectEqual(@as(u16, 6), options.padding.right.value);
+    try std.testing.expectEqual(@as(u16, 5), options.padding.bottom.value);
+    try std.testing.expectEqual(@as(u16, 6), options.padding.left.value);
+}
+
+test "inset pane resolves absolute and percentage margins" {
+    const pane = Pane{ .row = 1, .col = 1, .rows = 20, .cols = 100 };
+    const insets = Insets{
+        .top = .{ .value = 10, .percent = true },
+        .right = .{ .value = 5 },
+        .bottom = .{ .value = 20, .percent = true },
+        .left = .{ .value = 10 },
+    };
+    const out = insetPane(pane, insets);
+    try std.testing.expectEqual(@as(usize, 3), out.row);
+    try std.testing.expectEqual(@as(usize, 11), out.col);
+    try std.testing.expectEqual(@as(usize, 14), out.rows);
+    try std.testing.expectEqual(@as(usize, 85), out.cols);
 }
