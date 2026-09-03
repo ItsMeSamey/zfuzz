@@ -4313,7 +4313,13 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
         }
         if (std.mem.eql(u8, a, "--border")) {
             o.*.border = true;
-            if (o.*.border_style == .none) o.*.border_style = .rounded;
+            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+                i += 1;
+                o.*.border_style = try parseBorderStyle(args[i]);
+                o.*.border = o.*.border_style != .none;
+            } else if (o.*.border_style == .none) {
+                o.*.border_style = .rounded;
+            }
             continue;
         }
         if (std.mem.startsWith(u8, a, "--border=")) {
@@ -4495,8 +4501,19 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             parsePreviewWindow(&o.*.preview, a[17..]);
             continue;
         }
+        if (std.mem.eql(u8, a, "--preview-window")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            parsePreviewWindow(&o.*.preview, args[i]);
+            continue;
+        }
         if (std.mem.eql(u8, a, "--preview-border")) {
-            o.*.preview.border_style = .rounded;
+            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+                i += 1;
+                o.*.preview.border_style = try parseBorderStyle(args[i]);
+            } else {
+                o.*.preview.border_style = .rounded;
+            }
             continue;
         }
         if (std.mem.startsWith(u8, a, "--preview-border=")) {
@@ -7314,6 +7331,19 @@ test "scroll-off option uses fzf source default and accepts overrides" {
     var separate_options = try parseOptions(a, &separate_args);
     defer separate_options.deinit(a);
     try std.testing.expectEqual(@as(usize, 7), separate_options.scroll_off);
+}
+
+test "border and preview layout accept separated values" {
+    const a = std.testing.allocator;
+    const args = [_][]const u8{ "zfuzz", "--border", "sharp", "--preview-border", "dashed", "--preview-window", "left,40%,hidden" };
+    var options = try parseOptions(a, &args);
+    defer options.deinit(a);
+    try std.testing.expect(options.border);
+    try std.testing.expectEqual(BorderStyle.sharp, options.border_style);
+    try std.testing.expectEqual(BorderStyle.dashed, options.preview.border_style);
+    try std.testing.expectEqual(PreviewPosition.left, options.preview.position);
+    try std.testing.expectEqual(@as(u8, 40), options.preview.percent);
+    try std.testing.expect(options.preview.hidden);
 }
 
 test "prompt pointer and marker accept separate arguments" {
