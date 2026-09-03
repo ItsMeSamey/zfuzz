@@ -5403,11 +5403,11 @@ fn parsePreviewWindow(p: *PreviewOptions, spec: []const u8) void {
 
 fn parseWalkerOptions(spec: []const u8) !WalkerOptions {
     var out: WalkerOptions = .{ .file = false, .follow = false, .hidden = false };
-    if (spec.len == 0) return out;
     var parts = std.mem.splitScalar(u8, spec, ',');
     while (parts.next()) |part| {
-        if (std.mem.eql(u8, part, "file")) out.file = true else if (std.mem.eql(u8, part, "dir")) out.dir = true else if (std.mem.eql(u8, part, "follow")) out.follow = true else if (std.mem.eql(u8, part, "hidden")) out.hidden = true else return error.InvalidWalkerOption;
+        if (std.ascii.eqlIgnoreCase(part, "file")) out.file = true else if (std.ascii.eqlIgnoreCase(part, "dir")) out.dir = true else if (std.ascii.eqlIgnoreCase(part, "follow")) out.follow = true else if (std.ascii.eqlIgnoreCase(part, "hidden")) out.hidden = true else return error.InvalidWalkerOption;
     }
+    if (!out.file and !out.dir) return error.InvalidWalkerOption;
     return out;
 }
 
@@ -7502,12 +7502,14 @@ test "walker options match fzf defaults and parse explicit modes" {
     try std.testing.expect(default.follow);
     try std.testing.expect(default.hidden);
 
-    const dirs = try parseWalkerOptions("dir,follow");
+    const dirs = try parseWalkerOptions("DIR,FoLlOw");
     try std.testing.expect(!dirs.file);
     try std.testing.expect(dirs.dir);
     try std.testing.expect(dirs.follow);
     try std.testing.expect(!dirs.hidden);
     try std.testing.expectError(error.InvalidWalkerOption, parseWalkerOptions("file,bogus"));
+    try std.testing.expectError(error.InvalidWalkerOption, parseWalkerOptions("follow,hidden"));
+    try std.testing.expectError(error.InvalidWalkerOption, parseWalkerOptions(""));
 }
 
 test "walker root option consumes directories and replaces prior roots" {
