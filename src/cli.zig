@@ -91,6 +91,10 @@ const Action = union(enum) {
     last,
     toggle,
     toggle_up,
+    toggle_down,
+    toggle_in,
+    toggle_out,
+    toggle_all,
     select,
     deselect,
     select_all,
@@ -1688,8 +1692,13 @@ const Ui = struct {
             .select => try self.selectCurrent(),
             .deselect => self.deselectCurrent(),
             .toggle_up => if (try self.toggleCurrent()) self.move(-1),
+            .toggle_down => if (try self.toggleCurrent()) self.move(1),
+            .toggle_in => if (try self.toggleCurrent()) self.move(if (self.options.layout == .default) 1 else -1),
+            .toggle_out => if (try self.toggleCurrent()) self.move(if (self.options.layout == .default) -1 else 1),
+            .toggle_all => try self.toggleAll(),
             .select_all => {
                 if (self.options.multi) {
+                    try self.ensureAllResults();
                     for (self.results[0..self.result_len]) |idx| {
                         if (self.selected[idx]) continue;
                         if (self.options.multi_max) |max| if (self.selected_count >= max) break;
@@ -2544,22 +2553,48 @@ const Ui = struct {
         }
     }
 
-    fn selectCurrent(self: *Ui) !void {
-        if (!self.options.multi or self.result_len == 0) return;
-        const idx = self.results[self.focus];
-        if (self.selected[idx]) return;
-        if (self.options.multi_max) |max| if (self.selected_count >= max) return;
+    fn ensureAllResults(self: *Ui) !void {
+        if (self.result_cap >= self.candidates.display.len) return;
+        self.result_cap = self.candidates.display.len;
+        self.dirty_search = true;
+        try self.refreshSearch(false);
+    }
+
+    fn compactSelectionOrder(self: *Ui) void {
+        var write: usize = 0;
+        for (self.selection_order.items) |idx| {
+            if (idx >= self.selected.len or !self.selected[idx]) continue;
+            self.selection_order.items[write] = idx;
+            write += 1;
+        }
+        self.selection_order.shrinkRetainingCapacity(write);
+    }
+
+    fn selectIndex(self: *Ui, idx: usize) !bool {
+        if (!self.options.multi or idx >= self.selected.len or self.selected[idx]) return false;
+        if (self.options.multi_max) |max| if (self.selected_count >= max) return false;
         self.selected[idx] = true;
         try self.selection_order.append(self.allocator, idx);
         self.selected_count += 1;
+        return true;
+    }
+
+    fn deselectIndex(self: *Ui, idx: usize) bool {
+        if (!self.options.multi or idx >= self.selected.len or !self.selected[idx]) return false;
+        self.selected[idx] = false;
+        self.selected_count -= 1;
+        if (std.mem.indexOfScalar(usize, self.selection_order.items, idx)) |pos| _ = self.selection_order.orderedRemove(pos);
+        return true;
+    }
+
+    fn selectCurrent(self: *Ui) !void {
+        if (self.result_len == 0) return;
+        _ = try self.selectIndex(self.results[self.focus]);
     }
 
     fn deselectCurrent(self: *Ui) void {
-        if (!self.options.multi or self.result_len == 0) return;
-        const idx = self.results[self.focus];
-        if (!self.selected[idx]) return;
-        self.selected[idx] = false;
-        self.selected_count -= 1;
+        if (self.result_len == 0) return;
+        _ = self.deselectIndex(self.results[self.focus]);
     }
 
     fn waitForSearch(self: *Ui) !void {
@@ -2587,17 +2622,26 @@ const Ui = struct {
     fn toggleCurrent(self: *Ui) !bool {
         if (!self.options.multi or self.result_len == 0) return false;
         const idx = self.results[self.focus];
-        if (!self.selected[idx]) {
-            if (self.options.multi_max) |max| if (self.selected_count >= max) return false;
-            self.selected[idx] = true;
-            try self.selection_order.append(self.allocator, idx);
-            self.selected_count += 1;
-        } else {
+        if (self.selected[idx]) return self.deselectIndex(idx);
+        return try self.selectIndex(idx);
+    }
+
+    fn toggleAll(self: *Ui) !void {
+        if (!self.options.multi or self.result_len == 0) return;
+        try self.ensureAllResults();
+        const was_selected = try self.allocator.alloc(bool, self.result_len);
+        defer self.allocator.free(was_selected);
+        for (self.results[0..self.result_len], 0..) |idx, pos| {
+            was_selected[pos] = self.selected[idx];
+            if (!was_selected[pos]) continue;
             self.selected[idx] = false;
             self.selected_count -= 1;
-            if (std.mem.indexOfScalar(usize, self.selection_order.items, idx)) |pos| _ = self.selection_order.orderedRemove(pos);
         }
-        return true;
+        self.compactSelectionOrder();
+        for (self.results[0..self.result_len], 0..) |idx, pos| {
+            if (was_selected[pos]) continue;
+            if (!try self.selectIndex(idx)) break;
+        }
     }
 
     fn excludeCandidates(self: *Ui, remove: []const bool) !void {
@@ -4204,6 +4248,10 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "select")) return .select;
     if (std.mem.eql(u8, s, "deselect")) return .deselect;
     if (std.mem.eql(u8, s, "toggle-up")) return .toggle_up;
+    if (std.mem.eql(u8, s, "toggle-down")) return .toggle_down;
+    if (std.mem.eql(u8, s, "toggle-in")) return .toggle_in;
+    if (std.mem.eql(u8, s, "toggle-out")) return .toggle_out;
+    if (std.mem.eql(u8, s, "toggle-all")) return .toggle_all;
     if (std.mem.eql(u8, s, "select-all")) return .select_all;
     if (std.mem.eql(u8, s, "deselect-all")) return .deselect_all;
     if (std.mem.eql(u8, s, "clear-query")) return .clear_query;
@@ -6571,6 +6619,10 @@ test "stateful binding actions parse" {
     try std.testing.expectEqualStrings("printf 'down+accept'", t.transform);
     try std.testing.expect((try parseAction("wait")) == .wait);
     try std.testing.expect((try parseAction("select")) == .select);
+    try std.testing.expect((try parseAction("toggle-down")) == .toggle_down);
+    try std.testing.expect((try parseAction("toggle-in")) == .toggle_in);
+    try std.testing.expect((try parseAction("toggle-out")) == .toggle_out);
+    try std.testing.expect((try parseAction("toggle-all")) == .toggle_all);
     const printed = try parseAction("print(ctrl-y)");
     try std.testing.expectEqualStrings("ctrl-y", printed.print);
 
