@@ -5089,6 +5089,8 @@ fn maskActionListContents(allocator: Allocator, text: []const u8) ![]u8 {
 fn parseBindings(allocator: Allocator, out: *std.ArrayList(Binding), spec: []const u8) !void {
     const masked = try maskActionContents(allocator, spec);
     defer allocator.free(masked);
+    var pending: std.ArrayList([]const u8) = .empty;
+    defer pending.deinit(allocator);
 
     var start: usize = 0;
     var i: usize = 0;
@@ -5099,17 +5101,29 @@ fn parseBindings(allocator: Allocator, out: *std.ArrayList(Binding), spec: []con
         const masked_part_raw = masked[start..i];
         start = i + 1;
         const part = std.mem.trim(u8, raw_part, " \t");
-        if (part.len == 0) continue;
+        if (part.len == 0) return error.InvalidBinding;
         const leading = @intFromPtr(part.ptr) - @intFromPtr(raw_part.ptr);
         const masked_part = masked_part_raw[leading .. leading + part.len];
-        const colon = std.mem.indexOfScalar(u8, masked_part, ':') orelse return error.InvalidBinding;
-        const trigger = std.mem.trim(u8, part[0..colon], " \t");
+        const colon = std.mem.indexOfScalar(u8, masked_part, ':');
+        if (colon == null) {
+            if (asciiStartsWithIgnoreCase(part, "every(") and everyIntervalMilliseconds(part) == null) return error.InvalidEveryEvent;
+            try pending.append(allocator, part);
+            continue;
+        }
+
+        const trigger = std.mem.trim(u8, part[0..colon.?], " \t");
         if (trigger.len == 0) return error.InvalidBinding;
         if (asciiStartsWithIgnoreCase(trigger, "every(") and everyIntervalMilliseconds(trigger) == null) return error.InvalidEveryEvent;
-        const action_text = std.mem.trim(u8, part[colon + 1 ..], " \t");
-        if (action_text.len != 0 and action_text[0] != '+') removeBindingsForTrigger(out, trigger);
-        try appendBindingActions(allocator, out, trigger, action_text);
+        const action_text = std.mem.trim(u8, part[colon.? + 1 ..], " \t");
+        for (pending.items) |pending_trigger| try applyBindingSpec(allocator, out, pending_trigger, action_text);
+        try applyBindingSpec(allocator, out, trigger, action_text);
+        pending.clearRetainingCapacity();
     }
+}
+
+fn applyBindingSpec(allocator: Allocator, out: *std.ArrayList(Binding), trigger: []const u8, action_text: []const u8) !void {
+    if (action_text.len != 0 and action_text[0] != '+') removeBindingsForTrigger(out, trigger);
+    try appendBindingActions(allocator, out, trigger, action_text);
 }
 
 fn removeBindingsForTrigger(out: *std.ArrayList(Binding), trigger: []const u8) void {
@@ -8464,6 +8478,30 @@ test "repeated fzf bindings replace unless action list starts with plus" {
     try std.testing.expectEqual(@as(usize, 1), aliases.items.len);
     try std.testing.expectEqualStrings("enter", aliases.items[0].trigger);
     try std.testing.expect(aliases.items[0].action == .down);
+}
+
+test "binding parser groups pending fzf keys" {
+    const a = std.testing.allocator;
+    var bindings: std.ArrayList(Binding) = .empty;
+    defer bindings.deinit(a);
+
+    try parseBindings(a, &bindings, "a,b:accept");
+    try std.testing.expectEqual(@as(usize, 2), bindings.items.len);
+    try std.testing.expectEqualStrings("a", bindings.items[0].trigger);
+    try std.testing.expectEqualStrings("b", bindings.items[1].trigger);
+    try std.testing.expect(bindings.items[0].action == .accept);
+    try std.testing.expect(bindings.items[1].action == .accept);
+
+    try parseBindings(a, &bindings, "a:up,b:down,a,b:accept");
+    try std.testing.expectEqual(@as(usize, 2), bindings.items.len);
+    try std.testing.expect(bindings.items[0].action == .accept);
+    try std.testing.expect(bindings.items[1].action == .accept);
+
+    var pending_only: std.ArrayList(Binding) = .empty;
+    defer pending_only.deinit(a);
+    try parseBindings(a, &pending_only, "a,b");
+    try std.testing.expectEqual(@as(usize, 0), pending_only.items.len);
+    try std.testing.expectError(error.InvalidBinding, parseBindings(a, &pending_only, "a,,b:accept"));
 }
 
 test "binding parser accepts fzf action argument delimiters" {
