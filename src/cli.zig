@@ -1055,6 +1055,7 @@ const Ui = struct {
     input_hidden: bool = false,
     header_hidden: bool = false,
     last_action: []const u8 = "",
+    last_action_buf: [64]u8 = [_]u8{0} ** 64,
     last_key: []const u8 = "",
     timer_last_ms: []u64 = &.{},
     last_activity_ms: u64 = 0,
@@ -1401,6 +1402,12 @@ const Ui = struct {
         return if (effective > fixed) effective - fixed else 1;
     }
 
+    fn setLastAction(self: *Ui, name: []const u8) void {
+        const len = @min(name.len, self.last_action_buf.len);
+        for (name[0..len], 0..) |c, i| self.last_action_buf[i] = std.ascii.toLower(c);
+        self.last_action = self.last_action_buf[0..len];
+    }
+
     fn handleKey(self: *Ui, key: Key) !?u8 {
         switch (key) {
             .paste_start => {
@@ -1419,7 +1426,7 @@ const Ui = struct {
                 std.mem.eql(u8, binding.trigger, "one") or std.mem.eql(u8, binding.trigger, "focus")) continue;
             if (!keyMatchesName(key, binding.trigger)) continue;
             binding_handled = true;
-            self.last_action = binding.name;
+            self.setLastAction(binding.name);
             self.last_key = binding.trigger;
             if (try self.runAction(binding.action, binding_slot)) |code| return code;
         }
@@ -1620,7 +1627,7 @@ const Ui = struct {
                     defer actions.deinit(self.allocator);
                     appendBindingActions(self.allocator, &actions, "http", body) catch continue;
                     for (actions.items) |binding| {
-                        self.last_action = binding.name;
+                        self.setLastAction(binding.name);
                         self.last_key = "";
                         if (try self.runAction(binding.action, null)) |code| return code;
                     }
@@ -1647,7 +1654,7 @@ const Ui = struct {
                     defer actions.deinit(self.allocator);
                     try appendBindingActions(self.allocator, &actions, "bg-transform", result.output);
                     for (actions.items) |binding| {
-                        self.last_action = binding.name;
+                        self.setLastAction(binding.name);
                         if (try self.runAction(binding.action, null)) |code| return code;
                     }
                 },
@@ -1775,7 +1782,7 @@ const Ui = struct {
         for (self.options.bindings.items, 0..) |binding, binding_slot| {
             if (!binding.enabled) continue;
             if (!std.mem.eql(u8, binding.trigger, event)) continue;
-            self.last_action = binding.name;
+            self.setLastAction(binding.name);
             self.last_key = "";
             if (try self.runAction(binding.action, binding_slot)) |code| return code;
         }
@@ -1789,7 +1796,7 @@ const Ui = struct {
             const interval_ms = everyIntervalMilliseconds(binding.trigger) orelse continue;
             if (now_ms -| self.timer_last_ms[i] < interval_ms) continue;
             self.timer_last_ms[i] = now_ms;
-            self.last_action = binding.name;
+            self.setLastAction(binding.name);
             self.last_key = "";
             if (try self.runAction(binding.action, i)) |code| return code;
         }
@@ -2374,7 +2381,7 @@ const Ui = struct {
         defer actions.deinit(self.allocator);
         try appendBindingActions(self.allocator, &actions, "transform", text);
         for (actions.items) |binding| {
-            self.last_action = binding.name;
+            self.setLastAction(binding.name);
             if (try self.runAction(binding.action, null)) |code| return code;
         }
         return null;
@@ -4850,108 +4857,108 @@ fn validateActionSequence(text: []const u8) bool {
 }
 
 fn parseAction(s: []const u8) !Action {
-    if (std.mem.eql(u8, s, "ignore")) return .ignore;
-    if (std.mem.eql(u8, s, "up")) return .up;
-    if (std.mem.eql(u8, s, "down")) return .down;
-    if (std.mem.eql(u8, s, "page-up")) return .page_up;
-    if (std.mem.eql(u8, s, "page-down")) return .page_down;
-    if (std.mem.eql(u8, s, "half-page-up")) return .half_page_up;
-    if (std.mem.eql(u8, s, "half-page-down")) return .half_page_down;
-    if (std.mem.eql(u8, s, "offset-up")) return .offset_up;
-    if (std.mem.eql(u8, s, "offset-down")) return .offset_down;
-    if (std.mem.eql(u8, s, "offset-middle")) return .offset_middle;
-    if (std.mem.eql(u8, s, "beginning-of-line")) return .beginning_of_line;
-    if (std.mem.eql(u8, s, "end-of-line")) return .end_of_line;
-    if (std.mem.eql(u8, s, "backward-char")) return .backward_char;
-    if (std.mem.eql(u8, s, "forward-char")) return .forward_char;
-    if (std.mem.eql(u8, s, "backward-delete-char")) return .backward_delete_char;
-    if (std.mem.eql(u8, s, "backward-delete-char/eof")) return .backward_delete_char_eof;
-    if (std.mem.eql(u8, s, "delete-char")) return .delete_char;
-    if (std.mem.eql(u8, s, "delete-char/eof")) return .delete_char_eof;
-    if (std.mem.eql(u8, s, "backward-word")) return .backward_word;
-    if (std.mem.eql(u8, s, "forward-word")) return .forward_word;
-    if (std.mem.eql(u8, s, "backward-subword")) return .backward_subword;
-    if (std.mem.eql(u8, s, "forward-subword")) return .forward_subword;
-    if (std.mem.eql(u8, s, "backward-kill-word")) return .backward_kill_word;
-    if (std.mem.eql(u8, s, "kill-word")) return .kill_word;
-    if (std.mem.eql(u8, s, "backward-kill-subword")) return .backward_kill_subword;
-    if (std.mem.eql(u8, s, "kill-subword")) return .kill_subword;
-    if (std.mem.eql(u8, s, "kill-line")) return .kill_line;
-    if (std.mem.eql(u8, s, "unix-line-discard") or std.mem.eql(u8, s, "line-discard")) return .unix_line_discard;
-    if (std.mem.eql(u8, s, "unix-word-rubout") or std.mem.eql(u8, s, "word-rubout")) return .backward_kill_word;
-    if (std.mem.eql(u8, s, "yank")) return .yank;
-    if (std.mem.eql(u8, s, "cancel")) return .cancel;
-    if (std.mem.eql(u8, s, "print-query")) return .print_query;
-    if (std.mem.eql(u8, s, "accept-non-empty")) return .accept_non_empty;
-    if (std.mem.eql(u8, s, "accept-or-print-query")) return .accept_or_print_query;
-    if (std.mem.eql(u8, s, "replace-query")) return .replace_query;
+    if (std.ascii.eqlIgnoreCase(s, "ignore")) return .ignore;
+    if (std.ascii.eqlIgnoreCase(s, "up")) return .up;
+    if (std.ascii.eqlIgnoreCase(s, "down")) return .down;
+    if (std.ascii.eqlIgnoreCase(s, "page-up")) return .page_up;
+    if (std.ascii.eqlIgnoreCase(s, "page-down")) return .page_down;
+    if (std.ascii.eqlIgnoreCase(s, "half-page-up")) return .half_page_up;
+    if (std.ascii.eqlIgnoreCase(s, "half-page-down")) return .half_page_down;
+    if (std.ascii.eqlIgnoreCase(s, "offset-up")) return .offset_up;
+    if (std.ascii.eqlIgnoreCase(s, "offset-down")) return .offset_down;
+    if (std.ascii.eqlIgnoreCase(s, "offset-middle")) return .offset_middle;
+    if (std.ascii.eqlIgnoreCase(s, "beginning-of-line")) return .beginning_of_line;
+    if (std.ascii.eqlIgnoreCase(s, "end-of-line")) return .end_of_line;
+    if (std.ascii.eqlIgnoreCase(s, "backward-char")) return .backward_char;
+    if (std.ascii.eqlIgnoreCase(s, "forward-char")) return .forward_char;
+    if (std.ascii.eqlIgnoreCase(s, "backward-delete-char")) return .backward_delete_char;
+    if (std.ascii.eqlIgnoreCase(s, "backward-delete-char/eof")) return .backward_delete_char_eof;
+    if (std.ascii.eqlIgnoreCase(s, "delete-char")) return .delete_char;
+    if (std.ascii.eqlIgnoreCase(s, "delete-char/eof")) return .delete_char_eof;
+    if (std.ascii.eqlIgnoreCase(s, "backward-word")) return .backward_word;
+    if (std.ascii.eqlIgnoreCase(s, "forward-word")) return .forward_word;
+    if (std.ascii.eqlIgnoreCase(s, "backward-subword")) return .backward_subword;
+    if (std.ascii.eqlIgnoreCase(s, "forward-subword")) return .forward_subword;
+    if (std.ascii.eqlIgnoreCase(s, "backward-kill-word")) return .backward_kill_word;
+    if (std.ascii.eqlIgnoreCase(s, "kill-word")) return .kill_word;
+    if (std.ascii.eqlIgnoreCase(s, "backward-kill-subword")) return .backward_kill_subword;
+    if (std.ascii.eqlIgnoreCase(s, "kill-subword")) return .kill_subword;
+    if (std.ascii.eqlIgnoreCase(s, "kill-line")) return .kill_line;
+    if (std.ascii.eqlIgnoreCase(s, "unix-line-discard") or std.ascii.eqlIgnoreCase(s, "line-discard")) return .unix_line_discard;
+    if (std.ascii.eqlIgnoreCase(s, "unix-word-rubout") or std.ascii.eqlIgnoreCase(s, "word-rubout")) return .backward_kill_word;
+    if (std.ascii.eqlIgnoreCase(s, "yank")) return .yank;
+    if (std.ascii.eqlIgnoreCase(s, "cancel")) return .cancel;
+    if (std.ascii.eqlIgnoreCase(s, "print-query")) return .print_query;
+    if (std.ascii.eqlIgnoreCase(s, "accept-non-empty")) return .accept_non_empty;
+    if (std.ascii.eqlIgnoreCase(s, "accept-or-print-query")) return .accept_or_print_query;
+    if (std.ascii.eqlIgnoreCase(s, "replace-query")) return .replace_query;
     if (commandAction(s, "put")) |value| return .{ .put = value };
-    if (std.mem.eql(u8, s, "first") or std.mem.eql(u8, s, "top")) return .first;
-    if (std.mem.eql(u8, s, "last")) return .last;
+    if (std.ascii.eqlIgnoreCase(s, "first") or std.ascii.eqlIgnoreCase(s, "top")) return .first;
+    if (std.ascii.eqlIgnoreCase(s, "last")) return .last;
     if (commandAction(s, "pos")) |value| return .{ .position = value };
-    if (std.mem.eql(u8, s, "toggle")) return .toggle;
-    if (std.mem.eql(u8, s, "select")) return .select;
-    if (std.mem.eql(u8, s, "deselect")) return .deselect;
-    if (std.mem.eql(u8, s, "toggle-up")) return .toggle_up;
-    if (std.mem.eql(u8, s, "toggle-down")) return .toggle_down;
-    if (std.mem.eql(u8, s, "toggle-in")) return .toggle_in;
-    if (std.mem.eql(u8, s, "toggle-out")) return .toggle_out;
-    if (std.mem.eql(u8, s, "toggle-all")) return .toggle_all;
-    if (std.mem.eql(u8, s, "select-all")) return .select_all;
-    if (std.mem.eql(u8, s, "deselect-all")) return .deselect_all;
-    if (std.mem.eql(u8, s, "clear-selection") or std.mem.eql(u8, s, "clear-multi")) return .deselect_all;
-    if (std.mem.eql(u8, s, "clear-query")) return .clear_query;
-    if (std.mem.eql(u8, s, "clear-screen")) return .clear_screen;
-    if (std.mem.eql(u8, s, "close")) return .close;
-    if (std.mem.eql(u8, s, "bell")) return .bell;
-    if (std.mem.eql(u8, s, "accept")) return .accept;
-    if (std.mem.eql(u8, s, "abort")) return .abort;
-    if (std.mem.eql(u8, s, "toggle-preview")) return .toggle_preview;
-    if (std.mem.eql(u8, s, "show-preview")) return .show_preview;
-    if (std.mem.eql(u8, s, "hide-preview")) return .hide_preview;
-    if (std.mem.eql(u8, s, "refresh-preview")) return .refresh_preview;
-    if (std.mem.eql(u8, s, "toggle-preview-wrap")) return .toggle_preview_wrap;
-    if (std.mem.eql(u8, s, "toggle-wrap")) return .toggle_wrap;
-    if (std.mem.eql(u8, s, "toggle-raw")) return .toggle_raw;
-    if (std.mem.eql(u8, s, "enable-raw")) return .enable_raw;
-    if (std.mem.eql(u8, s, "disable-raw")) return .disable_raw;
-    if (std.mem.eql(u8, s, "down-match")) return .down_match;
-    if (std.mem.eql(u8, s, "up-match")) return .up_match;
-    if (std.mem.eql(u8, s, "best")) return .best;
-    if (std.mem.eql(u8, s, "exclude")) return .exclude;
-    if (std.mem.eql(u8, s, "exclude-multi")) return .exclude_multi;
-    if (std.mem.eql(u8, s, "toggle-input")) return .toggle_input;
-    if (std.mem.eql(u8, s, "show-input")) return .show_input;
-    if (std.mem.eql(u8, s, "hide-input")) return .hide_input;
-    if (std.mem.eql(u8, s, "toggle-header")) return .toggle_header;
-    if (std.mem.eql(u8, s, "show-header")) return .show_header;
-    if (std.mem.eql(u8, s, "hide-header")) return .hide_header;
-    if (std.mem.eql(u8, s, "wait")) return .wait;
-    if (std.mem.eql(u8, s, "preview-top")) return .preview_top;
-    if (std.mem.eql(u8, s, "preview-bottom")) return .preview_bottom;
-    if (std.mem.eql(u8, s, "preview-up")) return .preview_up;
-    if (std.mem.eql(u8, s, "preview-down")) return .preview_down;
-    if (std.mem.eql(u8, s, "preview-page-up")) return .preview_page_up;
-    if (std.mem.eql(u8, s, "preview-page-down")) return .preview_page_down;
-    if (std.mem.eql(u8, s, "preview-half-page-up")) return .preview_half_page_up;
-    if (std.mem.eql(u8, s, "preview-half-page-down")) return .preview_half_page_down;
-    if (std.mem.eql(u8, s, "up-selected") or std.mem.eql(u8, s, "prev-selected")) return .prev_selected;
-    if (std.mem.eql(u8, s, "down-selected") or std.mem.eql(u8, s, "next-selected")) return .next_selected;
-    if (std.mem.eql(u8, s, "toggle-sort")) return .toggle_sort;
-    if (std.mem.eql(u8, s, "enable-search")) return .enable_search;
-    if (std.mem.eql(u8, s, "disable-search")) return .disable_search;
-    if (std.mem.eql(u8, s, "toggle-search")) return .toggle_search;
-    if (std.mem.eql(u8, s, "toggle-track")) return .toggle_track;
-    if (std.mem.eql(u8, s, "track") or std.mem.eql(u8, s, "track-current")) return .track_current;
-    if (std.mem.eql(u8, s, "untrack-current")) return .untrack_current;
-    if (std.mem.eql(u8, s, "toggle-track-current")) return .toggle_track_current;
-    if (std.mem.eql(u8, s, "prev-history") or std.mem.eql(u8, s, "previous-history")) return .prev_history;
-    if (std.mem.eql(u8, s, "next-history")) return .next_history;
+    if (std.ascii.eqlIgnoreCase(s, "toggle")) return .toggle;
+    if (std.ascii.eqlIgnoreCase(s, "select")) return .select;
+    if (std.ascii.eqlIgnoreCase(s, "deselect")) return .deselect;
+    if (std.ascii.eqlIgnoreCase(s, "toggle-up")) return .toggle_up;
+    if (std.ascii.eqlIgnoreCase(s, "toggle-down")) return .toggle_down;
+    if (std.ascii.eqlIgnoreCase(s, "toggle-in")) return .toggle_in;
+    if (std.ascii.eqlIgnoreCase(s, "toggle-out")) return .toggle_out;
+    if (std.ascii.eqlIgnoreCase(s, "toggle-all")) return .toggle_all;
+    if (std.ascii.eqlIgnoreCase(s, "select-all")) return .select_all;
+    if (std.ascii.eqlIgnoreCase(s, "deselect-all")) return .deselect_all;
+    if (std.ascii.eqlIgnoreCase(s, "clear-selection") or std.ascii.eqlIgnoreCase(s, "clear-multi")) return .deselect_all;
+    if (std.ascii.eqlIgnoreCase(s, "clear-query")) return .clear_query;
+    if (std.ascii.eqlIgnoreCase(s, "clear-screen")) return .clear_screen;
+    if (std.ascii.eqlIgnoreCase(s, "close")) return .close;
+    if (std.ascii.eqlIgnoreCase(s, "bell")) return .bell;
+    if (std.ascii.eqlIgnoreCase(s, "accept")) return .accept;
+    if (std.ascii.eqlIgnoreCase(s, "abort")) return .abort;
+    if (std.ascii.eqlIgnoreCase(s, "toggle-preview")) return .toggle_preview;
+    if (std.ascii.eqlIgnoreCase(s, "show-preview")) return .show_preview;
+    if (std.ascii.eqlIgnoreCase(s, "hide-preview")) return .hide_preview;
+    if (std.ascii.eqlIgnoreCase(s, "refresh-preview")) return .refresh_preview;
+    if (std.ascii.eqlIgnoreCase(s, "toggle-preview-wrap")) return .toggle_preview_wrap;
+    if (std.ascii.eqlIgnoreCase(s, "toggle-wrap")) return .toggle_wrap;
+    if (std.ascii.eqlIgnoreCase(s, "toggle-raw")) return .toggle_raw;
+    if (std.ascii.eqlIgnoreCase(s, "enable-raw")) return .enable_raw;
+    if (std.ascii.eqlIgnoreCase(s, "disable-raw")) return .disable_raw;
+    if (std.ascii.eqlIgnoreCase(s, "down-match")) return .down_match;
+    if (std.ascii.eqlIgnoreCase(s, "up-match")) return .up_match;
+    if (std.ascii.eqlIgnoreCase(s, "best")) return .best;
+    if (std.ascii.eqlIgnoreCase(s, "exclude")) return .exclude;
+    if (std.ascii.eqlIgnoreCase(s, "exclude-multi")) return .exclude_multi;
+    if (std.ascii.eqlIgnoreCase(s, "toggle-input")) return .toggle_input;
+    if (std.ascii.eqlIgnoreCase(s, "show-input")) return .show_input;
+    if (std.ascii.eqlIgnoreCase(s, "hide-input")) return .hide_input;
+    if (std.ascii.eqlIgnoreCase(s, "toggle-header")) return .toggle_header;
+    if (std.ascii.eqlIgnoreCase(s, "show-header")) return .show_header;
+    if (std.ascii.eqlIgnoreCase(s, "hide-header")) return .hide_header;
+    if (std.ascii.eqlIgnoreCase(s, "wait")) return .wait;
+    if (std.ascii.eqlIgnoreCase(s, "preview-top")) return .preview_top;
+    if (std.ascii.eqlIgnoreCase(s, "preview-bottom")) return .preview_bottom;
+    if (std.ascii.eqlIgnoreCase(s, "preview-up")) return .preview_up;
+    if (std.ascii.eqlIgnoreCase(s, "preview-down")) return .preview_down;
+    if (std.ascii.eqlIgnoreCase(s, "preview-page-up")) return .preview_page_up;
+    if (std.ascii.eqlIgnoreCase(s, "preview-page-down")) return .preview_page_down;
+    if (std.ascii.eqlIgnoreCase(s, "preview-half-page-up")) return .preview_half_page_up;
+    if (std.ascii.eqlIgnoreCase(s, "preview-half-page-down")) return .preview_half_page_down;
+    if (std.ascii.eqlIgnoreCase(s, "up-selected") or std.ascii.eqlIgnoreCase(s, "prev-selected")) return .prev_selected;
+    if (std.ascii.eqlIgnoreCase(s, "down-selected") or std.ascii.eqlIgnoreCase(s, "next-selected")) return .next_selected;
+    if (std.ascii.eqlIgnoreCase(s, "toggle-sort")) return .toggle_sort;
+    if (std.ascii.eqlIgnoreCase(s, "enable-search")) return .enable_search;
+    if (std.ascii.eqlIgnoreCase(s, "disable-search")) return .disable_search;
+    if (std.ascii.eqlIgnoreCase(s, "toggle-search")) return .toggle_search;
+    if (std.ascii.eqlIgnoreCase(s, "toggle-track")) return .toggle_track;
+    if (std.ascii.eqlIgnoreCase(s, "track") or std.ascii.eqlIgnoreCase(s, "track-current")) return .track_current;
+    if (std.ascii.eqlIgnoreCase(s, "untrack-current")) return .untrack_current;
+    if (std.ascii.eqlIgnoreCase(s, "toggle-track-current")) return .toggle_track_current;
+    if (std.ascii.eqlIgnoreCase(s, "prev-history") or std.ascii.eqlIgnoreCase(s, "previous-history")) return .prev_history;
+    if (std.ascii.eqlIgnoreCase(s, "next-history")) return .next_history;
     if (commandAction(s, "change-query")) |value| return .{ .change_query = value };
     if (commandAction(s, "search")) |value| return .{ .search = value };
     if (commandAction(s, "change-nth")) |value| return .{ .change_nth = value };
     if (commandAction(s, "change-with-nth")) |value| return .{ .change_with_nth = value };
-    if (std.mem.eql(u8, s, "change-multi")) return .{ .change_multi = "" };
+    if (std.ascii.eqlIgnoreCase(s, "change-multi")) return .{ .change_multi = "" };
     if (commandAction(s, "change-multi")) |value| return .{ .change_multi = value };
     if (commandAction(s, "change-prompt")) |value| return .{ .change_prompt = value };
     if (commandAction(s, "change-ghost")) |value| return .{ .change_ghost = value };
@@ -4986,7 +4993,7 @@ fn parseAction(s: []const u8) !Action {
     if (commandAction(s, "bg-transform-footer")) |cmd| return .{ .bg_transform_footer = cmd };
     if (commandAction(s, "bg-transform-preview")) |cmd| return .{ .bg_transform_preview = cmd };
     if (commandAction(s, "bg-transform")) |cmd| return .{ .bg_transform = cmd };
-    if (std.mem.eql(u8, s, "bg-cancel")) return .bg_cancel;
+    if (std.ascii.eqlIgnoreCase(s, "bg-cancel")) return .bg_cancel;
     if (commandAction(s, "transform")) |cmd| return .{ .transform = cmd };
     if (commandAction(s, "print")) |value| return .{ .print = value };
     if (commandAction(s, "reload-sync")) |cmd| return .{ .reload_sync = cmd };
@@ -5001,7 +5008,7 @@ fn parseAction(s: []const u8) !Action {
 }
 
 fn commandAction(s: []const u8, name: []const u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, s, name)) return null;
+    if (s.len < name.len or !std.ascii.eqlIgnoreCase(s[0..name.len], name)) return null;
     const rest = s[name.len..];
     if (rest.len >= 2 and rest[0] == '(' and rest[rest.len - 1] == ')') return rest[1 .. rest.len - 1];
     if (rest.len >= 2 and rest[0] == ':') return rest[1..];
@@ -7616,6 +7623,9 @@ test "search enable and phony aliases are last-one-wins" {
 
 test "stateful binding actions parse" {
     try std.testing.expect((try parseAction("toggle-sort")) == .toggle_sort);
+    try std.testing.expect((try parseAction("ToGgLe-SoRt")) == .toggle_sort);
+    const mixed_execute = try parseAction("Execute-Silent(printf MiXeD)");
+    try std.testing.expectEqualStrings("printf MiXeD", mixed_execute.execute_silent);
     try std.testing.expect((try parseAction("enable-search")) == .enable_search);
     const q = try parseAction("change-query(foo bar)");
     try std.testing.expectEqualStrings("foo bar", q.change_query);
@@ -7803,6 +7813,13 @@ test "search override bypasses disabled without changing visible query" {
     const empty_override = resolveEffectiveSearch("alpha", true, "");
     try std.testing.expectEqualStrings("", empty_override.query);
     try std.testing.expect(!empty_override.disabled);
+}
+
+test "last action name is case normalized" {
+    var ui: Ui = undefined;
+    ui.last_action_buf = [_]u8{0} ** 64;
+    ui.setLastAction("Change-Query");
+    try std.testing.expectEqualStrings("change-query", ui.last_action);
 }
 
 test "binding parser" {
