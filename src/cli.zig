@@ -257,6 +257,7 @@ const Options = struct {
     print0: bool = false,
     ansi: bool = false,
     cycle: bool = false,
+    filepath_word: bool = false,
     wrap: bool = false,
     raw: bool = false,
     select_1: bool = false,
@@ -1412,8 +1413,8 @@ const Ui = struct {
             .down => self.move(1),
             .page_up => self.page(-1),
             .page_down => self.page(1),
-            .word_left => self.cursor = wordBoundaryBackward(self.query.items, self.cursor),
-            .word_right => self.cursor = wordBoundaryForward(self.query.items, self.cursor),
+            .word_left => self.cursor = self.queryWordBoundaryBackward(),
+            .word_right => self.cursor = self.queryWordBoundaryForward(),
             .home => self.cursor = 0,
             .end => self.cursor = self.query.items.len,
             .left => self.cursor = prevUtf8Boundary(self.query.items, self.cursor),
@@ -1456,8 +1457,10 @@ const Ui = struct {
                 },
             },
             .alt_byte => |b| switch (b) {
-                'b' => self.cursor = wordBoundaryBackward(self.query.items, self.cursor),
-                'f' => self.cursor = wordBoundaryForward(self.query.items, self.cursor),
+                'b' => self.cursor = self.queryWordBoundaryBackward(),
+                'f' => self.cursor = self.queryWordBoundaryForward(),
+                'd' => _ = try self.killWordForward(),
+                127, 8 => _ = try self.killWordBackward(),
                 else => {},
             },
             .paste_start, .paste_end => unreachable,
@@ -1795,8 +1798,8 @@ const Ui = struct {
             .up_match => self.moveMatch(-1),
             .down_match => self.moveMatch(1),
             .best => self.focusBestMatch(),
-            .backward_word => self.cursor = wordBoundaryBackward(self.query.items, self.cursor),
-            .forward_word => self.cursor = wordBoundaryForward(self.query.items, self.cursor),
+            .backward_word => self.cursor = self.queryWordBoundaryBackward(),
+            .forward_word => self.cursor = self.queryWordBoundaryForward(),
             .backward_subword => self.cursor = subwordBoundaryBackward(self.query.items, self.cursor),
             .forward_subword => self.cursor = subwordBoundaryForward(self.query.items, self.cursor),
             .backward_kill_word => _ = try self.killWordBackward(),
@@ -3018,9 +3021,23 @@ const Ui = struct {
         try self.yanked.appendSlice(self.allocator, text);
     }
 
+    fn queryWordBoundaryBackward(self: *Ui) usize {
+        return if (self.options.filepath_word)
+            filepathWordBoundaryBackward(self.query.items, self.cursor)
+        else
+            wordBoundaryBackward(self.query.items, self.cursor);
+    }
+
+    fn queryWordBoundaryForward(self: *Ui) usize {
+        return if (self.options.filepath_word)
+            filepathWordBoundaryForward(self.query.items, self.cursor)
+        else
+            wordBoundaryForward(self.query.items, self.cursor);
+    }
+
     fn killWordBackward(self: *Ui) !bool {
         if (self.cursor == 0) return false;
-        const begin = wordBoundaryBackward(self.query.items, self.cursor);
+        const begin = self.queryWordBoundaryBackward();
         if (begin == self.cursor) return false;
         try self.setYanked(self.query.items[begin..self.cursor]);
         try self.query.replaceRange(self.allocator, begin, self.cursor - begin, &.{});
@@ -3030,7 +3047,7 @@ const Ui = struct {
     }
 
     fn killWordForward(self: *Ui) !bool {
-        const end = wordBoundaryForward(self.query.items, self.cursor);
+        const end = self.queryWordBoundaryForward();
         if (end == self.cursor) return false;
         try self.setYanked(self.query.items[self.cursor..end]);
         try self.query.replaceRange(self.allocator, self.cursor, end - self.cursor, &.{});
@@ -3991,6 +4008,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
         }
         if (std.mem.eql(u8, a, "--cycle")) {
             o.*.cycle = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--filepath-word")) {
+            o.*.filepath_word = true;
             continue;
         }
         if (std.mem.eql(u8, a, "--wrap")) {
@@ -5886,6 +5907,33 @@ fn wordBoundaryForward(s: []const u8, pos: usize) usize {
     return p;
 }
 
+fn filepathWordBoundaryBackward(s: []const u8, pos: usize) usize {
+    const end = @min(pos, s.len);
+    if (end == 0) return 0;
+    var slash = end;
+    while (slash > 0) {
+        slash -= 1;
+        if (s[slash] != '/') continue;
+        // fzf's /[^/] expression only treats this slash as a boundary when
+        // there is a following path-segment byte before the current cursor.
+        if (slash + 1 < end) return slash + 1;
+    }
+    return 0;
+}
+
+fn filepathWordBoundaryForward(s: []const u8, pos: usize) usize {
+    const start = @min(pos, s.len);
+    if (start >= s.len) return s.len;
+    var slash = start;
+    while (slash < s.len) : (slash += 1) {
+        if (s[slash] != '/') continue;
+        // fzf's [^/]/ match starts on the byte immediately before the slash;
+        // a slash at the current cursor therefore belongs to the next segment.
+        if (slash > start) return slash;
+    }
+    return s.len;
+}
+
 fn subwordAlnum(cp: u21) bool {
     return fuzzy_engine.cliRuneIsLetterOrNumber(cp);
 }
@@ -6598,6 +6646,7 @@ const usage =
     \\      --reverse            top-down layout
     \\      --height=N%          constrain rendered height
     \\      --cycle              cycle list navigation
+    \\      --filepath-word      word actions respect path separators
     \\      --wrap               wrap long item display
     \\      --prompt=STR         prompt string
     \\      --pointer=STR        current-item pointer
@@ -6621,6 +6670,20 @@ const usage =
     \\  Ctrl-P/N history when --history is active, Tab toggle,
     \\  Ctrl-A/E line edges, Ctrl-U clear, Ctrl-W erase word.
 ;
+
+test "filepath word boundaries match fzf path separators" {
+    const q = "--/foo bar/foo-bar/baz";
+    var cursor: usize = q.len;
+    cursor = filepathWordBoundaryBackward(q, cursor);
+    try std.testing.expectEqual(@as(usize, 19), cursor);
+    cursor = filepathWordBoundaryBackward(q, cursor);
+    try std.testing.expectEqual(@as(usize, 11), cursor);
+    cursor = filepathWordBoundaryBackward(q, cursor);
+    try std.testing.expectEqual(@as(usize, 3), cursor);
+    try std.testing.expectEqual(@as(usize, 10), filepathWordBoundaryForward(q, 3));
+    try std.testing.expectEqual(q.len, filepathWordBoundaryForward(q, 18));
+    try std.testing.expectEqual(@as(usize, 0), filepathWordBoundaryBackward("foo/bar", 3));
+}
 
 test "query history preserves edited navigation slots" {
     const a = std.testing.allocator;

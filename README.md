@@ -87,7 +87,7 @@ movement and deletion remain UTF-8 boundary-safe. `backward-subword` and
 Kill/yank editing follows the same query buffer: `kill-line`, `kill-word`,
 `kill-subword`, backward word/subword rubout,
 `unix-line-discard`, `cancel`, and `yank` preserve and restore the most recently
-removed text; Ctrl-U/Ctrl-W/Ctrl-Y use those same paths. `put(...)`, `replace-query`,
+removed text; Ctrl-U/Ctrl-W/Ctrl-Y use those same paths. `--filepath-word` makes the word actions use path-separator boundaries. `put(...)`, `replace-query`,
 `print-query`, `accept-non-empty`, and `accept-or-print-query` are also
 available with fzf-compatible query/output behavior. List bindings also include
 `top`, `half-page-up`, `half-page-down`, `offset-up`, `offset-down`, `offset-middle`,
