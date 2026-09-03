@@ -96,6 +96,8 @@ const Action = union(enum) {
     enable_search,
     disable_search,
     toggle_search,
+    prev_history,
+    next_history,
     change_query: []const u8,
     change_prompt: []const u8,
     change_header: []const u8,
@@ -151,6 +153,8 @@ const Options = struct {
     walker: WalkerOptions = .{},
     walker_roots: std.ArrayList([]const u8) = .empty,
     walker_skip: []const u8 = ".git,node_modules",
+    history_file: ?[]const u8 = null,
+    history_size: usize = 1000,
     mouse: bool = true,
     style_preset: StylePreset = .default,
     border: bool = true,
@@ -463,6 +467,96 @@ const PaneGeometry = struct {
     preview: ?Pane,
 };
 
+const QueryHistory = struct {
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    max_size: usize,
+    lines: std.ArrayList([]u8) = .empty,
+    edits: []?[]u8 = &.{},
+    cursor: usize = 0,
+
+    fn init(allocator: Allocator, io: Io, path: []const u8, max_size: usize, initial_query: []const u8) !QueryHistory {
+        var self = QueryHistory{ .allocator = allocator, .io = io, .path = path, .max_size = max_size };
+        errdefer self.deinit();
+
+        const file = Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (file) |f| {
+            defer f.close(io);
+            var buffer: [8192]u8 = undefined;
+            var reader = f.reader(io, &buffer);
+            const bytes = try reader.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024));
+            defer allocator.free(bytes);
+            var parts = std.mem.splitScalar(u8, bytes, '\n');
+            while (parts.next()) |raw| {
+                const line = if (raw.len != 0 and raw[raw.len - 1] == '\r') raw[0 .. raw.len - 1] else raw;
+                if (line.len == 0) continue;
+                try self.lines.append(allocator, try allocator.dupe(u8, line));
+            }
+        }
+        if (self.lines.items.len > max_size) {
+            const drop = self.lines.items.len - max_size;
+            for (self.lines.items[0..drop]) |line| allocator.free(line);
+            std.mem.copyForwards([]u8, self.lines.items[0 .. self.lines.items.len - drop], self.lines.items[drop..]);
+            self.lines.items.len -= drop;
+        }
+        self.cursor = self.lines.items.len;
+        self.edits = try allocator.alloc(?[]u8, self.lines.items.len + 1);
+        @memset(self.edits, null);
+        self.edits[self.cursor] = try allocator.dupe(u8, initial_query);
+        return self;
+    }
+
+    fn deinit(self: *QueryHistory) void {
+        for (self.lines.items) |line| self.allocator.free(line);
+        self.lines.deinit(self.allocator);
+        for (self.edits) |edit| if (edit) |value| self.allocator.free(value);
+        if (self.edits.len != 0) self.allocator.free(self.edits);
+        self.edits = &.{};
+    }
+
+    fn remember(self: *QueryHistory, query: []const u8) !void {
+        if (self.edits[self.cursor]) |old| self.allocator.free(old);
+        self.edits[self.cursor] = try self.allocator.dupe(u8, query);
+    }
+
+    fn move(self: *QueryHistory, delta: isize, query: []const u8) !?[]const u8 {
+        try self.remember(query);
+        const old = self.cursor;
+        if (delta < 0) {
+            if (self.cursor != 0) self.cursor -= 1;
+        } else if (delta > 0) {
+            if (self.cursor < self.lines.items.len) self.cursor += 1;
+        }
+        if (self.cursor == old) return null;
+        if (self.edits[self.cursor]) |edit| return edit;
+        if (self.cursor < self.lines.items.len) return self.lines.items[self.cursor];
+        return "";
+    }
+
+    fn save(self: *QueryHistory, query: []const u8) !void {
+        if (query.len == 0) return;
+        var start: usize = 0;
+        if (self.lines.items.len != 0 and std.mem.eql(u8, self.lines.items[self.lines.items.len - 1], query)) return;
+        if (self.lines.items.len >= self.max_size) start = self.lines.items.len - self.max_size + 1;
+
+        var file = try Io.Dir.cwd().createFile(self.io, self.path, .{ .truncate = true });
+        defer file.close(self.io);
+        var buffer: [8192]u8 = undefined;
+        var writer = file.writerStreaming(self.io, &buffer);
+        for (self.lines.items[start..]) |line| {
+            try writer.interface.writeAll(line);
+            try writer.interface.writeByte('\n');
+        }
+        try writer.interface.writeAll(query);
+        try writer.interface.writeByte('\n');
+        try writer.flush();
+    }
+};
+
 const Ui = struct {
     allocator: Allocator,
     io: Io,
@@ -471,6 +565,7 @@ const Ui = struct {
     index: *fuzzy.Index,
     terminal: *Terminal,
     stream: ?*StreamInput,
+    history: ?QueryHistory = null,
     query: std.ArrayList(u8) = .empty,
     cursor: usize = 0,
     results: []usize,
@@ -509,6 +604,9 @@ const Ui = struct {
         errdefer allocator.free(extended_ranks);
         const selected = try allocator.alloc(bool, candidates.display.len);
         @memset(selected, false);
+        var history: ?QueryHistory = null;
+        if (options.history_file) |path| history = try QueryHistory.init(allocator, io, path, options.history_size, options.query);
+        errdefer if (history) |*value| value.deinit();
         return .{
             .allocator = allocator,
             .io = io,
@@ -517,6 +615,7 @@ const Ui = struct {
             .index = index,
             .terminal = terminal,
             .stream = stream,
+            .history = history,
             .query = query,
             .cursor = options.query.len,
             .results = results,
@@ -526,6 +625,7 @@ const Ui = struct {
     }
 
     fn deinit(self: *Ui) void {
+        if (self.history) |*history| history.deinit();
         self.query.deinit(self.allocator);
         self.allocator.free(self.results);
         self.allocator.free(self.extended_ranks);
@@ -735,11 +835,12 @@ const Ui = struct {
             .mouse => |m| try self.handleMouse(m),
             .byte => |b| switch (b) {
                 3, 7, 27 => return 130,
-                13, 10 => {
+                13 => {
                     if (self.result_len == 0 and self.selected_count == 0) return 1;
                     try self.emitSelection(self.accepted_key);
                     return 0;
                 },
+                10 => self.move(1),
                 9 => if (self.options.multi) {
                     try self.toggleCurrent();
                     self.move(1);
@@ -754,8 +855,9 @@ const Ui = struct {
                 },
                 1 => self.cursor = 0,
                 5 => self.cursor = self.query.items.len,
-                11, 16 => self.move(-1),
-                14 => self.move(1),
+                11 => self.move(-1),
+                16 => if (self.history != null) try self.navigateHistory(-1) else self.move(-1),
+                14 => if (self.history != null) try self.navigateHistory(1) else self.move(1),
                 21 => {
                     self.query.clearRetainingCapacity();
                     self.cursor = 0;
@@ -784,6 +886,15 @@ const Ui = struct {
         self.dirty_search = true;
         self.change_event_pending = true;
         self.preview_cache_key = null;
+    }
+
+    fn navigateHistory(self: *Ui, delta: isize) !void {
+        const history = if (self.history) |*value| value else return;
+        const next = try history.move(delta, self.query.items) orelse return;
+        self.query.clearRetainingCapacity();
+        try self.query.appendSlice(self.allocator, next);
+        self.cursor = self.query.items.len;
+        self.markQueryChanged();
     }
 
     fn fireEvent(self: *Ui, event: []const u8) !?u8 {
@@ -870,6 +981,8 @@ const Ui = struct {
                 self.options.disabled = !self.options.disabled;
                 self.dirty_search = true;
             },
+            .prev_history => try self.navigateHistory(-1),
+            .next_history => try self.navigateHistory(1),
             .change_query => |value| {
                 self.query.clearRetainingCapacity();
                 try self.query.appendSlice(self.allocator, value);
@@ -1110,6 +1223,7 @@ const Ui = struct {
     }
 
     fn emitSelection(self: *Ui, expect_key: ?[]const u8) !void {
+        if (self.history) |*history| try history.save(self.query.items);
         const sep: []const u8 = if (self.options.print0) "\x00" else "\n";
         var stdout_buffer: [8192]u8 = undefined;
         var writer = Io.File.stdout().writerStreaming(self.io, &stdout_buffer);
@@ -1884,6 +1998,30 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.walker_skip = args[i];
             continue;
         }
+        if (std.mem.startsWith(u8, a, "--history=")) {
+            o.*.history_file = a[10..];
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--history")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.history_file = args[i];
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--history-size=")) {
+            const value = try std.fmt.parseInt(usize, a[15..], 10);
+            if (value == 0) return error.InvalidHistorySize;
+            o.*.history_size = value;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--history-size")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            const value = try std.fmt.parseInt(usize, args[i], 10);
+            if (value == 0) return error.InvalidHistorySize;
+            o.*.history_size = value;
+            continue;
+        }
         if (std.mem.eql(u8, a, "-m") or std.mem.eql(u8, a, "--multi")) {
             o.*.multi = true;
             continue;
@@ -2403,6 +2541,8 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "enable-search")) return .enable_search;
     if (std.mem.eql(u8, s, "disable-search")) return .disable_search;
     if (std.mem.eql(u8, s, "toggle-search")) return .toggle_search;
+    if (std.mem.eql(u8, s, "prev-history") or std.mem.eql(u8, s, "previous-history")) return .prev_history;
+    if (std.mem.eql(u8, s, "next-history")) return .next_history;
     if (commandAction(s, "change-query")) |value| return .{ .change_query = value };
     if (commandAction(s, "change-prompt")) |value| return .{ .change_prompt = value };
     if (commandAction(s, "change-header")) |value| return .{ .change_header = value };
@@ -3633,6 +3773,19 @@ const usage =
     \\  Enter accept, Esc/Ctrl-C abort, arrows/Ctrl-J/Ctrl-K move,
     \\  Tab toggle, Ctrl-A/E line edges, Ctrl-U clear, Ctrl-W erase word.
 ;
+
+test "query history preserves edited navigation slots" {
+    const a = std.testing.allocator;
+    const path = "/tmp/zfuzz-history-navigation-test";
+    Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "first\nsecond\n" }) catch {};
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var history = try QueryHistory.init(a, std.testing.io, path, 1000, "draft");
+    defer history.deinit();
+    try std.testing.expectEqualStrings("second", (try history.move(-1, "draft")).?);
+    try std.testing.expectEqualStrings("first", (try history.move(-1, "second-edit")).?);
+    try std.testing.expectEqualStrings("second-edit", (try history.move(1, "first")).?);
+    try std.testing.expectEqualStrings("draft", (try history.move(1, "second-edit")).?);
+}
 
 test "walker options match fzf defaults and parse explicit modes" {
     const default: WalkerOptions = .{};
