@@ -91,7 +91,8 @@ removed text; Ctrl-U/Ctrl-W/Ctrl-Y use those same paths. `--filepath-word` makes
 `print-query`, `accept-non-empty`, and `accept-or-print-query` are also
 available with fzf-compatible query/output behavior. `--scroll-off=N` applies the
 fzf v0.74.3 source default of 3 rows and is shared by normal and offset navigation.
-List bindings also include
+`--no-input` starts with the existing input section hidden; `show-input`,
+`hide-input`, and `toggle-input` can change that state at runtime. List bindings also include
 `top`, `half-page-up`, `half-page-down`, `offset-up`, `offset-down`, `offset-middle`,
 `clear-screen`, `close`, and `bell`; `close`
 hides a visible preview before falling back to an interrupt exit. `bg-cancel` cancels all

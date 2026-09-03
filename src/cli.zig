@@ -244,6 +244,7 @@ const Options = struct {
     query: []const u8 = "",
     filter: ?[]const u8 = null,
     prompt: []const u8 = "> ",
+    no_input: bool = false,
     pointer: []const u8 = ">",
     marker: []const u8 = ">",
     header: ?[]const u8 = null,
@@ -1107,6 +1108,7 @@ const Ui = struct {
             .selected = selected,
             .match_flags = match_flags,
             .timer_last_ms = timer_last_ms,
+            .input_hidden = options.no_input,
             .last_activity_ms = now_ms,
         };
     }
@@ -4030,6 +4032,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.cycle = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "--no-input")) {
+            o.*.no_input = true;
+            continue;
+        }
         if (std.mem.eql(u8, a, "--filepath-word")) {
             o.*.filepath_word = true;
             continue;
@@ -6679,6 +6685,7 @@ const usage =
     \\      --filepath-word      word actions respect path separators
     \\      --scroll-off=N       keep N rows around the current item (source default: 3)
     \\      --wrap               wrap long item display
+    \\      --no-input           start with the input section hidden
     \\      --prompt=STR         prompt string
     \\      --pointer=STR        current-item pointer
     \\      --marker=STR         selected-item marker
@@ -7140,6 +7147,14 @@ test "multi modes match fzf zero and unlimited semantics" {
     defer options.deinit(a);
     try std.testing.expect(!options.multi);
     try std.testing.expect(options.multi_max == null);
+}
+
+test "no-input option starts the existing input visibility state hidden" {
+    const a = std.testing.allocator;
+    const args = [_][]const u8{ "zfuzz", "--no-input" };
+    var options = try parseOptions(a, &args);
+    defer options.deinit(a);
+    try std.testing.expect(options.no_input);
 }
 
 test "scroll-off option uses fzf source default and accepts overrides" {
