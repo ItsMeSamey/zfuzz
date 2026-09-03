@@ -220,6 +220,7 @@ const Action = union(enum) {
     reload: []const u8,
     reload_sync: []const u8,
     execute: []const u8,
+    execute_multi: []const u8,
     execute_silent: []const u8,
     become: []const u8,
     unbind: []const u8,
@@ -2097,8 +2098,9 @@ const Ui = struct {
             .print => |value| try self.print_queue.append(self.allocator, try self.allocator.dupe(u8, value)),
             .reload => |cmd| try self.launchAsyncReload(cmd),
             .reload_sync => |cmd| try self.reloadFromCommand(cmd),
-            .execute => |cmd| try self.executeCommand(cmd, false),
-            .execute_silent => |cmd| try self.executeCommand(cmd, true),
+            .execute => |cmd| try self.executeCommand(cmd, false, false),
+            .execute_multi => |cmd| try self.executeCommand(cmd, false, true),
+            .execute_silent => |cmd| try self.executeCommand(cmd, true, false),
             .become => |cmd| return try self.becomeCommand(cmd),
             .unbind => |targets| self.setBindingsEnabled(targets, .disable),
             .rebind => |targets| self.setBindingsEnabled(targets, .enable),
@@ -2407,6 +2409,10 @@ const Ui = struct {
     }
 
     fn expandedCommand(self: *Ui, command: []const u8) !ExpandedCommand {
+        return self.expandedCommandWithForcePlus(command, false);
+    }
+
+    fn expandedCommandWithForcePlus(self: *Ui, command: []const u8, force_plus: bool) !ExpandedCommand {
         const current_idx: ?usize = if (self.result_len == 0) null else self.results[self.focus];
         var temp_files: std.ArrayList([]u8) = .empty;
         errdefer {
@@ -2416,7 +2422,7 @@ const Ui = struct {
             }
             temp_files.deinit(self.allocator);
         }
-        const text = try expandCommandImpl(
+        const text = try expandCommandImplWithForcePlus(
             self.allocator,
             command,
             self.query.items,
@@ -2430,6 +2436,7 @@ const Ui = struct {
             self.options.prompt,
             self.io,
             &temp_files,
+            force_plus,
         );
         return .{ .allocator = self.allocator, .io = self.io, .text = text, .temp_files = temp_files };
     }
@@ -2546,8 +2553,8 @@ const Ui = struct {
         try self.replaceCandidates(new_candidates, new_index, true);
     }
 
-    fn executeCommand(self: *Ui, command: []const u8, silent: bool) !void {
-        var expanded = try self.expandedCommand(command);
+    fn executeCommand(self: *Ui, command: []const u8, silent: bool, force_plus: bool) !void {
+        var expanded = try self.expandedCommandWithForcePlus(command, force_plus);
         defer expanded.deinit();
         var env = try self.commandEnvironment();
         defer env.deinit();
@@ -5133,6 +5140,7 @@ fn parseAction(s: []const u8) !Action {
     if (commandAction(s, "print")) |value| return .{ .print = value };
     if (commandAction(s, "reload-sync")) |cmd| return .{ .reload_sync = cmd };
     if (commandAction(s, "reload")) |cmd| return .{ .reload = cmd };
+    if (commandAction(s, "execute-multi")) |cmd| return .{ .execute_multi = cmd };
     if (commandAction(s, "execute-silent")) |cmd| return .{ .execute_silent = cmd };
     if (commandAction(s, "execute")) |cmd| return .{ .execute = cmd };
     if (commandAction(s, "become")) |cmd| return .{ .become = cmd };
@@ -6689,6 +6697,25 @@ fn expandCommandImpl(
     io: ?Io,
     temp_files: ?*std.ArrayList([]u8),
 ) ![]u8 {
+    return expandCommandImplWithForcePlus(allocator, template, query, candidates, options, current_idx, selection_order, selected, matched, action, prompt, io, temp_files, false);
+}
+
+fn expandCommandImplWithForcePlus(
+    allocator: Allocator,
+    template: []const u8,
+    query: []const u8,
+    candidates: *const CandidateSet,
+    options: *const Options,
+    current_idx: ?usize,
+    selection_order: []const usize,
+    selected: []const bool,
+    matched: []const usize,
+    action: []const u8,
+    prompt: []const u8,
+    io: ?Io,
+    temp_files: ?*std.ArrayList([]u8),
+    force_plus: bool,
+) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var i: usize = 0;
@@ -6732,9 +6759,9 @@ fn expandCommandImpl(
                 if (spec.flags.file) {
                     const actual_io = io orelse return error.FilePlaceholderUnavailable;
                     const files = temp_files orelse return error.FilePlaceholderUnavailable;
-                    try appendFilePlaceholder(allocator, &out, actual_io, files, spec, candidates, options, current_idx, selection_order, selected, matched);
+                    try appendFilePlaceholder(allocator, &out, actual_io, files, spec, candidates, options, current_idx, selection_order, selected, matched, force_plus);
                 } else {
-                    try appendItemPlaceholder(allocator, &out, spec, candidates, options, current_idx, selection_order, selected, matched);
+                    try appendItemPlaceholder(allocator, &out, spec, candidates, options, current_idx, selection_order, selected, matched, force_plus);
                 }
             },
         }
@@ -6757,6 +6784,7 @@ fn appendFilePlaceholder(
     selection_order: []const usize,
     selected: []const bool,
     matched: []const usize,
+    force_plus: bool,
 ) !void {
     var path: ?[]u8 = null;
     var file: ?Io.File = null;
@@ -6798,7 +6826,7 @@ fn appendFilePlaceholder(
             try writer.interface.writeAll(sep);
             wrote = true;
         }
-    } else if (spec.flags.plus) {
+    } else if (spec.flags.plus or force_plus) {
         for (selection_order) |idx_value| {
             if (idx_value >= selected.len or !selected[idx_value]) continue;
             try writePlaceholderValue(allocator, &writer.interface, spec, candidates, options, idx_value);
@@ -6855,6 +6883,7 @@ fn appendItemPlaceholder(
     selection_order: []const usize,
     selected: []const bool,
     matched: []const usize,
+    force_plus: bool,
 ) !void {
     var wrote = false;
     if (spec.flags.asterisk) {
@@ -6866,7 +6895,7 @@ fn appendItemPlaceholder(
         }
         return;
     }
-    if (spec.flags.plus) {
+    if (spec.flags.plus or force_plus) {
         for (selection_order) |idx| {
             if (idx >= selected.len or !selected[idx]) continue;
             if (wrote) try out.append(allocator, ' ');
@@ -7302,6 +7331,27 @@ test "selected and field command placeholders" {
     try std.testing.expectEqualStrings("echo 0 'one' 'three,four' 'one,two' 'four' 'two' 'x y'", got);
 }
 
+test "execute-multi force-plus placeholders" {
+    const a = std.testing.allocator;
+    const blob = try a.dupe(u8, "one,two\nthree,four\n");
+    var options: Options = .{ .delimiter = "," };
+    defer options.deinit(a);
+    var candidates = try candidatesFromOwnedBlob(a, blob, &options);
+    defer candidates.deinit(a);
+    const selected = [_]bool{ true, true };
+    const order = [_]usize{ 1, 0 };
+    const matched = [_]usize{ 0, 1 };
+
+    const got = try expandCommandImplWithForcePlus(a, "echo {}|{2}|{n}|{q}|{*1}", "x y", &candidates, &options, 0, &order, &selected, &matched, "execute-multi", options.prompt, null, null, true);
+    defer a.free(got);
+    try std.testing.expectEqualStrings("echo 'three,four' 'one,two'|'four' 'two'|1 0|'x y'|'one' 'three'", got);
+
+    const none = [_]bool{ false, false };
+    const fallback = try expandCommandImplWithForcePlus(a, "echo {}|{2}|{n}", "", &candidates, &options, 1, &.{}, &none, &matched, "execute-multi", options.prompt, null, null, true);
+    defer a.free(fallback);
+    try std.testing.expectEqualStrings("echo 'three,four'|'four'|1", fallback);
+}
+
 test "file placeholders materialize selected fields" {
     const a = std.testing.allocator;
     const blob = try a.dupe(u8, "one,two\nthree,four\n");
@@ -7326,6 +7376,37 @@ test "file placeholders materialize selected fields" {
     try std.testing.expectEqual(@as(usize, 1), temp_files.items.len);
     try std.testing.expect(std.mem.startsWith(u8, got, "cat '/tmp/zfuzz-"));
 
+    const file = try Io.Dir.openFileAbsolute(std.testing.io, temp_files.items[0], .{});
+    defer file.close(std.testing.io);
+    var buffer: [256]u8 = undefined;
+    var reader = file.reader(std.testing.io, &buffer);
+    const contents = try reader.interface.allocRemaining(a, .unlimited);
+    defer a.free(contents);
+    try std.testing.expectEqualStrings("three\none\n", contents);
+}
+
+test "execute-multi force-plus file placeholders" {
+    const a = std.testing.allocator;
+    const blob = try a.dupe(u8, "one,two\nthree,four\n");
+    var options: Options = .{ .delimiter = "," };
+    defer options.deinit(a);
+    var candidates = try candidatesFromOwnedBlob(a, blob, &options);
+    defer candidates.deinit(a);
+    const selected = [_]bool{ true, true };
+    const order = [_]usize{ 1, 0 };
+    const matched = [_]usize{ 0, 1 };
+    var temp_files: std.ArrayList([]u8) = .empty;
+    defer {
+        for (temp_files.items) |file_path| {
+            Io.Dir.deleteFileAbsolute(std.testing.io, file_path) catch {};
+            a.free(file_path);
+        }
+        temp_files.deinit(a);
+    }
+
+    const got = try expandCommandImplWithForcePlus(a, "cat {f1}", "", &candidates, &options, 0, &order, &selected, &matched, "execute-multi", options.prompt, std.testing.io, &temp_files, true);
+    defer a.free(got);
+    try std.testing.expectEqual(@as(usize, 1), temp_files.items.len);
     const file = try Io.Dir.openFileAbsolute(std.testing.io, temp_files.items[0], .{});
     defer file.close(std.testing.io);
     var buffer: [256]u8 = undefined;
@@ -7806,6 +7887,8 @@ test "stateful binding actions parse" {
     try std.testing.expect((try parseAction("ToGgLe-SoRt")) == .toggle_sort);
     const mixed_execute = try parseAction("Execute-Silent(printf MiXeD)");
     try std.testing.expectEqualStrings("printf MiXeD", mixed_execute.execute_silent);
+    const mixed_execute_multi = try parseAction("Execute-Multi@printf multi@");
+    try std.testing.expectEqualStrings("printf multi", mixed_execute_multi.execute_multi);
     try std.testing.expect((try parseAction("enable-search")) == .enable_search);
     const q = try parseAction("change-query(foo bar)");
     try std.testing.expectEqualStrings("foo bar", q.change_query);
