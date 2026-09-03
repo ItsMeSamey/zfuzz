@@ -4544,6 +4544,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.query = a[8..];
             continue;
         }
+        if (std.mem.startsWith(u8, a, "-q") and a.len > 2) {
+            o.*.query = a[2..];
+            continue;
+        }
         if (std.mem.eql(u8, a, "-q") or std.mem.eql(u8, a, "--query")) {
             i += 1;
             if (i >= args.len) return error.MissingArgument;
@@ -4552,6 +4556,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
         }
         if (std.mem.startsWith(u8, a, "--filter=")) {
             o.*.filter = a[9..];
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "-f") and a.len > 2) {
+            o.*.filter = a[2..];
             continue;
         }
         if (std.mem.eql(u8, a, "-f") or std.mem.eql(u8, a, "--filter")) {
@@ -4735,6 +4743,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
         }
         if (std.mem.startsWith(u8, a, "--nth=")) {
             o.*.nth = a[6..];
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "-n") and a.len > 2) {
+            o.*.nth = a[2..];
             continue;
         }
         if (std.mem.eql(u8, a, "-n") or std.mem.eql(u8, a, "--nth")) {
@@ -7895,6 +7907,23 @@ test "sort option forms match fzf numeric semantics" {
     defer separate_negative.deinit(a);
     try std.testing.expect(!separate_negative.no_sort);
     try std.testing.expect(separate_negative.select_1);
+}
+
+test "compact query filter and nth options match fzf" {
+    const a = std.testing.allocator;
+    const args = [_][]const u8{ "zfuzz", "-qNeedle", "-fMatch", "-n2.." };
+    var options = try parseOptions(a, &args);
+    defer options.deinit(a);
+    try std.testing.expectEqualStrings("Needle", options.query);
+    try std.testing.expectEqualStrings("Match", options.filter.?);
+    try std.testing.expectEqualStrings("2..", options.nth.?);
+
+    const dash_values = [_][]const u8{ "zfuzz", "-q-x", "-f-y", "-n-1" };
+    var dashed = try parseOptions(a, &dash_values);
+    defer dashed.deinit(a);
+    try std.testing.expectEqualStrings("-x", dashed.query);
+    try std.testing.expectEqualStrings("-y", dashed.filter.?);
+    try std.testing.expectEqualStrings("-1", dashed.nth.?);
 }
 
 test "no-input option starts the existing input visibility state hidden" {
