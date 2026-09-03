@@ -82,6 +82,10 @@ const Action = union(enum) {
     down,
     page_up,
     page_down,
+    backward_word,
+    forward_word,
+    backward_kill_word,
+    kill_word,
     first,
     last,
     toggle,
@@ -503,6 +507,10 @@ const Key = union(enum) {
     end,
     page_up,
     page_down,
+    word_left,
+    word_right,
+    paste_start,
+    paste_end,
     delete,
     shift_tab,
     mouse: Mouse,
@@ -954,6 +962,14 @@ const Ui = struct {
     }
 
     fn handleKey(self: *Ui, key: Key) !?u8 {
+        switch (key) {
+            .paste_start => {
+                try self.readBracketedPaste();
+                return null;
+            },
+            .paste_end => return null,
+            else => {},
+        }
         var binding_handled = false;
         for (self.options.bindings.items) |binding| {
             if (std.mem.eql(u8, binding.trigger, "start") or std.mem.eql(u8, binding.trigger, "load") or
@@ -980,6 +996,8 @@ const Ui = struct {
             .down => self.move(1),
             .page_up => self.page(-1),
             .page_down => self.page(1),
+            .word_left => self.cursor = wordBoundaryBackward(self.query.items, self.cursor),
+            .word_right => self.cursor = wordBoundaryForward(self.query.items, self.cursor),
             .home => {
                 self.cursor = 0;
             },
@@ -1043,10 +1061,57 @@ const Ui = struct {
                     }
                 },
             },
-            .alt_byte => {},
+            .alt_byte => |b| switch (b) {
+                'b' => self.cursor = wordBoundaryBackward(self.query.items, self.cursor),
+                'f' => self.cursor = wordBoundaryForward(self.query.items, self.cursor),
+                else => {},
+            },
+            .paste_start, .paste_end => unreachable,
             .unknown => {},
         }
         return null;
+    }
+
+    fn readBracketedPaste(self: *Ui) !void {
+        const end_marker = "\x1b[201~";
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(self.allocator);
+        var matched: usize = 0;
+        var idle_timeouts: usize = 0;
+
+        while (true) {
+            const b = self.terminal.readByte() catch |err| switch (err) {
+                error.Timeout => {
+                    idle_timeouts += 1;
+                    if (idle_timeouts < 50) continue;
+                    if (matched != 0) try appendPastedBytes(self.allocator, &bytes, end_marker[0..matched]);
+                    break;
+                },
+                else => return err,
+            };
+            idle_timeouts = 0;
+
+            if (b == end_marker[matched]) {
+                matched += 1;
+                if (matched == end_marker.len) break;
+                continue;
+            }
+            if (matched != 0) {
+                try appendPastedBytes(self.allocator, &bytes, end_marker[0..matched]);
+                matched = 0;
+                if (b == end_marker[0]) {
+                    matched = 1;
+                    continue;
+                }
+            }
+            try appendPastedByte(self.allocator, &bytes, b);
+        }
+
+        if (bytes.items.len != 0) {
+            try self.query.insertSlice(self.allocator, self.cursor, bytes.items);
+            self.cursor += bytes.items.len;
+            self.markQueryChanged();
+        }
     }
 
     fn markQueryChanged(self: *Ui) void {
@@ -1219,6 +1284,19 @@ const Ui = struct {
             .down => self.move(1),
             .page_up => self.page(-1),
             .page_down => self.page(1),
+            .backward_word => self.cursor = wordBoundaryBackward(self.query.items, self.cursor),
+            .forward_word => self.cursor = wordBoundaryForward(self.query.items, self.cursor),
+            .backward_kill_word => {
+                self.deleteWordBackward();
+                self.markQueryChanged();
+            },
+            .kill_word => {
+                const end = wordBoundaryForward(self.query.items, self.cursor);
+                if (end != self.cursor) {
+                    try self.query.replaceRange(self.allocator, self.cursor, end - self.cursor, &.{});
+                    self.markQueryChanged();
+                }
+            },
             .first => if (self.result_len != 0) {
                 if (self.focus != 0) {
                     self.focus_event_pending = true;
@@ -3257,6 +3335,10 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "down")) return .down;
     if (std.mem.eql(u8, s, "page-up")) return .page_up;
     if (std.mem.eql(u8, s, "page-down")) return .page_down;
+    if (std.mem.eql(u8, s, "backward-word")) return .backward_word;
+    if (std.mem.eql(u8, s, "forward-word")) return .forward_word;
+    if (std.mem.eql(u8, s, "backward-kill-word")) return .backward_kill_word;
+    if (std.mem.eql(u8, s, "kill-word")) return .kill_word;
     if (std.mem.eql(u8, s, "first")) return .first;
     if (std.mem.eql(u8, s, "last")) return .last;
     if (std.mem.eql(u8, s, "toggle")) return .toggle;
@@ -4236,8 +4318,30 @@ fn readKey(t: *Terminal) !Key {
         else => return err,
     };
     if (b2 != '[') return .{ .alt_byte = b2 };
-    const b3 = try t.readByte();
-    return switch (b3) {
+    const first = t.readByte() catch |err| switch (err) {
+        error.Timeout => return .unknown,
+        else => return err,
+    };
+    if (first == '<') return try readMouse(t);
+
+    var params_buf: [48]u8 = undefined;
+    var len: usize = 0;
+    var c = first;
+    while (true) {
+        if (c >= 0x40 and c <= 0x7e) return decodeCsi(params_buf[0..len], c);
+        if (len < params_buf.len) {
+            params_buf[len] = c;
+            len += 1;
+        }
+        c = t.readByte() catch |err| switch (err) {
+            error.Timeout => return .unknown,
+            else => return err,
+        };
+    }
+}
+
+fn decodeCsi(params: []const u8, final: u8) Key {
+    if (params.len == 0) return switch (final) {
         'A' => .up,
         'B' => .down,
         'C' => .right,
@@ -4245,30 +4349,27 @@ fn readKey(t: *Terminal) !Key {
         'H' => .home,
         'F' => .end,
         'Z' => .shift_tab,
-        '<' => try readMouse(t),
-        '1', '2', '3', '4', '5', '6', '7', '8' => blk: {
-            var digits: [8]u8 = undefined;
-            digits[0] = b3;
-            var len: usize = 1;
-            while (len < digits.len) {
-                const x = try t.readByte();
-                if (x == '~') break;
-                if (x < '0' or x > '9') break;
-                digits[len] = x;
-                len += 1;
-            }
-            const code = std.fmt.parseInt(usize, digits[0..len], 10) catch 0;
-            break :blk switch (code) {
-                1, 7 => .home,
-                3 => .delete,
-                4, 8 => .end,
-                5 => .page_up,
-                6 => .page_down,
-                else => .unknown,
-            };
-        },
         else => .unknown,
     };
+
+    var pieces = std.mem.splitScalar(u8, params, ';');
+    const first_text = pieces.next() orelse "";
+    const first = std.fmt.parseInt(usize, first_text, 10) catch 0;
+    const modifier = if (pieces.next()) |text| std.fmt.parseInt(usize, text, 10) catch 0 else 0;
+    if ((final == 'C' or final == 'D') and first == 1 and (modifier == 3 or modifier == 5)) {
+        return if (final == 'C') .word_right else .word_left;
+    }
+    if (final == '~') return switch (first) {
+        1, 7 => .home,
+        3 => .delete,
+        4, 8 => .end,
+        5 => .page_up,
+        6 => .page_down,
+        200 => .paste_start,
+        201 => .paste_end,
+        else => .unknown,
+    };
+    return .unknown;
 }
 
 fn readMouse(t: *Terminal) !Key {
@@ -4299,6 +4400,32 @@ fn readMouse(t: *Terminal) !Key {
         return .unknown;
     }
     return .unknown;
+}
+
+fn appendPastedBytes(allocator: Allocator, out: *std.ArrayList(u8), bytes: []const u8) !void {
+    for (bytes) |b| try appendPastedByte(allocator, out, b);
+}
+
+fn appendPastedByte(allocator: Allocator, out: *std.ArrayList(u8), b: u8) !void {
+    if (b >= 32 or b >= 128) {
+        try out.append(allocator, b);
+    } else if (b == '\r' or b == '\n' or b == '\t') {
+        try out.append(allocator, ' ');
+    }
+}
+
+fn wordBoundaryBackward(s: []const u8, pos: usize) usize {
+    var p = pos;
+    while (p > 0 and std.ascii.isWhitespace(s[p - 1])) p -= 1;
+    while (p > 0 and !std.ascii.isWhitespace(s[p - 1])) p -= 1;
+    return p;
+}
+
+fn wordBoundaryForward(s: []const u8, pos: usize) usize {
+    var p = pos;
+    while (p < s.len and std.ascii.isWhitespace(s[p])) p += 1;
+    while (p < s.len and !std.ascii.isWhitespace(s[p])) p += 1;
+    return p;
 }
 
 fn prevUtf8Boundary(s: []const u8, pos: usize) usize {
@@ -4795,6 +4922,19 @@ test "binding parser" {
     try std.testing.expectEqualStrings("printf 'a,b'", bindings.items[0].action.reload);
     try std.testing.expectEqualStrings("ready", bindings.items[1].action.change_header);
     try std.testing.expect(bindings.items[2].action == .accept);
+}
+
+test "CSI decoder consumes modified keys and bracketed paste markers" {
+    try std.testing.expect(decodeCsi("1;3", 'D') == .word_left);
+    try std.testing.expect(decodeCsi("1;5", 'C') == .word_right);
+    try std.testing.expect(decodeCsi("200", '~') == .paste_start);
+    try std.testing.expect(decodeCsi("201", '~') == .paste_end);
+    try std.testing.expect(decodeCsi("?2004;1$", 'y') == .unknown);
+}
+
+test "word boundaries follow whitespace-separated editing" {
+    try std.testing.expectEqual(@as(usize, 4), wordBoundaryBackward("foo bar baz", 7));
+    try std.testing.expectEqual(@as(usize, 7), wordBoundaryForward("foo bar baz", 4));
 }
 
 test "every event interval parsing" {
