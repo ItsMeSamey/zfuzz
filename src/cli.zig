@@ -723,26 +723,42 @@ const BackgroundQueue = struct {
     }
 };
 
+const ExpandedCommand = struct {
+    allocator: Allocator,
+    io: Io,
+    text: []u8,
+    temp_files: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *ExpandedCommand) void {
+        for (self.temp_files.items) |path| {
+            Io.Dir.deleteFileAbsolute(self.io, path) catch {};
+            self.allocator.free(path);
+        }
+        self.temp_files.deinit(self.allocator);
+        self.allocator.free(self.text);
+    }
+};
+
 const BackgroundContext = struct {
     queue: *BackgroundQueue,
     allocator: Allocator,
     io: Io,
     kind: BackgroundKind,
     generation: u64,
-    command: []u8,
+    expanded: ExpandedCommand,
     env: std.process.Environ.Map,
 };
 
 fn backgroundTransformThread(ctx: *BackgroundContext) void {
     const allocator = ctx.allocator;
     defer {
-        allocator.free(ctx.command);
+        ctx.expanded.deinit();
         ctx.env.deinit();
         allocator.destroy(ctx);
     }
     const max_stdout: usize = if (ctx.kind == .reload) 64 * 1024 * 1024 else 1024 * 1024;
     const result = std.process.run(allocator, ctx.io, .{
-        .argv = &.{ "/bin/sh", "-c", ctx.command },
+        .argv = &.{ "/bin/sh", "-c", ctx.expanded.text },
         .environ_map = &ctx.env,
         .stdout_limit = .limited(max_stdout),
         .stderr_limit = .limited(1024 * 1024),
@@ -1770,12 +1786,12 @@ const Ui = struct {
     }
 
     fn launchBackgroundCommand(self: *Ui, kind: BackgroundKind, command: []const u8, generation: u64) !void {
-        const expanded = try self.expandedCommand(command);
-        errdefer self.allocator.free(expanded);
+        var expanded = try self.expandedCommand(command);
+        errdefer expanded.deinit();
         var env = try self.commandEnvironment();
         errdefer env.deinit();
         if (!self.bg_queue.begin()) {
-            self.allocator.free(expanded);
+            expanded.deinit();
             env.deinit();
             return;
         }
@@ -1790,7 +1806,7 @@ const Ui = struct {
             .io = self.io,
             .kind = kind,
             .generation = generation,
-            .command = expanded,
+            .expanded = expanded,
             .env = env,
         };
         const thread = std.Thread.spawn(.{}, backgroundTransformThread, .{ctx}) catch |err| {
@@ -1811,12 +1827,12 @@ const Ui = struct {
     }
 
     fn runTransformCommand(self: *Ui, command: []const u8) ![]u8 {
-        const expanded = try self.expandedCommand(command);
-        defer self.allocator.free(expanded);
+        var expanded = try self.expandedCommand(command);
+        defer expanded.deinit();
         var env = try self.commandEnvironment();
         defer env.deinit();
         const result = try std.process.run(self.allocator, self.io, .{
-            .argv = &.{ "/bin/sh", "-c", expanded },
+            .argv = &.{ "/bin/sh", "-c", expanded.text },
             .environ_map = &env,
             .stdout_limit = .limited(1024 * 1024),
             .stderr_limit = .limited(1024 * 1024),
@@ -1858,9 +1874,17 @@ const Ui = struct {
         return self.candidates.output[self.results[self.focus]];
     }
 
-    fn expandedCommand(self: *Ui, command: []const u8) ![]u8 {
+    fn expandedCommand(self: *Ui, command: []const u8) !ExpandedCommand {
         const current_idx: ?usize = if (self.result_len == 0) null else self.results[self.focus];
-        return expandCommand(
+        var temp_files: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (temp_files.items) |path| {
+                Io.Dir.deleteFileAbsolute(self.io, path) catch {};
+                self.allocator.free(path);
+            }
+            temp_files.deinit(self.allocator);
+        }
+        const text = try expandCommandImpl(
             self.allocator,
             command,
             self.query.items,
@@ -1869,7 +1893,10 @@ const Ui = struct {
             current_idx,
             self.selection_order.items,
             self.selected,
+            self.io,
+            &temp_files,
         );
+        return .{ .allocator = self.allocator, .io = self.io, .text = text, .temp_files = temp_files };
     }
 
     fn replaceCandidates(self: *Ui, new_candidates: CandidateSet, new_index: fuzzy.Index, mark_load: bool) !void {
@@ -1966,12 +1993,12 @@ const Ui = struct {
 
     fn reloadFromCommand(self: *Ui, command: []const u8) !void {
         self.stream = null;
-        const expanded = try self.expandedCommand(command);
-        defer self.allocator.free(expanded);
+        var expanded = try self.expandedCommand(command);
+        defer expanded.deinit();
         var env = try self.commandEnvironment();
         defer env.deinit();
         const result = try std.process.run(self.allocator, self.io, .{
-            .argv = &.{ "/bin/sh", "-c", expanded },
+            .argv = &.{ "/bin/sh", "-c", expanded.text },
             .environ_map = &env,
             .stdout_limit = .limited(64 * 1024 * 1024),
             .stderr_limit = .limited(1024 * 1024),
@@ -1985,13 +2012,13 @@ const Ui = struct {
     }
 
     fn executeCommand(self: *Ui, command: []const u8, silent: bool) !void {
-        const expanded = try self.expandedCommand(command);
-        defer self.allocator.free(expanded);
+        var expanded = try self.expandedCommand(command);
+        defer expanded.deinit();
         var env = try self.commandEnvironment();
         defer env.deinit();
         if (silent) {
             const result = try std.process.run(self.allocator, self.io, .{
-                .argv = &.{ "/bin/sh", "-c", expanded },
+                .argv = &.{ "/bin/sh", "-c", expanded.text },
                 .environ_map = &env,
                 .stdout_limit = .limited(1024 * 1024),
                 .stderr_limit = .limited(1024 * 1024),
@@ -2003,7 +2030,7 @@ const Ui = struct {
         self.terminal.leave();
         defer self.terminal.enter() catch {};
         var child = try std.process.spawn(self.io, .{
-            .argv = &.{ "/bin/sh", "-c", expanded },
+            .argv = &.{ "/bin/sh", "-c", expanded.text },
             .environ_map = &env,
             .stdin = .{ .file = self.terminal.file },
             .stdout = .{ .file = self.terminal.file },
@@ -2014,13 +2041,13 @@ const Ui = struct {
     }
 
     fn becomeCommand(self: *Ui, command: []const u8) !u8 {
-        const expanded = try self.expandedCommand(command);
-        defer self.allocator.free(expanded);
+        var expanded = try self.expandedCommand(command);
+        defer expanded.deinit();
         var env = try self.commandEnvironment();
         defer env.deinit();
         self.terminal.leave();
         var child = try std.process.spawn(self.io, .{
-            .argv = &.{ "/bin/sh", "-c", expanded },
+            .argv = &.{ "/bin/sh", "-c", expanded.text },
             .environ_map = &env,
             .stdin = .{ .file = self.terminal.file },
             .stdout = .{ .file = self.terminal.file },
@@ -2588,11 +2615,13 @@ const Ui = struct {
         const idx = self.results[self.focus];
         const qhash = std.hash.Wyhash.hash(0, self.query.items);
         if (self.preview_cache_key == idx and self.preview_cache_query_hash == qhash) return;
-        const expanded = try self.expandedCommand(cmd_template);
-        defer self.allocator.free(expanded);
+        var expanded = try self.expandedCommand(cmd_template);
+        defer expanded.deinit();
+        var env = try self.commandEnvironment();
+        defer env.deinit();
         const result = std.process.run(self.allocator, self.io, .{
-            .argv = &.{ "/bin/sh", "-c", expanded },
-            .environ_map = self.child_env,
+            .argv = &.{ "/bin/sh", "-c", expanded.text },
+            .environ_map = &env,
             .stdout_limit = .limited(512 * 1024),
             .stderr_limit = .limited(128 * 1024),
         }) catch {
@@ -5088,6 +5117,21 @@ fn expandCommand(
     selection_order: []const usize,
     selected: []const bool,
 ) ![]u8 {
+    return expandCommandImpl(allocator, template, query, candidates, options, current_idx, selection_order, selected, null, null);
+}
+
+fn expandCommandImpl(
+    allocator: Allocator,
+    template: []const u8,
+    query: []const u8,
+    candidates: *const CandidateSet,
+    options: *const Options,
+    current_idx: ?usize,
+    selection_order: []const usize,
+    selected: []const bool,
+    io: ?Io,
+    temp_files: ?*std.ArrayList([]u8),
+) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var i: usize = 0;
@@ -5105,20 +5149,118 @@ fn expandCommand(
         const expr = template[i + 1 .. close];
         if (std.mem.eql(u8, expr, "q")) {
             try appendShellQuoted(allocator, &out, query);
-        } else if (std.mem.eql(u8, expr, "")) {
-            if (current_idx) |idx| try appendShellQuoted(allocator, &out, candidates.output[idx]);
-        } else if (std.mem.eql(u8, expr, "n")) {
-            if (current_idx) |idx| try appendDecimal(allocator, &out, idx);
-        } else if (expr.len != 0 and expr[0] == '+') {
-            try appendSelectedPlaceholder(allocator, &out, expr[1..], candidates, options, current_idx, selection_order, selected);
-        } else if (current_idx) |idx| {
-            const transformed = try transformFields(allocator, candidates.output[idx], options.delimiter, expr, idx);
-            defer allocator.free(transformed);
-            try appendShellQuoted(allocator, &out, transformed);
+        } else {
+            const plus = expr.len != 0 and expr[0] == '+';
+            var body = if (plus) expr[1..] else expr;
+            const file = body.len != 0 and body[0] == 'f';
+            if (file) body = body[1..];
+
+            if (file) {
+                const actual_io = io orelse return error.FilePlaceholderUnavailable;
+                const files = temp_files orelse return error.FilePlaceholderUnavailable;
+                try appendFilePlaceholder(allocator, &out, actual_io, files, body, plus, candidates, options, current_idx, selection_order, selected);
+            } else if (plus) {
+                try appendSelectedPlaceholder(allocator, &out, body, candidates, options, current_idx, selection_order, selected);
+            } else if (body.len == 0) {
+                if (current_idx) |idx| try appendShellQuoted(allocator, &out, candidates.output[idx]);
+            } else if (std.mem.eql(u8, body, "n")) {
+                if (current_idx) |idx| try appendDecimal(allocator, &out, idx);
+            } else if (current_idx) |idx| {
+                const transformed = try transformFields(allocator, candidates.output[idx], options.delimiter, body, idx);
+                defer allocator.free(transformed);
+                try appendShellQuoted(allocator, &out, transformed);
+            }
         }
         i = close + 1;
     }
     return try out.toOwnedSlice(allocator);
+}
+
+var placeholder_file_counter: std.atomic.Value(u64) = .init(0);
+
+fn appendFilePlaceholder(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    io: Io,
+    temp_files: *std.ArrayList([]u8),
+    expr: []const u8,
+    plus: bool,
+    candidates: *const CandidateSet,
+    options: *const Options,
+    current_idx: ?usize,
+    selection_order: []const usize,
+    selected: []const bool,
+) !void {
+    var path: ?[]u8 = null;
+    var file: ?Io.File = null;
+    var attempt: usize = 0;
+    while (attempt < 32) : (attempt += 1) {
+        const serial = placeholder_file_counter.fetchAdd(1, .monotonic);
+        const candidate_path = try std.fmt.allocPrint(allocator, "/tmp/zfuzz-{d}-{d}.tmp", .{ std.c.getpid(), serial });
+        const opened = Io.Dir.createFileAbsolute(io, candidate_path, .{ .exclusive = true, .permissions = @enumFromInt(0o600) }) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                allocator.free(candidate_path);
+                continue;
+            },
+            else => {
+                allocator.free(candidate_path);
+                return err;
+            },
+        };
+        path = candidate_path;
+        file = opened;
+        break;
+    }
+    const file_path = path orelse return error.TemporaryFileUnavailable;
+    var owned_by_list = false;
+    errdefer if (!owned_by_list) {
+        if (file) |opened| opened.close(io);
+        Io.Dir.deleteFileAbsolute(io, file_path) catch {};
+        allocator.free(file_path);
+    };
+
+    var buffer: [8192]u8 = undefined;
+    var writer = file.?.writerStreaming(io, &buffer);
+    const sep: []const u8 = if (options.print0) "\x00" else "\n";
+    var wrote = false;
+
+    if (plus) {
+        for (selection_order) |idx_value| {
+            if (idx_value >= selected.len or !selected[idx_value]) continue;
+            try writePlaceholderValue(allocator, &writer.interface, expr, candidates, options, idx_value);
+            try writer.interface.writeAll(sep);
+            wrote = true;
+        }
+    }
+    if (!wrote) if (current_idx) |idx_value| {
+        try writePlaceholderValue(allocator, &writer.interface, expr, candidates, options, idx_value);
+        try writer.interface.writeAll(sep);
+    };
+    try writer.flush();
+    file.?.close(io);
+    file = null;
+
+    try temp_files.append(allocator, file_path);
+    owned_by_list = true;
+    try appendShellQuoted(allocator, out, file_path);
+}
+
+fn writePlaceholderValue(
+    allocator: Allocator,
+    writer: *Io.Writer,
+    expr: []const u8,
+    candidates: *const CandidateSet,
+    options: *const Options,
+    idx: usize,
+) !void {
+    if (expr.len == 0) return writer.writeAll(candidates.output[idx]);
+    if (std.mem.eql(u8, expr, "n")) {
+        var buf: [32]u8 = undefined;
+        return writer.writeAll(try std.fmt.bufPrint(&buf, "{d}", .{idx}));
+    }
+    const transformed = try transformFields(allocator, candidates.output[idx], options.delimiter, expr, idx);
+    defer allocator.free(transformed);
+    try writer.writeAll(transformed);
 }
 
 fn appendSelectedPlaceholder(
@@ -5371,6 +5513,38 @@ test "selected and field command placeholders" {
     const got = try expandCommand(a, "echo {n} {1} {+} {+2} {q}", "x y", &candidates, &options, 0, &order, &selected);
     defer a.free(got);
     try std.testing.expectEqualStrings("echo 0 'one' 'three,four' 'one,two' 'four' 'two' 'x y'", got);
+}
+
+test "file placeholders materialize selected fields" {
+    const a = std.testing.allocator;
+    const blob = try a.dupe(u8, "one,two\nthree,four\n");
+    var options: Options = .{ .delimiter = "," };
+    defer options.deinit(a);
+    var candidates = try candidatesFromOwnedBlob(a, blob, &options);
+    defer candidates.deinit(a);
+    const selected = [_]bool{ true, true };
+    const order = [_]usize{ 1, 0 };
+    var temp_files: std.ArrayList([]u8) = .empty;
+    defer {
+        for (temp_files.items) |path| {
+            Io.Dir.deleteFileAbsolute(std.testing.io, path) catch {};
+            a.free(path);
+        }
+        temp_files.deinit(a);
+    }
+
+    const got = try expandCommandImpl(a, "cat {+f1}", "", &candidates, &options, 0, &order, &selected, std.testing.io, &temp_files);
+    defer a.free(got);
+    try std.testing.expectEqual(@as(usize, 1), temp_files.items.len);
+    try std.testing.expect(std.mem.startsWith(u8, got, "cat '/tmp/zfuzz-"));
+
+    const file = try Io.Dir.openFileAbsolute(std.testing.io, temp_files.items[0], .{});
+    defer file.close(std.testing.io);
+    var buffer: [256]u8 = undefined;
+    var reader = file.reader(std.testing.io, &buffer);
+    const contents = try reader.interface.allocRemaining(a, .unlimited);
+    defer a.free(contents);
+    try std.testing.expectEqualStrings("three\none\n", contents);
 }
 
 test "field transforms" {
