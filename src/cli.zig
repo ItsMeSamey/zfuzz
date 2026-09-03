@@ -27,6 +27,11 @@ const Insets = struct {
     left: SizeSpec = .{},
 };
 
+const LabelPosition = struct {
+    column: i16 = 0,
+    bottom: bool = false,
+};
+
 const Color = union(enum) {
     ansi: u8,
     rgb: struct { r: u8, g: u8, b: u8 },
@@ -66,6 +71,9 @@ const PreviewOptions = struct {
     percent: u8 = 50,
     hidden: bool = false,
     wrap: bool = true,
+    border_style: BorderStyle = .rounded,
+    label: ?[]const u8 = null,
+    label_pos: LabelPosition = .{},
 };
 
 const Action = union(enum) {
@@ -137,6 +145,8 @@ const Options = struct {
     style_preset: StylePreset = .default,
     border: bool = true,
     border_style: BorderStyle = .rounded,
+    border_label: ?[]const u8 = null,
+    border_label_pos: LabelPosition = .{},
     bold: bool = true,
     theme: Theme = .{},
     info_style: InfoStyle = .default,
@@ -1141,7 +1151,10 @@ const Ui = struct {
             try w.writeAll("\x1b[H\x1b[2J");
         }
 
-        if (self.options.border) try drawPaneBorder(w, geom.main, self.terminal.inline_mode, self.options.border_style, self.options.theme.border, self.options.theme.enabled, self.options.bold);
+        if (self.options.border) {
+            try drawPaneBorder(w, geom.main, self.terminal.inline_mode, self.options.border_style, self.options.theme.border, self.options.theme.enabled, self.options.bold);
+            if (self.options.border_label) |label| try drawBorderLabel(w, geom.main, self.terminal.inline_mode, self.options.border_style, label, self.options.border_label_pos, self.options.theme.border, self.options.theme.enabled, self.options.bold);
+        }
         const content = self.contentPane(geom.main);
         var row = content.row;
         if (self.options.layout == .reverse) {
@@ -1315,20 +1328,28 @@ const Ui = struct {
     }
 
     fn renderPreviewOverlay(self: *Ui, frame: *Io.Writer.Allocating, size: anytype, geom: PaneGeometry, preview: Pane) !void {
+        _ = size;
+        _ = geom;
         const w = &frame.writer;
-        switch (self.options.preview.position) {
-            .right => try drawVerticalSeparator(w, 1, size.rows, preview.col - 1, self.terminal.inline_mode, self.options.theme.preview_border, self.options.theme.enabled, self.options.bold),
-            .left => try drawVerticalSeparator(w, 1, size.rows, geom.main.col - 1, self.terminal.inline_mode, self.options.theme.preview_border, self.options.theme.enabled, self.options.bold),
-            .down => try drawHorizontalSeparator(w, preview.row - 1, 1, size.cols, self.terminal.inline_mode, self.options.theme.preview_border, self.options.theme.enabled, self.options.bold),
-            .up => try drawHorizontalSeparator(w, geom.main.row - 1, 1, size.cols, self.terminal.inline_mode, self.options.theme.preview_border, self.options.theme.enabled, self.options.bold),
+        var content = preview;
+        if (self.options.preview.border_style != .none) {
+            try drawPaneBorder(w, preview, self.terminal.inline_mode, self.options.preview.border_style, self.options.theme.preview_border, self.options.theme.enabled, self.options.bold);
+            if (self.options.preview.label) |label| try drawBorderLabel(w, preview, self.terminal.inline_mode, self.options.preview.border_style, label, self.options.preview.label_pos, self.options.theme.preview_border, self.options.theme.enabled, self.options.bold);
+            const sides = borderSides(self.options.preview.border_style);
+            content = insetPane(content, .{
+                .top = .{ .value = @intFromBool(sides.top) },
+                .right = .{ .value = @intFromBool(sides.right) },
+                .bottom = .{ .value = @intFromBool(sides.bottom) },
+                .left = .{ .value = @intFromBool(sides.left) },
+            });
         }
 
         var lines = std.mem.splitScalar(u8, self.preview_text, '\n');
         var row: usize = 0;
-        while (row < preview.rows) : (row += 1) {
+        while (row < content.rows) : (row += 1) {
             const line = lines.next() orelse break;
-            try cursorTo(w, preview.row + row, preview.col, self.terminal.inline_mode);
-            try writeTruncated(w, line, preview.cols, self.options.preview.wrap, "");
+            try cursorTo(w, content.row + row, content.col, self.terminal.inline_mode);
+            try writeTruncated(w, line, content.cols, self.options.preview.wrap, "");
         }
     }
 };
@@ -1411,23 +1432,30 @@ fn drawPaneBorder(w: anytype, pane: Pane, inline_mode: bool, style: BorderStyle,
     try writeReset(w);
 }
 
-fn drawVerticalSeparator(w: anytype, first_row: usize, rows: usize, col: usize, inline_mode: bool, role: RoleStyle, colors: bool, bold_enabled: bool) !void {
-    if (col == 0) return;
-    try writeRoleStyle(w, role, colors, bold_enabled);
-    var r: usize = 0;
-    while (r < rows) : (r += 1) {
-        try cursorTo(w, first_row + r, col, inline_mode);
-        try w.writeAll("│");
+fn drawBorderLabel(w: anytype, pane: Pane, inline_mode: bool, style: BorderStyle, label: []const u8, pos: LabelPosition, role: RoleStyle, colors: bool, bold_enabled: bool) !void {
+    if (label.len == 0 or pane.cols < 3 or style == .none) return;
+    const sides = borderSides(style);
+    if (pos.bottom) {
+        if (!sides.bottom) return;
+    } else if (!sides.top) return;
+    const max_len = pane.cols - 2;
+    const shown = label[0..@min(label.len, max_len)];
+    const inner_start = pane.col + 1;
+    const inner_end = pane.col + pane.cols - 1;
+    var col: usize = undefined;
+    if (pos.column == 0) {
+        col = pane.col + (pane.cols - shown.len) / 2;
+    } else if (pos.column > 0) {
+        col = pane.col + @as(usize, @intCast(pos.column));
+    } else {
+        const from_right: usize = @intCast(-@as(i32, pos.column));
+        col = if (inner_end > shown.len + from_right) inner_end - shown.len - from_right else inner_start;
     }
-    try writeReset(w);
-}
-
-fn drawHorizontalSeparator(w: anytype, row: usize, first_col: usize, cols: usize, inline_mode: bool, role: RoleStyle, colors: bool, bold_enabled: bool) !void {
-    if (row == 0) return;
-    try cursorTo(w, row, first_col, inline_mode);
+    col = std.math.clamp(col, inner_start, @max(inner_start, inner_end - shown.len));
+    const row = if (pos.bottom) pane.row + pane.rows - 1 else pane.row;
+    try cursorTo(w, row, col, inline_mode);
     try writeRoleStyle(w, role, colors, bold_enabled);
-    var c: usize = 0;
-    while (c < cols) : (c += 1) try w.writeAll("─");
+    try w.writeAll(shown);
     try writeReset(w);
 }
 
@@ -1601,6 +1629,15 @@ fn parseInsets(text: []const u8) !Insets {
     };
 }
 
+fn parseLabelPosition(text: []const u8) !LabelPosition {
+    var out: LabelPosition = .{};
+    var it = std.mem.tokenizeAny(u8, text, ":,");
+    while (it.next()) |part| {
+        if (std.ascii.eqlIgnoreCase(part, "center")) out.column = 0 else if (std.ascii.eqlIgnoreCase(part, "bottom")) out.bottom = true else if (std.ascii.eqlIgnoreCase(part, "top")) out.bottom = false else out.column = try std.fmt.parseInt(i16, part, 10);
+    }
+    return out;
+}
+
 fn parseInfoOption(options: *Options, text: []const u8) !void {
     if (std.ascii.eqlIgnoreCase(text, "default")) {
         options.info_style = .default;
@@ -1648,14 +1685,17 @@ fn applyStylePreset(options: *Options, text: []const u8) !void {
         options.style_preset = .default;
         options.border = true;
         options.border_style = .rounded;
+        options.preview.border_style = .rounded;
     } else if (std.ascii.eqlIgnoreCase(preset, "minimal")) {
         options.style_preset = .minimal;
         options.border = false;
         options.border_style = .none;
+        options.preview.border_style = .none;
     } else if (std.ascii.eqlIgnoreCase(preset, "full")) {
         options.style_preset = .full;
         options.border = true;
         options.border_style = .rounded;
+        options.preview.border_style = .rounded;
     } else return error.InvalidStylePreset;
     if (parts.next()) |border| {
         options.border_style = try parseBorderStyle(border);
@@ -2017,6 +2057,26 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.border_style = .none;
             continue;
         }
+        if (std.mem.startsWith(u8, a, "--border-label=")) {
+            o.*.border_label = a[15..];
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--border-label")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.border_label = args[i];
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--border-label-pos=")) {
+            o.*.border_label_pos = try parseLabelPosition(a[19..]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--border-label-pos")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.border_label_pos = try parseLabelPosition(args[i]);
+            continue;
+        }
         if (std.mem.eql(u8, a, "--reverse") or std.mem.eql(u8, a, "--layout=reverse")) {
             o.*.layout = .reverse;
             continue;
@@ -2092,6 +2152,38 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
         }
         if (std.mem.startsWith(u8, a, "--preview-window=")) {
             parsePreviewWindow(&o.*.preview, a[17..]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--preview-border")) {
+            o.*.preview.border_style = .rounded;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--preview-border=")) {
+            o.*.preview.border_style = try parseBorderStyle(a[17..]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-preview-border")) {
+            o.*.preview.border_style = .none;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--preview-label=")) {
+            o.*.preview.label = a[16..];
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--preview-label")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.preview.label = args[i];
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--preview-label-pos=")) {
+            o.*.preview.label_pos = try parseLabelPosition(a[20..]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--preview-label-pos")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.preview.label_pos = try parseLabelPosition(args[i]);
             continue;
         }
         if (std.mem.startsWith(u8, a, "--delimiter=")) {
@@ -2303,7 +2395,7 @@ fn parsePercent(s: []const u8) u8 {
 fn parsePreviewWindow(p: *PreviewOptions, spec: []const u8) void {
     var it = std.mem.splitScalar(u8, spec, ',');
     while (it.next()) |part| {
-        if (std.mem.eql(u8, part, "right")) p.position = .right else if (std.mem.eql(u8, part, "left")) p.position = .left else if (std.mem.eql(u8, part, "up")) p.position = .up else if (std.mem.eql(u8, part, "down")) p.position = .down else if (std.mem.eql(u8, part, "hidden")) p.hidden = true else if (std.mem.eql(u8, part, "nohidden")) p.hidden = false else if (std.mem.eql(u8, part, "wrap")) p.wrap = true else if (std.mem.eql(u8, part, "nowrap")) p.wrap = false else if (std.mem.endsWith(u8, part, "%")) p.percent = parsePercent(part);
+        if (std.mem.eql(u8, part, "right")) p.position = .right else if (std.mem.eql(u8, part, "left")) p.position = .left else if (std.mem.eql(u8, part, "up")) p.position = .up else if (std.mem.eql(u8, part, "down")) p.position = .down else if (std.mem.eql(u8, part, "hidden")) p.hidden = true else if (std.mem.eql(u8, part, "nohidden")) p.hidden = false else if (std.mem.eql(u8, part, "wrap")) p.wrap = true else if (std.mem.eql(u8, part, "nowrap")) p.wrap = false else if (std.mem.startsWith(u8, part, "border-")) p.border_style = parseBorderStyle(part[7..]) catch p.border_style else if (std.mem.endsWith(u8, part, "%")) p.percent = parsePercent(part);
     }
 }
 
@@ -3717,4 +3809,30 @@ test "inset pane resolves absolute and percentage margins" {
     try std.testing.expectEqual(@as(usize, 11), out.col);
     try std.testing.expectEqual(@as(usize, 14), out.rows);
     try std.testing.expectEqual(@as(usize, 85), out.cols);
+}
+
+test "finder and preview border labels parse" {
+    const a = std.testing.allocator;
+    const args = [_][]const u8{
+        "zfuzz",
+        "--border=double",
+        "--border-label= finder ",
+        "--border-label-pos=-2:bottom",
+        "--preview-border=sharp",
+        "--preview-label= preview ",
+        "--preview-label-pos=3:top",
+        "--preview-window=left,40%,border-dashed",
+    };
+    var options = try parseOptions(a, &args);
+    defer options.deinit(a);
+    try std.testing.expectEqual(BorderStyle.double, options.border_style);
+    try std.testing.expectEqualStrings(" finder ", options.border_label.?);
+    try std.testing.expectEqual(@as(i16, -2), options.border_label_pos.column);
+    try std.testing.expect(options.border_label_pos.bottom);
+    try std.testing.expectEqualStrings(" preview ", options.preview.label.?);
+    try std.testing.expectEqual(@as(i16, 3), options.preview.label_pos.column);
+    try std.testing.expect(!options.preview.label_pos.bottom);
+    try std.testing.expectEqual(PreviewPosition.left, options.preview.position);
+    try std.testing.expectEqual(@as(u8, 40), options.preview.percent);
+    try std.testing.expectEqual(BorderStyle.dashed, options.preview.border_style);
 }
