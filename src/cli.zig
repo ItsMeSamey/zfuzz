@@ -210,6 +210,7 @@ const Options = struct {
     extended: bool = true,
     exact: bool = false,
     case_mode: CaseMode = .smart,
+    literal: bool = false,
     scheme: Scheme = .default,
     tac: bool = false,
     tail: ?usize = null,
@@ -261,6 +262,7 @@ const CandidateSet = struct {
     search: [][]const u8,
     owned_display: bool,
     owned_search: bool,
+    has_non_ascii: bool,
 
     fn deinit(self: *CandidateSet, allocator: Allocator) void {
         if (self.owned_search) {
@@ -3354,6 +3356,14 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.case_mode = .smart;
             continue;
         }
+        if (std.mem.eql(u8, a, "--literal")) {
+            o.*.literal = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-literal")) {
+            o.*.literal = false;
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--scheme=")) {
             try applyScheme(o, a[9..]);
             continue;
@@ -4177,6 +4187,11 @@ fn readTailBlobStdin(allocator: Allocator, tail: usize, header_lines: usize, del
     return blob;
 }
 
+fn anyNonAscii(lines: []const []const u8) bool {
+    for (lines) |line| if (fuzzy_engine.cliTextHasNonAscii(line)) return true;
+    return false;
+}
+
 fn candidatesFromOwnedBlob(allocator: Allocator, blob: []u8, options: *const Options) !CandidateSet {
     errdefer allocator.free(blob);
     const delim: u8 = if (options.read0) 0 else '\n';
@@ -4235,7 +4250,7 @@ fn candidatesFromOwnedBlob(allocator: Allocator, blob: []u8, options: *const Opt
 
     const base_search = if (options.with_nth != null) display else output;
     if (options.nth == null and !options.ansi) {
-        return .{ .blob = blob, .header = header, .output = output, .display = display, .search = base_search, .owned_display = owned_display, .owned_search = false };
+        return .{ .blob = blob, .header = header, .output = output, .display = display, .search = base_search, .owned_display = owned_display, .owned_search = false, .has_non_ascii = anyNonAscii(base_search) };
     }
 
     const search = try allocator.alloc([]const u8, count);
@@ -4257,7 +4272,7 @@ fn candidatesFromOwnedBlob(allocator: Allocator, blob: []u8, options: *const Opt
         }
         built_search += 1;
     }
-    return .{ .blob = blob, .header = header, .output = output, .display = display, .search = search, .owned_display = owned_display, .owned_search = true };
+    return .{ .blob = blob, .header = header, .output = output, .display = display, .search = search, .owned_display = owned_display, .owned_search = true, .has_non_ascii = anyNonAscii(search) };
 }
 
 const TermKind = enum { fuzzy, exact, prefix, suffix, boundary_exact, equal };
@@ -4283,6 +4298,7 @@ const CandidateScore = struct {
     min_end: usize = std.math.maxInt(usize),
     max_end: usize = 0,
     valid_offset: bool = false,
+    rune_offsets: bool = false,
 
     fn add(self: *CandidateScore, matched: fuzzy_engine.CliMatch) void {
         self.score += matched.score;
@@ -4313,7 +4329,84 @@ fn trimLength(line: []const u8) usize {
     return end - start;
 }
 
+fn runeTrimLength(line: []const u8) usize {
+    var it = std.unicode.Utf8Iterator{ .bytes = line, .i = 0 };
+    var count: usize = 0;
+    var leading: usize = 0;
+    var last_non_white: ?usize = null;
+    var still_leading = true;
+    while (it.nextCodepoint()) |cp| : (count += 1) {
+        const white = fuzzy_engine.cliRuneIsWhitespace(cp);
+        if (still_leading and white) leading += 1 else still_leading = false;
+        if (!white) last_non_white = count;
+    }
+    const end = if (last_non_white) |last| last + 1 else leading;
+    return end -| leading;
+}
+
+fn runeChunkLength(line: []const u8, begin_match: usize, end_match: usize) usize {
+    var it = std.unicode.Utf8Iterator{ .bytes = line, .i = 0 };
+    var rune_index: usize = 0;
+    var chunk_begin: usize = 0;
+    var chunk_end: ?usize = null;
+    var last_white_end: usize = 0;
+    while (it.nextCodepoint()) |cp| : (rune_index += 1) {
+        const white = fuzzy_engine.cliRuneIsWhitespace(cp);
+        if (rune_index < begin_match and white) last_white_end = rune_index + 1;
+        if (rune_index >= end_match and white and chunk_end == null) chunk_end = rune_index;
+    }
+    chunk_begin = last_white_end;
+    return (chunk_end orelse rune_index) - chunk_begin;
+}
+
+fn runeLastPathDelimiter(line: []const u8) ?usize {
+    var it = std.unicode.Utf8Iterator{ .bytes = line, .i = 0 };
+    var rune_index: usize = 0;
+    var last: ?usize = null;
+    while (it.nextCodepoint()) |cp| : (rune_index += 1) {
+        if (cp == '/' or cp == '\\') last = rune_index;
+    }
+    return last;
+}
+
+fn runeWhitePrefix(line: []const u8, match_begin: usize) usize {
+    var it = std.unicode.Utf8Iterator{ .bytes = line, .i = 0 };
+    var rune_index: usize = 0;
+    while (it.nextCodepoint()) |cp| : (rune_index += 1) {
+        if (rune_index == match_begin or !fuzzy_engine.cliRuneIsWhitespace(cp)) return rune_index;
+    }
+    return rune_index;
+}
+
+fn runeTiebreakValue(kind: TieBreak, line: []const u8, score: CandidateScore) usize {
+    const invalid = std.math.maxInt(usize);
+    return switch (kind) {
+        .length => runeTrimLength(line),
+        .chunk => if (!score.valid_offset) invalid else runeChunkLength(line, score.min_begin, score.max_end),
+        .pathname => blk: {
+            if (!score.valid_offset) break :blk invalid;
+            if (runeLastPathDelimiter(line)) |delim| {
+                if (delim > score.min_begin) break :blk invalid;
+                break :blk score.min_begin - delim;
+            }
+            break :blk score.min_begin + 1;
+        },
+        .begin => blk: {
+            if (!score.valid_offset) break :blk invalid;
+            break :blk score.min_end -| runeWhitePrefix(line, score.min_begin);
+        },
+        .end => blk: {
+            if (!score.valid_offset) break :blk invalid;
+            const white_prefix = runeWhitePrefix(line, score.min_begin);
+            const trimmed = runeTrimLength(line);
+            const span = score.max_end -| white_prefix;
+            break :blk std.math.maxInt(u16) - (@as(usize, std.math.maxInt(u16)) * span / (trimmed + 1));
+        },
+    };
+}
+
 fn tiebreakValue(kind: TieBreak, line: []const u8, score: CandidateScore) usize {
+    if (score.rune_offsets) return runeTiebreakValue(kind, line, score);
     const invalid = std.math.maxInt(usize);
     return switch (kind) {
         .length => trimLength(line),
@@ -4401,7 +4494,7 @@ fn searchCandidates(
     const parsed = try parseQuery(query, options, &term_buf);
 
     if (parsed.direct) |direct| {
-        if (options.scheme == .default and !termCaseSensitive(options.case_mode, direct) and options.tiebreak_count == 1 and options.tiebreaks[0] == .length) {
+        if (!candidates.has_non_ascii and !fuzzy_engine.cliTextHasNonAscii(direct) and options.scheme == .default and !termCaseSensitive(options.case_mode, direct) and options.tiebreak_count == 1 and options.tiebreaks[0] == .length) {
             return try index.search(direct, out[0..cap]);
         }
     }
@@ -4411,7 +4504,7 @@ fn searchCandidates(
     if (options.no_sort or !parsed.sortable) {
         var write: usize = 0;
         for (candidates.search, 0..) |line, idx| {
-            if (scoreParsedCandidate(index, parsed, line, idx, options.case_mode, options.scheme) == null) continue;
+            if (scoreParsedCandidate(index, parsed, line, idx, options.case_mode, !options.literal, options.scheme) == null) continue;
             out[write] = idx;
             write += 1;
             if (write == cap) break;
@@ -4421,16 +4514,20 @@ fn searchCandidates(
 
     var source: []usize = out;
     if (parsed.driver) |driver| {
-        // A driver is chosen only from a mandatory singleton fuzzy clause, so
-        // folded Index.search is a safe prefilter even for case-sensitive terms.
-        source = try index.search(driver, out);
+        // The byte index is not a sound prefilter when Unicode folding or fzf
+        // normalization can make a non-ASCII candidate match an ASCII query.
+        if (!candidates.has_non_ascii and !fuzzy_engine.cliTextHasNonAscii(driver)) {
+            source = try index.search(driver, out);
+        } else {
+            for (out, 0..) |*slot, i| slot.* = i;
+        }
     } else {
         for (out, 0..) |*slot, i| slot.* = i;
     }
 
     var rank_len: usize = 0;
     for (source) |idx| {
-        const score = scoreParsedCandidate(index, parsed, candidates.search[idx], idx, options.case_mode, options.scheme) orelse continue;
+        const score = scoreParsedCandidate(index, parsed, candidates.search[idx], idx, options.case_mode, !options.literal, options.scheme) orelse continue;
         rank_scratch[rank_len] = .{ .entry = idx, .score = score };
         rank_len += 1;
     }
@@ -4441,16 +4538,16 @@ fn searchCandidates(
     return out[0..take];
 }
 
-fn scoreParsedCandidate(index: *fuzzy.Index, parsed: ParsedQuery, line: []const u8, entry_index: usize, mode: CaseMode, scheme: Scheme) ?CandidateScore {
+fn scoreParsedCandidate(index: *fuzzy.Index, parsed: ParsedQuery, line: []const u8, entry_index: usize, mode: CaseMode, normalize_enabled: bool, scheme: Scheme) ?CandidateScore {
     if (parsed.terms.len == 0) return .{};
-    var total: CandidateScore = .{};
+    var total: CandidateScore = .{ .rune_offsets = fuzzy_engine.cliTextHasNonAscii(line) and std.unicode.utf8ValidateSlice(line) };
     var clause: usize = 0;
     while (clause < parsed.clause_count) : (clause += 1) {
         var matched = false;
         var contribution: ?fuzzy_engine.CliMatch = null;
         for (parsed.terms) |term| {
             if (term.clause != clause) continue;
-            const term_match = scoreTerm(index, term, line, entry_index, mode, scheme);
+            const term_match = scoreTerm(index, term, line, entry_index, mode, normalize_enabled, scheme);
             if (term_match) |value| {
                 if (term.inverse) continue;
                 contribution = value;
@@ -4470,12 +4567,23 @@ fn scoreParsedCandidate(index: *fuzzy.Index, parsed: ParsedQuery, line: []const 
     return total;
 }
 
-fn scoreTerm(index: *fuzzy.Index, term: QueryTerm, line: []const u8, entry_index: usize, mode: CaseMode, scheme: Scheme) ?fuzzy_engine.CliMatch {
+fn scoreTerm(index: *fuzzy.Index, term: QueryTerm, line: []const u8, entry_index: usize, mode: CaseMode, normalize_enabled: bool, scheme: Scheme) ?fuzzy_engine.CliMatch {
     const sensitive = termCaseSensitive(mode, term.text);
+    const normalize = fuzzy_engine.cliNormalizeTerm(term.text, normalize_enabled);
     const cli_scheme: fuzzy_engine.CliScheme = switch (scheme) {
         .default => .default,
         .path => .path,
         .history => .history,
+    };
+    const unicode_path = (fuzzy_engine.cliTextHasNonAscii(term.text) or fuzzy_engine.cliTextHasNonAscii(line)) and
+        std.unicode.utf8ValidateSlice(term.text) and std.unicode.utf8ValidateSlice(line);
+    if (unicode_path) return switch (term.kind) {
+        .fuzzy => fuzzy_engine.matchFuzzyUnicodeForCliScheme(index, term.text, line, sensitive, normalize, cli_scheme),
+        .exact => fuzzy_engine.scoreExactUnicodeForCliScheme(index, term.text, line, sensitive, normalize, false, cli_scheme),
+        .boundary_exact => fuzzy_engine.scoreExactUnicodeForCliScheme(index, term.text, line, sensitive, normalize, true, cli_scheme),
+        .prefix => fuzzy_engine.scorePrefixUnicodeForCliScheme(index, term.text, line, sensitive, normalize, cli_scheme),
+        .suffix => fuzzy_engine.scoreSuffixUnicodeForCliScheme(index, term.text, line, sensitive, normalize, cli_scheme),
+        .equal => fuzzy_engine.scoreEqualUnicodeForCliScheme(index, term.text, line, sensitive, normalize, cli_scheme),
     };
     return switch (term.kind) {
         .fuzzy => fuzzy_engine.matchFuzzyForCliScheme(index, term.text, line, entry_index, sensitive, cli_scheme),
@@ -4641,10 +4749,7 @@ fn termCaseSensitive(mode: CaseMode, text: []const u8) bool {
     return switch (mode) {
         .ignore => false,
         .respect => true,
-        .smart => blk: {
-            for (text) |c| if (c >= 'A' and c <= 'Z') break :blk true;
-            break :blk false;
-        },
+        .smart => fuzzy_engine.cliSmartCaseSensitive(text),
     };
 }
 
@@ -5333,6 +5438,7 @@ const usage =
     \\  -i, --ignore-case        force case-insensitive matching
     \\  +i, --no-ignore-case     force case-sensitive matching
     \\      --smart-case         smart-case matching (default)
+    \\      --literal            disable Unicode normalization
     \\  +x, --no-extended        disable extended query grammar
     \\  -q, --query=STR          start with query
     \\  -f, --filter=STR         non-interactive filter mode
@@ -5718,6 +5824,69 @@ test "fzf parser equal inverse fuzzy and boundary exact" {
     try std.testing.expect(!queryMatches(parsed, "x foobar y", .smart));
 }
 
+test "Unicode normalization and literal mode match fzf filter semantics" {
+    const a = std.testing.allocator;
+    const input = "Só Danço Samba\nDanço\nDANCO\nplain\n";
+
+    var options: Options = .{};
+    defer options.deinit(a);
+    var candidates = try candidatesFromOwnedBlob(a, try a.dupe(u8, input), &options);
+    defer candidates.deinit(a);
+    try std.testing.expect(candidates.has_non_ascii);
+    var index = try fuzzy.init(a, candidates.search);
+    defer index.deinit();
+    const out = try a.alloc(usize, candidates.search.len);
+    defer a.free(out);
+    const ranks = try a.alloc(ExtendedRank, candidates.search.len);
+    defer a.free(ranks);
+
+    const normalized = try searchCandidates(&index, &candidates, &options, "danco", out, ranks, out.len);
+    try std.testing.expectEqual(@as(usize, 3), normalized.len);
+    try std.testing.expectEqualStrings("Danço", candidates.output[normalized[0]]);
+    try std.testing.expectEqualStrings("DANCO", candidates.output[normalized[1]]);
+    try std.testing.expectEqualStrings("Só Danço Samba", candidates.output[normalized[2]]);
+
+    options.literal = true;
+    const literal = try searchCandidates(&index, &candidates, &options, "danco", out, ranks, out.len);
+    try std.testing.expectEqual(@as(usize, 1), literal.len);
+    try std.testing.expectEqualStrings("DANCO", candidates.output[literal[0]]);
+}
+
+test "Unicode query normalization policy and fullwidth folding match fzf" {
+    const a = std.testing.allocator;
+    const input = "é\ne\nｆｕｌｌ\nfull\n";
+
+    var options: Options = .{};
+    defer options.deinit(a);
+    var candidates = try candidatesFromOwnedBlob(a, try a.dupe(u8, input), &options);
+    defer candidates.deinit(a);
+    var index = try fuzzy.init(a, candidates.search);
+    defer index.deinit();
+    const out_buf = try a.alloc(usize, candidates.search.len);
+    defer a.free(out_buf);
+    const ranks = try a.alloc(ExtendedRank, candidates.search.len);
+    defer a.free(ranks);
+
+    // fzf disables normalization when the query itself would normalize.
+    const accented = try searchCandidates(&index, &candidates, &options, "é", out_buf, ranks, out_buf.len);
+    try std.testing.expectEqual(@as(usize, 1), accented.len);
+    try std.testing.expectEqualStrings("é", candidates.output[accented[0]]);
+
+    const folded = try searchCandidates(&index, &candidates, &options, "full", out_buf, ranks, out_buf.len);
+    try std.testing.expectEqual(@as(usize, 2), folded.len);
+    options.literal = true;
+    const literal = try searchCandidates(&index, &candidates, &options, "full", out_buf, ranks, out_buf.len);
+    try std.testing.expectEqual(@as(usize, 1), literal.len);
+    try std.testing.expectEqualStrings("full", candidates.output[literal[0]]);
+}
+
+test "Unicode smart case recognizes non-ASCII uppercase" {
+    try std.testing.expect(termCaseSensitive(.smart, "ẞ"));
+    try std.testing.expect(!termCaseSensitive(.smart, "ß"));
+    try std.testing.expect(termCaseSensitive(.smart, "Δ"));
+    try std.testing.expect(!termCaseSensitive(.smart, "δ"));
+}
+
 test "scheme rankings match upstream fzf boundary fixture" {
     const a = std.testing.allocator;
     const input = "xxyzx\n-xxyz\nxyzx-\n_xyz_\n_xyz-\n-xyz_\n[xyz]\n-xyz-\n xyz \n/xyz/\n";
@@ -5920,4 +6089,26 @@ test "listen option forms and action validation" {
     try std.testing.expect(validateActionSequence("change-query(foo)+down"));
     try std.testing.expect(validateActionSequence("execute-silent(true)"));
     try std.testing.expect(!validateActionSequence("not-a-real-action"));
+}
+
+test "literal option toggles match fzf" {
+    const a = std.testing.allocator;
+    const args = [_][]const u8{ "zfuzz", "--literal", "--no-literal", "--literal" };
+    var options = try parseOptions(a, &args);
+    defer options.deinit(a);
+    try std.testing.expect(options.literal);
+}
+
+test "Unicode tiebreak lengths use rune offsets and Unicode whitespace" {
+    try std.testing.expectEqual(@as(usize, 3), runeTrimLength("　éab　"));
+
+    const score: CandidateScore = .{
+        .min_begin = 1,
+        .min_end = 2,
+        .max_end = 2,
+        .valid_offset = true,
+        .rune_offsets = true,
+    };
+    try std.testing.expectEqual(@as(usize, 3), tiebreakValue(.length, "　éab　", score));
+    try std.testing.expectEqual(@as(usize, 1), tiebreakValue(.begin, "　éab　", score));
 }

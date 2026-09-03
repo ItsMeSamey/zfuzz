@@ -1,4 +1,5 @@
 const std = @import("std");
+const unicode_cli = @import("unicode_tables.zig");
 
 const signature_classes = 64;
 const signature_levels = 2;
@@ -3287,7 +3288,9 @@ pub fn matchFuzzyForCliScheme(index: *Index, query: []const u8, candidate: []con
 
     var previous_score: i16 = 0;
     var in_gap = false;
-    for (candidate, 0..) |c, j| {
+    var j: usize = first_start;
+    while (j < n) : (j += 1) {
+        const c = candidate[j];
         if (cliByteEq(c, query[0], case_sensitive)) {
             prev_h[j] = @intCast(score_match + cliSchemeBonusAt(index, entry, candidate, j, scheme) * bonus_first_char_multiplier);
             prev_c[j] = 1;
@@ -3307,12 +3310,14 @@ pub fn matchFuzzyForCliScheme(index: *Index, query: []const u8, candidate: []con
     while (row < query.len) : (row += 1) {
         in_gap = false;
         var left: i16 = 0;
-        for (candidate, 0..) |c, j| {
+        j = first_start;
+        while (j < n) : (j += 1) {
+            const c = candidate[j];
             const gap_penalty: i16 = @intCast(if (in_gap) score_gap_extension else score_gap_start);
             const gap_score: i16 = left + gap_penalty;
             var match_score_value: i16 = 0;
             var consecutive: i16 = 0;
-            if (j > 0 and cliByteEq(c, query[row], case_sensitive)) {
+            if (j > first_start and cliByteEq(c, query[row], case_sensitive)) {
                 match_score_value = prev_h[j - 1] + @as(i16, score_match);
                 var b: i16 = @intCast(cliSchemeBonusAt(index, entry, candidate, j, scheme));
                 consecutive = prev_c[j - 1] + 1;
@@ -3483,6 +3488,427 @@ pub fn scoreSuffixForCli(index: *const Index, needle: []const u8, candidate: []c
 
 pub fn scoreEqualForCli(index: *const Index, needle: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool) ?CliMatch {
     return scoreEqualForCliScheme(index, needle, candidate, entry_index, case_sensitive, .default);
+}
+
+const CliRuneClass = enum(u3) { white, non_word, delimiter, lower, upper, letter, number };
+
+fn cliRuneClass(cp: u21, scheme: CliScheme) CliRuneClass {
+    if (cp <= 0x7f) return switch (cliSchemeCharClass(@intCast(cp), scheme)) {
+        .white => .white,
+        .non_word => .non_word,
+        .delimiter => .delimiter,
+        .lower => .lower,
+        .upper => .upper,
+        .number => .number,
+    };
+    return switch (unicode_cli.classOf(cp)) {
+        .white => .white,
+        .lower => .lower,
+        .upper => .upper,
+        .letter => .letter,
+        .number => .number,
+        .other => .non_word,
+    };
+}
+
+fn cliRuneBonusFor(previous: CliRuneClass, current: CliRuneClass, scheme: CliScheme) i32 {
+    const boundary_white: i32 = if (scheme == .default) bonus_boundary_white else bonus_boundary;
+    const boundary_delimiter: i32 = if (scheme == .history) bonus_boundary else bonus_boundary_delimiter;
+    if (current != .white) {
+        switch (previous) {
+            .white => return boundary_white,
+            .delimiter => return boundary_delimiter,
+            .non_word => return bonus_boundary,
+            else => {},
+        }
+    }
+    if ((previous == .lower and current == .upper) or (previous != .number and current == .number)) return bonus_camel_number;
+    return switch (current) {
+        .non_word, .delimiter => bonus_non_word,
+        .white => boundary_white,
+        else => 0,
+    };
+}
+
+fn cliInitialRuneClass(scheme: CliScheme) CliRuneClass {
+    return if (scheme == .path) .delimiter else .white;
+}
+
+fn cliRuneMetaBonus(meta: usize) i32 {
+    return @intCast(meta & 0xff);
+}
+
+fn cliRuneMetaClass(meta: usize) CliRuneClass {
+    return @enumFromInt((meta >> 8) & 0x7);
+}
+
+fn cliPrepareUnicodeCandidate(index: *Index, candidate: []const u8, case_sensitive: bool, normalize: bool, scheme: CliScheme) ?usize {
+    if (!std.unicode.utf8ValidateSlice(candidate)) return null;
+    var it = std.unicode.Utf8Iterator{ .bytes = candidate, .i = 0 };
+    var n: usize = 0;
+    var previous = cliInitialRuneClass(scheme);
+    while (it.nextCodepoint()) |raw| : (n += 1) {
+        const class = cliRuneClass(raw, scheme);
+        const bonus = cliRuneBonusFor(previous, class, scheme);
+        var cp = raw;
+        if (!case_sensitive) cp = unicode_cli.toLower(cp);
+        if (normalize) cp = unicode_cli.normalize(cp);
+        index.position_scratch[n] = cp;
+        index.last_position_scratch[n] = @as(usize, @intCast(bonus)) | (@as(usize, @intFromEnum(class)) << 8);
+        previous = class;
+    }
+    return n;
+}
+
+fn cliPrepareUnicodePattern(query: []const u8, case_sensitive: bool, normalize: bool, out: []u21) ?usize {
+    if (!std.unicode.utf8ValidateSlice(query)) return null;
+    var it = std.unicode.Utf8Iterator{ .bytes = query, .i = 0 };
+    var n: usize = 0;
+    while (it.nextCodepoint()) |raw| {
+        if (n == out.len) return null;
+        var cp = raw;
+        if (!case_sensitive) cp = unicode_cli.toLower(cp);
+        if (normalize) cp = unicode_cli.normalize(cp);
+        out[n] = cp;
+        n += 1;
+    }
+    return n;
+}
+
+pub fn cliTextHasNonAscii(text: []const u8) bool {
+    for (text) |c| if (c >= 0x80) return true;
+    return false;
+}
+
+pub fn cliSmartCaseSensitive(text: []const u8) bool {
+    if (!std.unicode.utf8ValidateSlice(text)) {
+        for (text) |c| if (c >= 'A' and c <= 'Z') return true;
+        return false;
+    }
+    var it = std.unicode.Utf8Iterator{ .bytes = text, .i = 0 };
+    while (it.nextCodepoint()) |cp| if (unicode_cli.toLower(cp) != cp) return true;
+    return false;
+}
+
+pub fn cliNormalizeTerm(text: []const u8, enabled: bool) bool {
+    if (!enabled or !std.unicode.utf8ValidateSlice(text)) return false;
+    var it = std.unicode.Utf8Iterator{ .bytes = text, .i = 0 };
+    while (it.nextCodepoint()) |cp| {
+        const lower_cp = unicode_cli.toLower(cp);
+        if (unicode_cli.normalize(lower_cp) != lower_cp) return false;
+    }
+    return true;
+}
+
+pub fn cliRuneIsWhitespace(cp: u21) bool {
+    if (cp <= 0x7f) return switch (@as(u8, @intCast(cp))) {
+        ' ', '\t', '\n', '\r', 0x0b, 0x0c => true,
+        else => false,
+    };
+    return unicode_cli.classOf(cp) == .white;
+}
+
+fn cliUnicodeContiguousScore(index: *const Index, start: usize, len: usize) i32 {
+    var total: i32 = 0;
+    var consecutive: usize = 0;
+    var first_bonus: i32 = 0;
+    for (start..start + len) |j| {
+        var b = cliRuneMetaBonus(index.last_position_scratch[j]);
+        total += score_match;
+        if (consecutive == 0) {
+            first_bonus = b;
+        } else {
+            if (b >= bonus_boundary and b > first_bonus) first_bonus = b;
+            b = @max(@max(b, first_bonus), bonus_consecutive);
+        }
+        total += if (j == start) b * bonus_first_char_multiplier else b;
+        consecutive += 1;
+    }
+    return total;
+}
+
+fn cliStoreUnicodePattern(index: *Index, query: []const u8, case_sensitive: bool, normalize: bool, expected_len: usize) bool {
+    if (expected_len * 2 > index.dp.len or !std.unicode.utf8ValidateSlice(query)) return false;
+    var it = std.unicode.Utf8Iterator{ .bytes = query, .i = 0 };
+    var i: usize = 0;
+    while (it.nextCodepoint()) |raw| : (i += 1) {
+        var cp = raw;
+        if (!case_sensitive) cp = unicode_cli.toLower(cp);
+        if (normalize) cp = unicode_cli.normalize(cp);
+        const value: u32 = cp;
+        index.dp[i * 2] = @bitCast(@as(u16, @truncate(value)));
+        index.dp[i * 2 + 1] = @bitCast(@as(u16, @truncate(value >> 16)));
+    }
+    return i == expected_len;
+}
+
+fn cliStoredPatternAt(index: *const Index, i: usize) u21 {
+    const lo: u16 = @bitCast(index.dp[i * 2]);
+    const hi: u16 = @bitCast(index.dp[i * 2 + 1]);
+    return @intCast(@as(u32, lo) | (@as(u32, hi) << 16));
+}
+
+fn cliCalculateUnicodeStoredScore(index: *const Index, pattern_len: usize, start: usize, end: usize) i32 {
+    var p: usize = 0;
+    var score: i32 = 0;
+    var in_gap = false;
+    var consecutive: usize = 0;
+    var first_bonus: i32 = 0;
+    var j = start;
+    while (j < end and p < pattern_len) : (j += 1) {
+        if (index.position_scratch[j] == cliStoredPatternAt(index, p)) {
+            score += score_match;
+            var b = cliRuneMetaBonus(index.last_position_scratch[j]);
+            if (consecutive == 0) {
+                first_bonus = b;
+            } else {
+                if (b >= bonus_boundary and b > first_bonus) first_bonus = b;
+                b = @max(@max(b, first_bonus), bonus_consecutive);
+            }
+            score += if (p == 0) b * bonus_first_char_multiplier else b;
+            in_gap = false;
+            consecutive += 1;
+            p += 1;
+        } else {
+            score += if (in_gap) score_gap_extension else score_gap_start;
+            in_gap = true;
+            consecutive = 0;
+            first_bonus = 0;
+        }
+    }
+    return score;
+}
+
+fn cliScoreUnicodeV1Stored(index: *Index, candidate_len: usize, pattern_len: usize) ?CliMatch {
+    var p: usize = 0;
+    var start: ?usize = null;
+    var end: usize = 0;
+    for (index.position_scratch[0..candidate_len], 0..) |cp, i| {
+        if (cp == cliStoredPatternAt(index, p)) {
+            if (start == null) start = i;
+            p += 1;
+            if (p == pattern_len) {
+                end = i + 1;
+                break;
+            }
+        }
+    }
+    if (p != pattern_len) return null;
+
+    p = pattern_len;
+    var compact_start = start.?;
+    var i = end;
+    while (i > compact_start and p > 0) {
+        i -= 1;
+        if (index.position_scratch[i] == cliStoredPatternAt(index, p - 1)) {
+            p -= 1;
+            if (p == 0) {
+                compact_start = i;
+                break;
+            }
+        }
+    }
+    return .{
+        .score = cliCalculateUnicodeStoredScore(index, pattern_len, compact_start, end),
+        .start = compact_start,
+        .end = end,
+    };
+}
+
+fn cliUnicodeExactAtStored(index: *const Index, pattern_len: usize, start: usize) bool {
+    for (0..pattern_len) |k| if (index.position_scratch[start + k] != cliStoredPatternAt(index, k)) return false;
+    return true;
+}
+
+pub fn matchFuzzyUnicodeForCliScheme(index: *Index, query: []const u8, candidate: []const u8, case_sensitive: bool, normalize: bool, scheme: CliScheme) ?CliMatch {
+    if (!std.unicode.utf8ValidateSlice(query)) return null;
+    const n = cliPrepareUnicodeCandidate(index, candidate, case_sensitive, normalize, scheme) orelse return null;
+    const m = std.unicode.utf8CountCodepoints(query) catch return null;
+    if (m == 0) return .{ .score = 0, .start = 0, .end = 0 };
+    if (m > n) return null;
+    if (m > 1000) {
+        if (!cliStoreUnicodePattern(index, query, case_sensitive, normalize, m)) return null;
+        return cliScoreUnicodeV1Stored(index, n, m);
+    }
+    var pattern_buf: [1000]u21 = undefined;
+    _ = cliPrepareUnicodePattern(query, case_sensitive, normalize, &pattern_buf) orelse return null;
+
+    var p: usize = 0;
+    var first_start: usize = 0;
+    for (index.position_scratch[0..n], 0..) |cp, j| {
+        if (cp == pattern_buf[p]) {
+            if (p == 0) first_start = j;
+            p += 1;
+            if (p == m) break;
+        }
+    }
+    if (p != m) return null;
+
+    if (m == 1) {
+        var best: ?CliMatch = null;
+        for (index.position_scratch[0..n], 0..) |cp, j| {
+            if (cp != pattern_buf[0]) continue;
+            const raw_bonus = cliRuneMetaBonus(index.last_position_scratch[j]);
+            const score = score_match + raw_bonus * bonus_first_char_multiplier;
+            if (best == null or score > best.?.score) best = .{ .score = score, .start = j, .end = j + 1 };
+            if (raw_bonus >= bonus_boundary) return best;
+        }
+        return best;
+    }
+
+    var prev_h = index.dp[0..n];
+    var prev_c = index.dp[n .. 2 * n];
+    var cur_h = index.dp[2 * n .. 3 * n];
+    var cur_c = index.dp[3 * n .. 4 * n];
+    var previous_score: i16 = 0;
+    var in_gap = false;
+    var j: usize = first_start;
+    while (j < n) : (j += 1) {
+        const cp: u21 = @intCast(index.position_scratch[j]);
+        if (cp == pattern_buf[0]) {
+            prev_h[j] = @intCast(score_match + cliRuneMetaBonus(index.last_position_scratch[j]) * bonus_first_char_multiplier);
+            prev_c[j] = 1;
+            in_gap = false;
+        } else {
+            const penalty: i16 = @intCast(if (in_gap) score_gap_extension else score_gap_start);
+            prev_h[j] = @max(previous_score + penalty, 0);
+            prev_c[j] = 0;
+            in_gap = true;
+        }
+        previous_score = prev_h[j];
+    }
+
+    var max_score: i16 = 0;
+    var max_score_pos = first_start;
+    var row: usize = 1;
+    while (row < m) : (row += 1) {
+        in_gap = false;
+        var left: i16 = 0;
+        j = first_start;
+        while (j < n) : (j += 1) {
+            const cp: u21 = @intCast(index.position_scratch[j]);
+            const gap_penalty: i16 = @intCast(if (in_gap) score_gap_extension else score_gap_start);
+            const gap_score = left + gap_penalty;
+            var match_score_value: i16 = 0;
+            var consecutive: i16 = 0;
+            if (j > first_start and cp == pattern_buf[row]) {
+                match_score_value = prev_h[j - 1] + @as(i16, score_match);
+                var b: i16 = @intCast(cliRuneMetaBonus(index.last_position_scratch[j]));
+                consecutive = prev_c[j - 1] + 1;
+                if (consecutive > 1) {
+                    const first_index = j - @as(usize, @intCast(consecutive)) + 1;
+                    const first_bonus: i16 = @intCast(cliRuneMetaBonus(index.last_position_scratch[first_index]));
+                    if (b >= bonus_boundary and b > first_bonus) {
+                        consecutive = 1;
+                    } else {
+                        b = @max(@max(b, @as(i16, bonus_consecutive)), first_bonus);
+                    }
+                }
+                if (match_score_value + b < gap_score) {
+                    match_score_value += @intCast(cliRuneMetaBonus(index.last_position_scratch[j]));
+                    consecutive = 0;
+                } else {
+                    match_score_value += b;
+                }
+            }
+            cur_c[j] = consecutive;
+            in_gap = match_score_value < gap_score;
+            const score: i16 = @max(@max(match_score_value, gap_score), 0);
+            cur_h[j] = score;
+            left = score;
+            if (row + 1 == m and score > max_score) {
+                max_score = score;
+                max_score_pos = j;
+            }
+        }
+        std.mem.swap([]i16, &prev_h, &cur_h);
+        std.mem.swap([]i16, &prev_c, &cur_c);
+    }
+    return .{ .score = @intCast(max_score), .start = first_start, .end = max_score_pos + 1 };
+}
+
+pub fn scoreExactUnicodeForCliScheme(index: *Index, needle: []const u8, candidate: []const u8, case_sensitive: bool, normalize: bool, boundary: bool, scheme: CliScheme) ?CliMatch {
+    const n = cliPrepareUnicodeCandidate(index, candidate, case_sensitive, normalize, scheme) orelse return null;
+    const m = std.unicode.utf8CountCodepoints(needle) catch return null;
+    if (m == 0) return .{ .score = 0, .start = 0, .end = 0 };
+    if (m > n or !cliStoreUnicodePattern(index, needle, case_sensitive, normalize, m)) return null;
+    var best_start: ?usize = null;
+    var best_bonus: i32 = -1;
+    var scan_start: usize = 0;
+    while (scan_start + m <= n) : (scan_start += 1) {
+        if (!cliUnicodeExactAtStored(index, m, scan_start)) continue;
+        const b = cliRuneMetaBonus(index.last_position_scratch[scan_start]);
+        if (boundary) {
+            if (b < bonus_boundary) continue;
+            if (scan_start > 0 and @intFromEnum(cliRuneMetaClass(index.last_position_scratch[scan_start - 1])) > @intFromEnum(CliRuneClass.delimiter)) continue;
+            const match_end = scan_start + m;
+            if (match_end < n and @intFromEnum(cliRuneMetaClass(index.last_position_scratch[match_end])) > @intFromEnum(CliRuneClass.delimiter)) continue;
+        }
+        if (b > best_bonus) {
+            best_bonus = b;
+            best_start = scan_start;
+        }
+        if (b >= bonus_boundary) break;
+    }
+    const match_start = best_start orelse return null;
+    const match_end = match_start + m;
+    if (!boundary) return .{ .score = cliUnicodeContiguousScore(index, match_start, m), .start = match_start, .end = match_end };
+    var score = best_bonus;
+    var deduct = best_bonus - bonus_boundary + 1;
+    if (match_start > 0 and index.position_scratch[match_start - 1] == '_') {
+        score -= deduct + 1;
+        deduct = 1;
+    }
+    if (match_end < n and index.position_scratch[match_end] == '_') score -= deduct;
+    const boundary_white: i32 = if (scheme == .default) bonus_boundary_white else bonus_boundary;
+    score += score_match * @as(i32, @intCast(m)) + boundary_white * @as(i32, @intCast(m + 1));
+    return .{ .score = score, .start = match_start, .end = match_end };
+}
+
+pub fn scorePrefixUnicodeForCliScheme(index: *Index, needle: []const u8, candidate: []const u8, case_sensitive: bool, normalize: bool, scheme: CliScheme) ?CliMatch {
+    const n = cliPrepareUnicodeCandidate(index, candidate, case_sensitive, normalize, scheme) orelse return null;
+    const m = std.unicode.utf8CountCodepoints(needle) catch return null;
+    if (m == 0) return .{ .score = 0, .start = 0, .end = 0 };
+    if (m > n or !cliStoreUnicodePattern(index, needle, case_sensitive, normalize, m)) return null;
+    var match_start: usize = 0;
+    if (!cliRuneIsWhitespace(cliStoredPatternAt(index, 0))) {
+        while (match_start < n and cliRuneMetaClass(index.last_position_scratch[match_start]) == .white) : (match_start += 1) {}
+    }
+    if (match_start + m > n or !cliUnicodeExactAtStored(index, m, match_start)) return null;
+    return .{ .score = cliUnicodeContiguousScore(index, match_start, m), .start = match_start, .end = match_start + m };
+}
+
+pub fn scoreSuffixUnicodeForCliScheme(index: *Index, needle: []const u8, candidate: []const u8, case_sensitive: bool, normalize: bool, scheme: CliScheme) ?CliMatch {
+    const n = cliPrepareUnicodeCandidate(index, candidate, case_sensitive, normalize, scheme) orelse return null;
+    const m = std.unicode.utf8CountCodepoints(needle) catch return null;
+    if (m > n or !cliStoreUnicodePattern(index, needle, case_sensitive, normalize, m)) return null;
+    var match_end = n;
+    if (m == 0 or !cliRuneIsWhitespace(cliStoredPatternAt(index, m - 1))) {
+        while (match_end > 0 and cliRuneMetaClass(index.last_position_scratch[match_end - 1]) == .white) : (match_end -= 1) {}
+    }
+    if (m == 0) return .{ .score = 0, .start = match_end, .end = match_end };
+    if (m > match_end) return null;
+    const match_start = match_end - m;
+    if (!cliUnicodeExactAtStored(index, m, match_start)) return null;
+    return .{ .score = cliUnicodeContiguousScore(index, match_start, m), .start = match_start, .end = match_end };
+}
+
+pub fn scoreEqualUnicodeForCliScheme(index: *Index, needle: []const u8, candidate: []const u8, case_sensitive: bool, normalize: bool, scheme: CliScheme) ?CliMatch {
+    const n = cliPrepareUnicodeCandidate(index, candidate, case_sensitive, normalize, scheme) orelse return null;
+    const m = std.unicode.utf8CountCodepoints(needle) catch return null;
+    if (m == 0 or m > n or !cliStoreUnicodePattern(index, needle, case_sensitive, normalize, m)) return null;
+    var match_start: usize = 0;
+    var match_end = n;
+    if (!cliRuneIsWhitespace(cliStoredPatternAt(index, 0))) {
+        while (match_start < match_end and cliRuneMetaClass(index.last_position_scratch[match_start]) == .white) : (match_start += 1) {}
+    }
+    if (!cliRuneIsWhitespace(cliStoredPatternAt(index, m - 1))) {
+        while (match_end > match_start and cliRuneMetaClass(index.last_position_scratch[match_end - 1]) == .white) : (match_end -= 1) {}
+    }
+    if (match_end - match_start != m or !cliUnicodeExactAtStored(index, m, match_start)) return null;
+    const boundary_white: i32 = if (scheme == .default) bonus_boundary_white else bonus_boundary;
+    const score = (score_match + boundary_white) * @as(i32, @intCast(m)) + (bonus_first_char_multiplier - 1) * boundary_white;
+    return .{ .score = score, .start = match_start, .end = match_end };
 }
 
 fn lower(c: u8) u8 {
@@ -4030,6 +4456,127 @@ test "indexed final occurrence bound preserves subsequence search" {
             const bounded = index.subsequenceIndexed(&q, entry, entry_index, first_slot, end);
             try std.testing.expectEqual(full, bounded);
         }
+    }
+}
+
+test "CLI Unicode scorer matches upstream fzf normalization fixtures" {
+    const values = [_][]const u8{ "Só Danço Samba", "Danço", "ẞtraße", "plain-ascii" };
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+
+    const so = matchFuzzyUnicodeForCliScheme(&index, "So", values[0], false, true, .default).?;
+    try std.testing.expectEqual(@as(i32, 62), so.score);
+    try std.testing.expectEqual(@as(usize, 0), so.start);
+    try std.testing.expectEqual(@as(usize, 2), so.end);
+
+    const sodc = matchFuzzyUnicodeForCliScheme(&index, "sodc", values[0], false, true, .default).?;
+    try std.testing.expectEqual(@as(i32, 97), sodc.score);
+    try std.testing.expectEqual(@as(usize, 0), sodc.start);
+    try std.testing.expectEqual(@as(usize, 7), sodc.end);
+
+    const danco = matchFuzzyUnicodeForCliScheme(&index, "danco", values[1], false, true, .default).?;
+    try std.testing.expectEqual(@as(i32, 140), danco.score);
+    try std.testing.expectEqual(@as(usize, 0), danco.start);
+    try std.testing.expectEqual(@as(usize, 5), danco.end);
+
+    try std.testing.expect(matchFuzzyUnicodeForCliScheme(&index, "ßtraße", values[2], false, false, .default) != null);
+}
+
+test "CLI Unicode exact modes match upstream normalization fixture" {
+    const values = [_][]const u8{"Danço"};
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+
+    const fuzzy = matchFuzzyUnicodeForCliScheme(&index, "danco", values[0], false, true, .default).?;
+    const exact = scoreExactUnicodeForCliScheme(&index, "danco", values[0], false, true, false, .default).?;
+    const prefix = scorePrefixUnicodeForCliScheme(&index, "danco", values[0], false, true, .default).?;
+    const suffix = scoreSuffixUnicodeForCliScheme(&index, "danco", values[0], false, true, .default).?;
+    const equal = scoreEqualUnicodeForCliScheme(&index, "danco", values[0], false, true, .default).?;
+    for ([_]CliMatch{ fuzzy, exact, prefix, suffix, equal }) |matched| {
+        try std.testing.expectEqual(@as(i32, 140), matched.score);
+        try std.testing.expectEqual(@as(usize, 0), matched.start);
+        try std.testing.expectEqual(@as(usize, 5), matched.end);
+    }
+}
+
+test "CLI Unicode case and normalization policy matches fzf" {
+    try std.testing.expect(cliSmartCaseSensitive("ẞ"));
+    try std.testing.expect(!cliSmartCaseSensitive("ß"));
+    try std.testing.expect(cliSmartCaseSensitive("Δ"));
+    try std.testing.expect(!cliSmartCaseSensitive("δ"));
+    try std.testing.expect(cliNormalizeTerm("danco", true));
+    try std.testing.expect(cliNormalizeTerm("DANCO", true));
+    try std.testing.expect(!cliNormalizeTerm("danço", true));
+    try std.testing.expect(!cliNormalizeTerm("É", true));
+    try std.testing.expect(!cliNormalizeTerm("danco", false));
+}
+
+test "CLI Unicode fallback mirrors ASCII scorer across randomized cases" {
+    const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-./,:;|@#()[]{}";
+    var buffers: [64][48]u8 = undefined;
+    var values: [64][]const u8 = undefined;
+    var state: u64 = 0x5a17c0de12345678;
+    for (&buffers, 0..) |*buffer, i| {
+        const len = 1 + (i * 29 % buffer.len);
+        for (buffer[0..len]) |*slot| {
+            state = state *% 6364136223846793005 +% 1442695040888963407;
+            slot.* = alphabet[@as(usize, @intCast(state >> 32)) % alphabet.len];
+        }
+        values[i] = buffer[0..len];
+    }
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+
+    const schemes = [_]CliScheme{ .default, .path, .history };
+    var query_buf: [10]u8 = undefined;
+    for (0..1500) |trial| {
+        state = state *% 2862933555777941757 +% 3037000493;
+        const entry_index = @as(usize, @intCast(state >> 32)) % values.len;
+        const candidate = values[entry_index];
+        const qlen = 1 + trial % @min(query_buf.len, candidate.len);
+        for (query_buf[0..qlen]) |*slot| {
+            state = state *% 2862933555777941757 +% 3037000493;
+            slot.* = alphabet[@as(usize, @intCast(state >> 33)) % alphabet.len];
+        }
+        const query = query_buf[0..qlen];
+        for (schemes) |scheme| for ([_]bool{ false, true }) |case_sensitive| {
+            try std.testing.expectEqual(
+                matchFuzzyForCliScheme(&index, query, candidate, entry_index, case_sensitive, scheme),
+                matchFuzzyUnicodeForCliScheme(&index, query, candidate, case_sensitive, false, scheme),
+            );
+            try std.testing.expectEqual(
+                scoreExactForCliScheme(&index, query, candidate, entry_index, case_sensitive, false, scheme),
+                scoreExactUnicodeForCliScheme(&index, query, candidate, case_sensitive, false, false, scheme),
+            );
+            try std.testing.expectEqual(
+                scoreExactForCliScheme(&index, query, candidate, entry_index, case_sensitive, true, scheme),
+                scoreExactUnicodeForCliScheme(&index, query, candidate, case_sensitive, false, true, scheme),
+            );
+            try std.testing.expectEqual(
+                scorePrefixForCliScheme(&index, query, candidate, entry_index, case_sensitive, scheme),
+                scorePrefixUnicodeForCliScheme(&index, query, candidate, case_sensitive, false, scheme),
+            );
+            try std.testing.expectEqual(
+                scoreSuffixForCliScheme(&index, query, candidate, entry_index, case_sensitive, scheme),
+                scoreSuffixUnicodeForCliScheme(&index, query, candidate, case_sensitive, false, scheme),
+            );
+            try std.testing.expectEqual(
+                scoreEqualForCliScheme(&index, query, candidate, entry_index, case_sensitive, scheme),
+                scoreEqualUnicodeForCliScheme(&index, query, candidate, case_sensitive, false, scheme),
+            );
+        };
+    }
+}
+
+test "CLI Unicode scorer is score-equivalent on ASCII" {
+    const values = [_][]const u8{ "fooBarbaz1", "foo bar baz", "/AutomatorDocument.icns", "/.oh-my-zsh/cache", "plain-ascii" };
+    const queries = [_][]const u8{ "oBZ", "fbb", "rdoc", "zshc", "pain" };
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+    for (values, queries, 0..) |value, query, i| {
+        const byte_match = matchFuzzyForCliScheme(&index, query, value, i, false, .default);
+        const rune_match = matchFuzzyUnicodeForCliScheme(&index, query, value, false, false, .default);
+        try std.testing.expectEqual(byte_match, rune_match);
     }
 }
 
