@@ -140,18 +140,21 @@ const Action = union(enum) {
     prev_history,
     next_history,
     change_query: []const u8,
+    search: []const u8,
     change_prompt: []const u8,
     change_header: []const u8,
     change_footer: []const u8,
     change_preview: []const u8,
     transform: []const u8,
     transform_query: []const u8,
+    transform_search: []const u8,
     transform_prompt: []const u8,
     transform_header: []const u8,
     transform_footer: []const u8,
     transform_preview: []const u8,
     bg_transform: []const u8,
     bg_transform_query: []const u8,
+    bg_transform_search: []const u8,
     bg_transform_prompt: []const u8,
     bg_transform_header: []const u8,
     bg_transform_footer: []const u8,
@@ -655,7 +658,7 @@ const QueryHistory = struct {
     }
 };
 
-const BackgroundKind = enum { actions, query, prompt, header, footer, preview, reload };
+const BackgroundKind = enum { actions, query, search, prompt, header, footer, preview, reload };
 
 const BackgroundResult = struct {
     kind: BackgroundKind,
@@ -751,6 +754,22 @@ const BackgroundContext = struct {
     env: std.process.Environ.Map,
 };
 
+fn firstCommandOutputLine(text: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    return std.mem.trimEnd(u8, text[0..end], "\r");
+}
+
+const EffectiveSearch = struct {
+    query: []const u8,
+    disabled: bool,
+};
+
+fn resolveEffectiveSearch(visible_query: []const u8, disabled: bool, search_override: ?[]const u8) EffectiveSearch {
+    if (search_override) |query| return .{ .query = query, .disabled = false };
+    if (disabled) return .{ .query = "", .disabled = true };
+    return .{ .query = visible_query, .disabled = false };
+}
+
 fn backgroundTransformThread(ctx: *BackgroundContext) void {
     const allocator = ctx.allocator;
     defer {
@@ -774,7 +793,11 @@ fn backgroundTransformThread(ctx: *BackgroundContext) void {
         return;
     }
     defer allocator.free(result.stdout);
-    const text = std.mem.trimEnd(u8, result.stdout, "\r\n");
+    const trimmed = std.mem.trimEnd(u8, result.stdout, "\r\n");
+    const text = switch (ctx.kind) {
+        .query, .search, .prompt => firstCommandOutputLine(trimmed),
+        else => trimmed,
+    };
     const output = allocator.dupe(u8, text) catch {
         ctx.queue.finish(ctx.kind, null, ctx.generation);
         return;
@@ -825,6 +848,7 @@ const Ui = struct {
     one_event_pending: bool = false,
     focus_event_pending: bool = false,
     owned_prompt: ?[]u8 = null,
+    owned_search_override: ?[]u8 = null,
     owned_header: ?[]u8 = null,
     owned_footer: ?[]u8 = null,
     owned_preview: ?[]u8 = null,
@@ -907,6 +931,7 @@ const Ui = struct {
         self.selection_order.deinit(self.allocator);
         if (self.preview_text.len != 0) self.allocator.free(self.preview_text);
         if (self.owned_prompt) |value| self.allocator.free(value);
+        if (self.owned_search_override) |value| self.allocator.free(value);
         if (self.owned_header) |value| self.allocator.free(value);
         if (self.owned_footer) |value| self.allocator.free(value);
         if (self.owned_preview) |value| self.allocator.free(value);
@@ -1001,9 +1026,11 @@ const Ui = struct {
         if (force_all_for_auto and (self.options.select_1 or self.options.exit_0)) self.result_cap = n;
         if (self.options.no_sort or track_key != null or self.options.raw) self.result_cap = n;
 
-        const effective_query: []const u8 = if (self.options.disabled) "" else self.query.items;
+        const effective = resolveEffectiveSearch(self.query.items, self.options.disabled, self.owned_search_override);
+        var search_options = self.options.*;
+        search_options.disabled = effective.disabled;
         const old_focus_idx: ?usize = if (self.result_len == 0) null else self.results[self.focus];
-        const found = try searchCandidates(self.index, self.candidates, self.options, effective_query, self.match_results, self.extended_ranks, self.result_cap);
+        const found = try searchCandidates(self.index, self.candidates, &search_options, effective.query, self.match_results, self.extended_ranks, self.result_cap);
         self.match_len = found.len;
         self.best_match_idx = if (found.len == 0) null else found[0];
         @memset(self.match_flags, false);
@@ -1306,9 +1333,26 @@ const Ui = struct {
     }
 
     fn markQueryChanged(self: *Ui) void {
+        self.clearSearchOverride();
         self.dirty_search = true;
         self.change_event_pending = true;
         self.preview_cache_key = null;
+    }
+
+    fn clearSearchOverride(self: *Ui) void {
+        if (self.owned_search_override) |value| self.allocator.free(value);
+        self.owned_search_override = null;
+    }
+
+    fn setSearchOverrideOwned(self: *Ui, value: []u8) void {
+        self.clearSearchOverride();
+        self.owned_search_override = value;
+        self.dirty_search = true;
+        self.preview_cache_key = null;
+    }
+
+    fn setSearchOverride(self: *Ui, value: []const u8) !void {
+        self.setSearchOverrideOwned(try self.allocator.dupe(u8, value));
     }
 
     fn navigateHistory(self: *Ui, delta: isize) !void {
@@ -1409,6 +1453,10 @@ const Ui = struct {
                     try self.query.appendSlice(self.allocator, result.output);
                     self.cursor = self.query.items.len;
                     self.markQueryChanged();
+                },
+                .search => {
+                    self.setSearchOverrideOwned(result.output);
+                    owned = null;
                 },
                 .prompt => {
                     self.replaceOwnedText(&self.owned_prompt, &self.options.prompt, result.output);
@@ -1684,6 +1732,7 @@ const Ui = struct {
                 self.cursor = self.query.items.len;
                 self.markQueryChanged();
             },
+            .search => |value| try self.setSearchOverride(value),
             .change_prompt => |value| self.options.prompt = value,
             .change_header => |value| self.options.header = value,
             .change_footer => |value| self.options.footer = value,
@@ -1695,15 +1744,16 @@ const Ui = struct {
             },
             .transform => |cmd| return try self.runTransformActions(cmd),
             .transform_query => |cmd| {
-                const value = try self.runTransformCommand(cmd);
+                const value = try self.runTransformCommandFirstLine(cmd);
                 defer self.allocator.free(value);
                 self.query.clearRetainingCapacity();
                 try self.query.appendSlice(self.allocator, value);
                 self.cursor = self.query.items.len;
                 self.markQueryChanged();
             },
+            .transform_search => |cmd| self.setSearchOverrideOwned(try self.runTransformCommandFirstLine(cmd)),
             .transform_prompt => |cmd| {
-                const value = try self.runTransformCommand(cmd);
+                const value = try self.runTransformCommandFirstLine(cmd);
                 self.replaceOwnedText(&self.owned_prompt, &self.options.prompt, value);
             },
             .transform_header => |cmd| {
@@ -1723,6 +1773,7 @@ const Ui = struct {
             },
             .bg_transform => |cmd| try self.launchBackgroundTransform(.actions, cmd),
             .bg_transform_query => |cmd| try self.launchBackgroundTransform(.query, cmd),
+            .bg_transform_search => |cmd| try self.launchBackgroundTransform(.search, cmd),
             .bg_transform_prompt => |cmd| try self.launchBackgroundTransform(.prompt, cmd),
             .bg_transform_header => |cmd| try self.launchBackgroundTransform(.header, cmd),
             .bg_transform_footer => |cmd| try self.launchBackgroundTransform(.footer, cmd),
@@ -1843,6 +1894,12 @@ const Ui = struct {
         defer self.allocator.free(result.stdout);
         const text = std.mem.trimEnd(u8, result.stdout, "\r\n");
         return try self.allocator.dupe(u8, text);
+    }
+
+    fn runTransformCommandFirstLine(self: *Ui, command: []const u8) ![]u8 {
+        const output = try self.runTransformCommand(command);
+        defer self.allocator.free(output);
+        return try self.allocator.dupe(u8, firstCommandOutputLine(output));
     }
 
     fn runTransformActions(self: *Ui, command: []const u8) anyerror!?u8 {
@@ -3949,16 +4006,19 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "prev-history") or std.mem.eql(u8, s, "previous-history")) return .prev_history;
     if (std.mem.eql(u8, s, "next-history")) return .next_history;
     if (commandAction(s, "change-query")) |value| return .{ .change_query = value };
+    if (commandAction(s, "search")) |value| return .{ .search = value };
     if (commandAction(s, "change-prompt")) |value| return .{ .change_prompt = value };
     if (commandAction(s, "change-header")) |value| return .{ .change_header = value };
     if (commandAction(s, "change-footer")) |value| return .{ .change_footer = value };
     if (commandAction(s, "change-preview")) |value| return .{ .change_preview = value };
     if (commandAction(s, "transform-query")) |cmd| return .{ .transform_query = cmd };
+    if (commandAction(s, "transform-search")) |cmd| return .{ .transform_search = cmd };
     if (commandAction(s, "transform-prompt")) |cmd| return .{ .transform_prompt = cmd };
     if (commandAction(s, "transform-header")) |cmd| return .{ .transform_header = cmd };
     if (commandAction(s, "transform-footer")) |cmd| return .{ .transform_footer = cmd };
     if (commandAction(s, "transform-preview")) |cmd| return .{ .transform_preview = cmd };
     if (commandAction(s, "bg-transform-query")) |cmd| return .{ .bg_transform_query = cmd };
+    if (commandAction(s, "bg-transform-search")) |cmd| return .{ .bg_transform_search = cmd };
     if (commandAction(s, "bg-transform-prompt")) |cmd| return .{ .bg_transform_prompt = cmd };
     if (commandAction(s, "bg-transform-header")) |cmd| return .{ .bg_transform_header = cmd };
     if (commandAction(s, "bg-transform-footer")) |cmd| return .{ .bg_transform_footer = cmd };
@@ -6193,6 +6253,40 @@ test "stateful binding actions parse" {
     try std.testing.expect((try parseAction("select")) == .select);
     const printed = try parseAction("print(ctrl-y)");
     try std.testing.expectEqualStrings("ctrl-y", printed.print);
+}
+
+test "search override actions parse" {
+    const direct = try parseAction("search(foo bar)");
+    try std.testing.expectEqualStrings("foo bar", direct.search);
+    const transformed = try parseAction("transform-search:printf beta");
+    try std.testing.expectEqualStrings("printf beta", transformed.transform_search);
+    const background = try parseAction("bg-transform-search(printf gamma)");
+    try std.testing.expectEqualStrings("printf gamma", background.bg_transform_search);
+}
+
+test "transform first-line capture matches fzf" {
+    try std.testing.expectEqualStrings("alpha", firstCommandOutputLine("alpha\nbeta"));
+    try std.testing.expectEqualStrings("alpha", firstCommandOutputLine("alpha\r\nbeta"));
+    try std.testing.expectEqualStrings("alpha  ", firstCommandOutputLine("alpha  \nbeta"));
+    try std.testing.expectEqualStrings("alpha", firstCommandOutputLine("alpha"));
+}
+
+test "search override bypasses disabled without changing visible query" {
+    const normal = resolveEffectiveSearch("alpha", false, null);
+    try std.testing.expectEqualStrings("alpha", normal.query);
+    try std.testing.expect(!normal.disabled);
+
+    const disabled = resolveEffectiveSearch("alpha", true, null);
+    try std.testing.expectEqualStrings("", disabled.query);
+    try std.testing.expect(disabled.disabled);
+
+    const overridden = resolveEffectiveSearch("alpha", true, "beta");
+    try std.testing.expectEqualStrings("beta", overridden.query);
+    try std.testing.expect(!overridden.disabled);
+
+    const empty_override = resolveEffectiveSearch("alpha", true, "");
+    try std.testing.expectEqualStrings("", empty_override.query);
+    try std.testing.expect(!empty_override.disabled);
 }
 
 test "binding parser" {
