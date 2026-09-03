@@ -189,6 +189,7 @@ const Action = union(enum) {
     change_header: []const u8,
     change_footer: []const u8,
     change_preview: []const u8,
+    preview: []const u8,
     transform: []const u8,
     transform_query: []const u8,
     transform_search: []const u8,
@@ -1029,6 +1030,7 @@ const Ui = struct {
     dirty_search: bool = true,
     preview_cache_key: ?usize = null,
     preview_cache_query_hash: u64 = 0,
+    preview_forced: bool = false,
     preview_text: []u8 = &.{},
     preview_offset: usize = 0,
     accepted_key: ?[]const u8 = null,
@@ -1291,7 +1293,7 @@ const Ui = struct {
         const full = Pane{ .row = 1, .col = 1, .rows = size.rows, .cols = size.cols };
         const area = insetPane(full, self.options.margin);
         var main_pane = area;
-        const preview_active = self.options.preview.command != null and !self.options.preview.hidden;
+        const preview_active = (self.options.preview.command != null or self.preview_forced) and !self.options.preview.hidden;
         if (!preview_active) return .{ .main = main_pane, .preview = null };
 
         switch (self.options.preview.position) {
@@ -1918,6 +1920,7 @@ const Ui = struct {
             .close => {
                 if (self.paneGeometry(self.terminal.size()).preview != null) {
                     self.options.preview.hidden = true;
+                    self.preview_forced = false;
                     self.preview_cache_key = null;
                 } else return 130;
             },
@@ -1928,14 +1931,28 @@ const Ui = struct {
             },
             .abort => return 130,
             .toggle_preview => {
-                self.options.preview.hidden = !self.options.preview.hidden;
-                self.preview_cache_key = null;
+                const active = (self.options.preview.command != null or self.preview_forced) and !self.options.preview.hidden;
+                if (active or self.options.preview.command != null) {
+                    self.options.preview.hidden = !active;
+                    self.preview_forced = false;
+                    self.preview_cache_key = null;
+                }
             },
             .show_preview => {
-                self.options.preview.hidden = false;
-                self.preview_cache_key = null;
+                const active = (self.options.preview.command != null or self.preview_forced) and !self.options.preview.hidden;
+                if (!active and self.options.preview.command != null) {
+                    self.options.preview.hidden = false;
+                    self.preview_forced = false;
+                    self.preview_cache_key = null;
+                }
             },
-            .hide_preview => self.options.preview.hidden = true,
+            .hide_preview => {
+                const active = (self.options.preview.command != null or self.preview_forced) and !self.options.preview.hidden;
+                if (active) {
+                    self.options.preview.hidden = true;
+                    self.preview_forced = false;
+                }
+            },
             .refresh_preview => {
                 self.preview_cache_key = null;
                 self.preview_offset = 0;
@@ -2023,9 +2040,11 @@ const Ui = struct {
             .change_preview => |value| {
                 self.options.preview.command = value;
                 self.options.preview.hidden = false;
+                self.preview_forced = false;
                 self.preview_cache_key = null;
                 self.preview_offset = 0;
             },
+            .preview => |cmd| try self.runPreviewAction(cmd),
             .transform => |cmd| return try self.runTransformActions(cmd),
             .transform_query => |cmd| {
                 const value = try self.runTransformCommandFirstLine(cmd);
@@ -3387,13 +3406,31 @@ const Ui = struct {
         return start_row + rows;
     }
 
-    fn ensurePreview(self: *Ui) !void {
-        const cmd_template = self.options.preview.command orelse return;
-        if (self.result_len == 0) return;
-        const idx = self.results[self.focus];
-        const qhash = std.hash.Wyhash.hash(0, self.query.items);
-        if (self.preview_cache_key == idx and self.preview_cache_query_hash == qhash) return;
-        var expanded = try self.expandedCommand(cmd_template);
+    fn clearPreviewText(self: *Ui) void {
+        if (self.preview_text.len != 0) self.allocator.free(self.preview_text);
+        self.preview_text = &.{};
+        self.preview_offset = 0;
+    }
+
+    fn cachePreviewForCurrent(self: *Ui) void {
+        self.preview_cache_key = if (self.result_len == 0) null else self.results[self.focus];
+        self.preview_cache_query_hash = std.hash.Wyhash.hash(0, self.query.items);
+        self.preview_offset = 0;
+    }
+
+    fn previewTemplateRunnable(self: *Ui, command: []const u8) bool {
+        const flags = previewTemplateFlags(command);
+        return !flags.slot or flags.force_update or flags.asterisk or
+            (flags.plus and self.selected_count != 0) or self.result_len != 0;
+    }
+
+    fn runPreviewTemplate(self: *Ui, command: []const u8) !void {
+        if (!self.previewTemplateRunnable(command)) {
+            self.clearPreviewText();
+            self.cachePreviewForCurrent();
+            return;
+        }
+        var expanded = try self.expandedCommand(command);
         defer expanded.deinit();
         var env = try self.commandEnvironment();
         defer env.deinit();
@@ -3402,18 +3439,32 @@ const Ui = struct {
             .environ_map = &env,
             .stdout_limit = .limited(512 * 1024),
             .stderr_limit = .limited(128 * 1024),
-        }) catch {
-            return;
-        };
+        }) catch return;
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
-        if (self.preview_text.len != 0) self.allocator.free(self.preview_text);
-        self.preview_text = try self.allocator.alloc(u8, result.stdout.len + result.stderr.len);
-        @memcpy(self.preview_text[0..result.stdout.len], result.stdout);
-        @memcpy(self.preview_text[result.stdout.len..], result.stderr);
-        self.preview_cache_key = idx;
-        self.preview_cache_query_hash = qhash;
-        self.preview_offset = 0;
+        self.clearPreviewText();
+        const output_len = result.stdout.len + result.stderr.len;
+        if (output_len != 0) {
+            self.preview_text = try self.allocator.alloc(u8, output_len);
+            @memcpy(self.preview_text[0..result.stdout.len], result.stdout);
+            @memcpy(self.preview_text[result.stdout.len..], result.stderr);
+        }
+        self.cachePreviewForCurrent();
+    }
+
+    fn runPreviewAction(self: *Ui, command: []const u8) !void {
+        self.preview_forced = true;
+        self.options.preview.hidden = false;
+        if (command.len != 0) try self.runPreviewTemplate(command);
+    }
+
+    fn ensurePreview(self: *Ui) !void {
+        const cmd_template = self.options.preview.command orelse return;
+        if (self.result_len == 0) return;
+        const idx = self.results[self.focus];
+        const qhash = std.hash.Wyhash.hash(0, self.query.items);
+        if (self.preview_cache_key == idx and self.preview_cache_query_hash == qhash) return;
+        try self.runPreviewTemplate(cmd_template);
     }
 
     fn renderPreviewOverlay(self: *Ui, frame: *Io.Writer.Allocating, size: anytype, geom: PaneGeometry, preview: Pane) !void {
@@ -5110,6 +5161,7 @@ fn parseAction(s: []const u8) !Action {
     if (commandAction(s, "change-header")) |value| return .{ .change_header = value };
     if (commandAction(s, "change-footer")) |value| return .{ .change_footer = value };
     if (commandAction(s, "change-preview")) |value| return .{ .change_preview = value };
+    if (commandAction(s, "preview")) |cmd| return .{ .preview = cmd };
     if (commandAction(s, "transform-query")) |cmd| return .{ .transform_query = cmd };
     if (commandAction(s, "transform-search")) |cmd| return .{ .transform_search = cmd };
     if (commandAction(s, "transform-nth")) |cmd| return .{ .transform_nth = cmd };
@@ -6564,6 +6616,50 @@ const PlaceholderKind = enum {
     fzf_prompt,
 };
 
+const PreviewTemplateFlags = struct {
+    slot: bool = false,
+    plus: bool = false,
+    asterisk: bool = false,
+    force_update: bool = false,
+};
+
+fn previewTemplateFlags(template: []const u8) PreviewTemplateFlags {
+    var flags: PreviewTemplateFlags = .{};
+    var i: usize = 0;
+    while (i < template.len) {
+        if (template[i] == '\\' and i + 1 < template.len and template[i + 1] == '{') {
+            if (std.mem.indexOfScalarPos(u8, template, i + 2, '}')) |close| {
+                if (parsePlaceholderExpr(template[i + 2 .. close]) != null) {
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
+        if (template[i] != '{') {
+            i += 1;
+            continue;
+        }
+        const close = std.mem.indexOfScalarPos(u8, template, i + 1, '}') orelse {
+            i += 1;
+            continue;
+        };
+        const spec = parsePlaceholderExpr(template[i + 1 .. close]) orelse {
+            i = close + 1;
+            continue;
+        };
+        flags.slot = true;
+        switch (spec.kind) {
+            .query, .query_fields, .fzf_query, .fzf_action, .fzf_prompt => flags.force_update = true,
+            .item, .fields => {
+                flags.plus = flags.plus or spec.flags.plus;
+                flags.asterisk = flags.asterisk or spec.flags.asterisk;
+            },
+        }
+        i = close + 1;
+    }
+    return flags;
+}
+
 const PlaceholderSpec = struct {
     kind: PlaceholderKind,
     flags: PlaceholderFlags = .{},
@@ -7882,6 +7978,21 @@ test "search enable and phony aliases are last-one-wins" {
     try std.testing.expect(!no_phony.disabled);
 }
 
+test "preview action placeholder classification" {
+    const plain = previewTemplateFlags("printf ready");
+    try std.testing.expect(!plain.slot);
+    const current = previewTemplateFlags("echo {} {2} {n}");
+    try std.testing.expect(current.slot and !current.plus and !current.asterisk and !current.force_update);
+    const selected = previewTemplateFlags("echo {+} {+2}");
+    try std.testing.expect(selected.slot and selected.plus and !selected.asterisk);
+    const matched = previewTemplateFlags("echo {*} {*2}");
+    try std.testing.expect(matched.slot and matched.asterisk);
+    const query = previewTemplateFlags("echo {q} {fzf:action}");
+    try std.testing.expect(query.slot and query.force_update);
+    const escaped = previewTemplateFlags("echo \\{} \\{q}");
+    try std.testing.expect(!escaped.slot);
+}
+
 test "stateful binding actions parse" {
     try std.testing.expect((try parseAction("toggle-sort")) == .toggle_sort);
     try std.testing.expect((try parseAction("ToGgLe-SoRt")) == .toggle_sort);
@@ -7889,6 +8000,8 @@ test "stateful binding actions parse" {
     try std.testing.expectEqualStrings("printf MiXeD", mixed_execute.execute_silent);
     const mixed_execute_multi = try parseAction("Execute-Multi@printf multi@");
     try std.testing.expectEqualStrings("printf multi", mixed_execute_multi.execute_multi);
+    const mixed_preview = try parseAction("PrEvIeW(printf preview)");
+    try std.testing.expectEqualStrings("printf preview", mixed_preview.preview);
     try std.testing.expect((try parseAction("enable-search")) == .enable_search);
     const q = try parseAction("change-query(foo bar)");
     try std.testing.expectEqualStrings("foo bar", q.change_query);
