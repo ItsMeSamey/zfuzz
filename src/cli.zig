@@ -142,6 +142,10 @@ const Action = union(enum) {
     change_query: []const u8,
     search: []const u8,
     change_prompt: []const u8,
+    change_ghost: []const u8,
+    change_pointer: []const u8,
+    change_border_label: []const u8,
+    change_preview_label: []const u8,
     change_header: []const u8,
     change_footer: []const u8,
     change_preview: []const u8,
@@ -149,6 +153,10 @@ const Action = union(enum) {
     transform_query: []const u8,
     transform_search: []const u8,
     transform_prompt: []const u8,
+    transform_ghost: []const u8,
+    transform_pointer: []const u8,
+    transform_border_label: []const u8,
+    transform_preview_label: []const u8,
     transform_header: []const u8,
     transform_footer: []const u8,
     transform_preview: []const u8,
@@ -156,6 +164,10 @@ const Action = union(enum) {
     bg_transform_query: []const u8,
     bg_transform_search: []const u8,
     bg_transform_prompt: []const u8,
+    bg_transform_ghost: []const u8,
+    bg_transform_pointer: []const u8,
+    bg_transform_border_label: []const u8,
+    bg_transform_preview_label: []const u8,
     bg_transform_header: []const u8,
     bg_transform_footer: []const u8,
     bg_transform_preview: []const u8,
@@ -658,7 +670,7 @@ const QueryHistory = struct {
     }
 };
 
-const BackgroundKind = enum { actions, query, search, prompt, header, footer, preview, reload };
+const BackgroundKind = enum { actions, query, search, prompt, ghost, pointer, border_label, preview_label, header, footer, preview, reload };
 
 const BackgroundResult = struct {
     kind: BackgroundKind,
@@ -795,7 +807,7 @@ fn backgroundTransformThread(ctx: *BackgroundContext) void {
     defer allocator.free(result.stdout);
     const trimmed = std.mem.trimEnd(u8, result.stdout, "\r\n");
     const text = switch (ctx.kind) {
-        .query, .search, .prompt => firstCommandOutputLine(trimmed),
+        .query, .search, .prompt, .ghost, .pointer, .border_label, .preview_label => firstCommandOutputLine(trimmed),
         else => trimmed,
     };
     const output = allocator.dupe(u8, text) catch {
@@ -849,6 +861,10 @@ const Ui = struct {
     focus_event_pending: bool = false,
     owned_prompt: ?[]u8 = null,
     owned_search_override: ?[]u8 = null,
+    owned_ghost: ?[]u8 = null,
+    owned_pointer: ?[]u8 = null,
+    owned_border_label: ?[]u8 = null,
+    owned_preview_label: ?[]u8 = null,
     owned_header: ?[]u8 = null,
     owned_footer: ?[]u8 = null,
     owned_preview: ?[]u8 = null,
@@ -932,6 +948,10 @@ const Ui = struct {
         if (self.preview_text.len != 0) self.allocator.free(self.preview_text);
         if (self.owned_prompt) |value| self.allocator.free(value);
         if (self.owned_search_override) |value| self.allocator.free(value);
+        if (self.owned_ghost) |value| self.allocator.free(value);
+        if (self.owned_pointer) |value| self.allocator.free(value);
+        if (self.owned_border_label) |value| self.allocator.free(value);
+        if (self.owned_preview_label) |value| self.allocator.free(value);
         if (self.owned_header) |value| self.allocator.free(value);
         if (self.owned_footer) |value| self.allocator.free(value);
         if (self.owned_preview) |value| self.allocator.free(value);
@@ -1462,6 +1482,22 @@ const Ui = struct {
                     self.replaceOwnedText(&self.owned_prompt, &self.options.prompt, result.output);
                     owned = null;
                 },
+                .ghost => {
+                    self.replaceOwnedOptionalText(&self.owned_ghost, &self.options.ghost, result.output);
+                    owned = null;
+                },
+                .pointer => {
+                    self.replaceOwnedText(&self.owned_pointer, &self.options.pointer, result.output);
+                    owned = null;
+                },
+                .border_label => {
+                    self.replaceOwnedOptionalText(&self.owned_border_label, &self.options.border_label, result.output);
+                    owned = null;
+                },
+                .preview_label => {
+                    self.replaceOwnedOptionalText(&self.owned_preview_label, &self.options.preview.label, result.output);
+                    owned = null;
+                },
                 .header => {
                     self.replaceOwnedOptionalText(&self.owned_header, &self.options.header, result.output);
                     owned = null;
@@ -1734,6 +1770,10 @@ const Ui = struct {
             },
             .search => |value| try self.setSearchOverride(value),
             .change_prompt => |value| self.options.prompt = value,
+            .change_ghost => |value| self.options.ghost = value,
+            .change_pointer => |value| self.options.pointer = value,
+            .change_border_label => |value| self.options.border_label = value,
+            .change_preview_label => |value| self.options.preview.label = value,
             .change_header => |value| self.options.header = value,
             .change_footer => |value| self.options.footer = value,
             .change_preview => |value| {
@@ -1756,6 +1796,22 @@ const Ui = struct {
                 const value = try self.runTransformCommandFirstLine(cmd);
                 self.replaceOwnedText(&self.owned_prompt, &self.options.prompt, value);
             },
+            .transform_ghost => |cmd| {
+                const value = try self.runTransformCommandFirstLine(cmd);
+                self.replaceOwnedOptionalText(&self.owned_ghost, &self.options.ghost, value);
+            },
+            .transform_pointer => |cmd| {
+                const value = try self.runTransformCommandFirstLine(cmd);
+                self.replaceOwnedText(&self.owned_pointer, &self.options.pointer, value);
+            },
+            .transform_border_label => |cmd| {
+                const value = try self.runTransformCommandFirstLine(cmd);
+                self.replaceOwnedOptionalText(&self.owned_border_label, &self.options.border_label, value);
+            },
+            .transform_preview_label => |cmd| {
+                const value = try self.runTransformCommandFirstLine(cmd);
+                self.replaceOwnedOptionalText(&self.owned_preview_label, &self.options.preview.label, value);
+            },
             .transform_header => |cmd| {
                 const value = try self.runTransformCommand(cmd);
                 self.replaceOwnedOptionalText(&self.owned_header, &self.options.header, value);
@@ -1775,6 +1831,10 @@ const Ui = struct {
             .bg_transform_query => |cmd| try self.launchBackgroundTransform(.query, cmd),
             .bg_transform_search => |cmd| try self.launchBackgroundTransform(.search, cmd),
             .bg_transform_prompt => |cmd| try self.launchBackgroundTransform(.prompt, cmd),
+            .bg_transform_ghost => |cmd| try self.launchBackgroundTransform(.ghost, cmd),
+            .bg_transform_pointer => |cmd| try self.launchBackgroundTransform(.pointer, cmd),
+            .bg_transform_border_label => |cmd| try self.launchBackgroundTransform(.border_label, cmd),
+            .bg_transform_preview_label => |cmd| try self.launchBackgroundTransform(.preview_label, cmd),
             .bg_transform_header => |cmd| try self.launchBackgroundTransform(.header, cmd),
             .bg_transform_footer => |cmd| try self.launchBackgroundTransform(.footer, cmd),
             .bg_transform_preview => |cmd| try self.launchBackgroundTransform(.preview, cmd),
@@ -4008,18 +4068,30 @@ fn parseAction(s: []const u8) !Action {
     if (commandAction(s, "change-query")) |value| return .{ .change_query = value };
     if (commandAction(s, "search")) |value| return .{ .search = value };
     if (commandAction(s, "change-prompt")) |value| return .{ .change_prompt = value };
+    if (commandAction(s, "change-ghost")) |value| return .{ .change_ghost = value };
+    if (commandAction(s, "change-pointer")) |value| return .{ .change_pointer = value };
+    if (commandAction(s, "change-border-label")) |value| return .{ .change_border_label = value };
+    if (commandAction(s, "change-preview-label")) |value| return .{ .change_preview_label = value };
     if (commandAction(s, "change-header")) |value| return .{ .change_header = value };
     if (commandAction(s, "change-footer")) |value| return .{ .change_footer = value };
     if (commandAction(s, "change-preview")) |value| return .{ .change_preview = value };
     if (commandAction(s, "transform-query")) |cmd| return .{ .transform_query = cmd };
     if (commandAction(s, "transform-search")) |cmd| return .{ .transform_search = cmd };
     if (commandAction(s, "transform-prompt")) |cmd| return .{ .transform_prompt = cmd };
+    if (commandAction(s, "transform-ghost")) |cmd| return .{ .transform_ghost = cmd };
+    if (commandAction(s, "transform-pointer")) |cmd| return .{ .transform_pointer = cmd };
+    if (commandAction(s, "transform-border-label")) |cmd| return .{ .transform_border_label = cmd };
+    if (commandAction(s, "transform-preview-label")) |cmd| return .{ .transform_preview_label = cmd };
     if (commandAction(s, "transform-header")) |cmd| return .{ .transform_header = cmd };
     if (commandAction(s, "transform-footer")) |cmd| return .{ .transform_footer = cmd };
     if (commandAction(s, "transform-preview")) |cmd| return .{ .transform_preview = cmd };
     if (commandAction(s, "bg-transform-query")) |cmd| return .{ .bg_transform_query = cmd };
     if (commandAction(s, "bg-transform-search")) |cmd| return .{ .bg_transform_search = cmd };
     if (commandAction(s, "bg-transform-prompt")) |cmd| return .{ .bg_transform_prompt = cmd };
+    if (commandAction(s, "bg-transform-ghost")) |cmd| return .{ .bg_transform_ghost = cmd };
+    if (commandAction(s, "bg-transform-pointer")) |cmd| return .{ .bg_transform_pointer = cmd };
+    if (commandAction(s, "bg-transform-border-label")) |cmd| return .{ .bg_transform_border_label = cmd };
+    if (commandAction(s, "bg-transform-preview-label")) |cmd| return .{ .bg_transform_preview_label = cmd };
     if (commandAction(s, "bg-transform-header")) |cmd| return .{ .bg_transform_header = cmd };
     if (commandAction(s, "bg-transform-footer")) |cmd| return .{ .bg_transform_footer = cmd };
     if (commandAction(s, "bg-transform-preview")) |cmd| return .{ .bg_transform_preview = cmd };
@@ -6262,6 +6334,36 @@ test "search override actions parse" {
     try std.testing.expectEqualStrings("printf beta", transformed.transform_search);
     const background = try parseAction("bg-transform-search(printf gamma)");
     try std.testing.expectEqualStrings("printf gamma", background.bg_transform_search);
+}
+
+test "dynamic visual actions parse" {
+    const change_ghost = try parseAction("change-ghost(type here)");
+    try std.testing.expectEqualStrings("type here", change_ghost.change_ghost);
+    const transform_ghost = try parseAction("transform-ghost:printf ghost");
+    try std.testing.expectEqualStrings("printf ghost", transform_ghost.transform_ghost);
+    const bg_ghost = try parseAction("bg-transform-ghost(printf ghost)");
+    try std.testing.expectEqualStrings("printf ghost", bg_ghost.bg_transform_ghost);
+
+    const change_pointer = try parseAction("change-pointer(>>)");
+    try std.testing.expectEqualStrings(">>", change_pointer.change_pointer);
+    const transform_pointer = try parseAction("transform-pointer:printf '>>'");
+    try std.testing.expectEqualStrings("printf '>>'", transform_pointer.transform_pointer);
+    const bg_pointer = try parseAction("bg-transform-pointer(printf '>')");
+    try std.testing.expectEqualStrings("printf '>'", bg_pointer.bg_transform_pointer);
+
+    const change_border = try parseAction("change-border-label(repo)");
+    try std.testing.expectEqualStrings("repo", change_border.change_border_label);
+    const transform_border = try parseAction("transform-border-label:printf repo");
+    try std.testing.expectEqualStrings("printf repo", transform_border.transform_border_label);
+    const bg_border = try parseAction("bg-transform-border-label(printf repo)");
+    try std.testing.expectEqualStrings("printf repo", bg_border.bg_transform_border_label);
+
+    const change_preview = try parseAction("change-preview-label(details)");
+    try std.testing.expectEqualStrings("details", change_preview.change_preview_label);
+    const transform_preview = try parseAction("transform-preview-label:printf details");
+    try std.testing.expectEqualStrings("printf details", transform_preview.transform_preview_label);
+    const bg_preview = try parseAction("bg-transform-preview-label(printf details)");
+    try std.testing.expectEqualStrings("printf details", bg_preview.bg_transform_preview_label);
 }
 
 test "transform first-line capture matches fzf" {
