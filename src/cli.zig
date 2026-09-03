@@ -145,6 +145,8 @@ const Options = struct {
     pointer: []const u8 = ">",
     marker: []const u8 = ">",
     header: ?[]const u8 = null,
+    header_lines: usize = 0,
+    header_first: bool = false,
     footer: ?[]const u8 = null,
     layout: Layout = .default,
     multi: bool = false,
@@ -206,6 +208,7 @@ const Options = struct {
 
 const CandidateSet = struct {
     blob: []u8,
+    header: [][]const u8,
     output: [][]const u8,
     display: [][]const u8,
     search: [][]const u8,
@@ -221,6 +224,7 @@ const CandidateSet = struct {
             for (self.display) |line| allocator.free(line);
             allocator.free(self.display);
         }
+        allocator.free(self.header);
         allocator.free(self.output);
         allocator.free(self.blob);
     }
@@ -235,16 +239,20 @@ const StreamInput = struct {
     allocator: Allocator,
     delim: u8,
     tail: ?usize,
+    header_limit: usize,
+    headers: std.ArrayList([]u8) = .empty,
     records: std.ArrayList([]u8) = .empty,
     head: usize = 0,
     partial: std.ArrayList(u8) = .empty,
     eof: bool = false,
 
-    fn init(allocator: Allocator, delim: u8, tail: ?usize) StreamInput {
-        return .{ .allocator = allocator, .delim = delim, .tail = tail };
+    fn init(allocator: Allocator, delim: u8, tail: ?usize, header_limit: usize) StreamInput {
+        return .{ .allocator = allocator, .delim = delim, .tail = tail, .header_limit = header_limit };
     }
 
     fn deinit(self: *StreamInput) void {
+        for (self.headers.items) |record| self.allocator.free(record);
+        self.headers.deinit(self.allocator);
         for (self.records.items[self.head..]) |record| self.allocator.free(record);
         self.records.deinit(self.allocator);
         self.partial.deinit(self.allocator);
@@ -255,6 +263,12 @@ const StreamInput = struct {
     }
 
     fn pushRecord(self: *StreamInput, record: []const u8) !void {
+        if (self.headers.items.len < self.header_limit) {
+            const owned = try self.allocator.dupe(u8, record);
+            errdefer self.allocator.free(owned);
+            try self.headers.append(self.allocator, owned);
+            return;
+        }
         if (self.tail) |limit| {
             while (self.records.items.len - self.head >= limit) {
                 self.allocator.free(self.records.items[self.head]);
@@ -326,10 +340,17 @@ const StreamInput = struct {
 
     fn materializeBlob(self: *const StreamInput) ![]u8 {
         const records = self.activeRecords();
-        var len: usize = records.len;
+        var len: usize = self.headers.items.len + records.len;
+        for (self.headers.items) |record| len += record.len;
         for (records) |record| len += record.len;
         const blob = try self.allocator.alloc(u8, len);
         var at: usize = 0;
+        for (self.headers.items) |record| {
+            @memcpy(blob[at .. at + record.len], record);
+            at += record.len;
+            blob[at] = self.delim;
+            at += 1;
+        }
         for (records) |record| {
             @memcpy(blob[at .. at + record.len], record);
             at += record.len;
@@ -805,6 +826,37 @@ const Ui = struct {
         return insetPane(content, self.options.padding);
     }
 
+    fn headerRowCount(self: *const Ui) usize {
+        var count = self.candidates.header.len;
+        if (self.options.header) |text| {
+            if (text.len != 0) {
+                count += 1;
+                for (text) |byte| if (byte == '\n') {
+                    count += 1;
+                };
+            }
+        }
+        return count;
+    }
+
+    fn renderHeaderBlock(self: *Ui, w: anytype, start_row: usize, content: Pane) !usize {
+        var row = start_row;
+        if (self.options.header) |text| {
+            if (text.len != 0) {
+                var lines = std.mem.splitScalar(u8, text, '\n');
+                while (lines.next()) |line| {
+                    try self.renderPlainLine(w, row, content.col, line, content.cols, self.options.theme.header);
+                    row += 1;
+                }
+            }
+        }
+        for (self.candidates.header) |line| {
+            try self.renderPlainLine(w, row, content.col, line, content.cols, self.options.theme.header);
+            row += 1;
+        }
+        return row;
+    }
+
     fn visibleListRows(self: *Ui) usize {
         const geom = self.paneGeometry(self.terminal.size());
         return self.listRows(self.contentPane(geom.main).rows);
@@ -820,7 +872,7 @@ const Ui = struct {
     fn listRows(self: *Ui, rows: usize) usize {
         var fixed: usize = 1;
         if (self.options.info_style == .default or self.options.info_style == .right) fixed += 1;
-        if (self.options.header != null) fixed += 1;
+        fixed += self.headerRowCount();
         if (self.options.footer != null) fixed += 1;
         const effective = @max(@as(usize, 3), rows);
         return if (effective > fixed) effective - fixed else 1;
@@ -1298,7 +1350,7 @@ const Ui = struct {
         const content = self.contentPane(geom.main);
         const rows = self.listRows(content.rows);
         const list_start = if (self.options.layout == .reverse)
-            content.row + 1 + @intFromBool(self.options.header != null)
+            content.row + 1 + @intFromBool(self.options.info_style == .default or self.options.info_style == .right) + self.headerRowCount()
         else
             content.row;
         if (m.y < list_start or m.y >= list_start + rows) return;
@@ -1490,24 +1542,19 @@ const Ui = struct {
         const content = self.contentPane(geom.main);
         var row = content.row;
         if (self.options.layout == .reverse) {
+            if (self.options.header_first) row = try self.renderHeaderBlock(w, row, content);
             try self.renderPrompt(w, row, content.col, content.cols);
             row += 1;
             if (self.options.info_style == .default or self.options.info_style == .right) {
                 try self.renderInfo(w, row, content.col, content.cols);
                 row += 1;
             }
-            if (self.options.header) |h| {
-                try self.renderPlainLine(w, row, content.col, h, content.cols, self.options.theme.header);
-                row += 1;
-            }
+            if (!self.options.header_first) row = try self.renderHeaderBlock(w, row, content);
             row = try self.renderList(w, row, content, true);
             if (self.options.footer) |f| try self.renderPlainLine(w, row, content.col, f, content.cols, self.options.theme.footer);
         } else {
             row = try self.renderList(w, row, content, false);
-            if (self.options.header) |h| {
-                try self.renderPlainLine(w, row, content.col, h, content.cols, self.options.theme.header);
-                row += 1;
-            }
+            row = try self.renderHeaderBlock(w, row, content);
             if (self.options.info_style == .default or self.options.info_style == .right) {
                 try self.renderInfo(w, row, content.col, content.cols);
                 row += 1;
@@ -2080,7 +2127,7 @@ pub fn main(init: std.process.Init) !void {
 
     const live_stdin = terminal_opt != null and std.c.isatty(std.posix.STDIN_FILENO) != 1 and !options.sync;
     var stream_input: ?StreamInput = if (live_stdin)
-        StreamInput.init(allocator, if (options.read0) 0 else '\n', options.tail)
+        StreamInput.init(allocator, if (options.read0) 0 else '\n', options.tail, options.header_lines)
     else
         null;
     defer if (stream_input) |*stream| stream.deinit();
@@ -2529,6 +2576,24 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.header = a[9..];
             continue;
         }
+        if (std.mem.startsWith(u8, a, "--header-lines=")) {
+            o.*.header_lines = try std.fmt.parseInt(usize, a[15..], 10);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--header-lines")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.header_lines = try std.fmt.parseInt(usize, args[i], 10);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--header-first")) {
+            o.*.header_first = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-header-first")) {
+            o.*.header_first = false;
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--footer=")) {
             o.*.footer = a[9..];
             continue;
@@ -2912,7 +2977,7 @@ fn readCandidates(allocator: Allocator, io: Io, options: *const Options, default
         return candidatesFromOwnedBlob(allocator, blob, options);
     }
     if (options.tail) |tail| {
-        const blob = try readTailBlobStdin(allocator, tail, if (options.read0) 0 else '\n');
+        const blob = try readTailBlobStdin(allocator, tail, options.header_lines, if (options.read0) 0 else '\n');
         return candidatesFromOwnedBlob(allocator, blob, options);
     }
     var buffer: [64 * 1024]u8 = undefined;
@@ -2940,12 +3005,17 @@ const TailRing = struct {
     }
 };
 
-fn readTailBlobStdin(allocator: Allocator, tail: usize, delim: u8) ![]u8 {
+fn readTailBlobStdin(allocator: Allocator, tail: usize, header_lines: usize, delim: u8) ![]u8 {
     const slots = try allocator.alloc(?[]u8, tail);
     @memset(slots, null);
     var ring = TailRing{ .allocator = allocator, .slots = slots };
     defer ring.deinit();
 
+    var headers: std.ArrayList([]u8) = .empty;
+    defer {
+        for (headers.items) |line| allocator.free(line);
+        headers.deinit(allocator);
+    }
     var current: std.ArrayList(u8) = .empty;
     defer current.deinit(allocator);
     var buffer: [64 * 1024]u8 = undefined;
@@ -2963,7 +3033,11 @@ fn readTailBlobStdin(allocator: Allocator, tail: usize, delim: u8) ![]u8 {
         saw_any = true;
         for (buffer[0..count]) |byte| {
             if (byte == delim) {
-                try ring.push(current.items);
+                if (headers.items.len < header_lines) {
+                    try headers.append(allocator, try allocator.dupe(u8, current.items));
+                } else {
+                    try ring.push(current.items);
+                }
                 current.clearRetainingCapacity();
                 last_was_delim = true;
             } else {
@@ -2972,15 +3046,28 @@ fn readTailBlobStdin(allocator: Allocator, tail: usize, delim: u8) ![]u8 {
             }
         }
     }
-    if (saw_any and !last_was_delim) try ring.push(current.items);
+    if (saw_any and !last_was_delim) {
+        if (headers.items.len < header_lines) {
+            try headers.append(allocator, try allocator.dupe(u8, current.items));
+        } else {
+            try ring.push(current.items);
+        }
+    }
 
     const kept = @min(ring.total, tail);
-    if (kept == 0) return try allocator.alloc(u8, 0);
     const first = if (ring.total > tail) ring.total % tail else 0;
-    var bytes: usize = kept;
+    var bytes: usize = headers.items.len + kept;
+    for (headers.items) |line| bytes += line.len;
     for (0..kept) |i| bytes += ring.slots[(first + i) % tail].?.len;
+    if (bytes == 0) return try allocator.alloc(u8, 0);
     const blob = try allocator.alloc(u8, bytes);
     var at: usize = 0;
+    for (headers.items) |line| {
+        @memcpy(blob[at .. at + line.len], line);
+        at += line.len;
+        blob[at] = delim;
+        at += 1;
+    }
     for (0..kept) |i| {
         const record = ring.slots[(first + i) % tail].?;
         @memcpy(blob[at .. at + record.len], record);
@@ -2994,32 +3081,43 @@ fn readTailBlobStdin(allocator: Allocator, tail: usize, delim: u8) ![]u8 {
 fn candidatesFromOwnedBlob(allocator: Allocator, blob: []u8, options: *const Options) !CandidateSet {
     errdefer allocator.free(blob);
     const delim: u8 = if (options.read0) 0 else '\n';
-    var count: usize = 0;
+    var total_count: usize = 0;
     if (blob.len != 0) {
         var it_count = std.mem.splitScalar(u8, blob, delim);
         while (it_count.next()) |part| {
             if (part.len == 0 and it_count.index == null and blob[blob.len - 1] == delim) break;
-            count += 1;
+            total_count += 1;
         }
     }
-    const keep_count = if (options.tail) |tail| @min(count, tail) else count;
-    const skip_count = count - keep_count;
+    const header_count = @min(total_count, options.header_lines);
+    const body_count = total_count - header_count;
+    const keep_count = if (options.tail) |tail| @min(body_count, tail) else body_count;
+    const skip_body = body_count - keep_count;
+    const header = try allocator.alloc([]const u8, header_count);
+    errdefer allocator.free(header);
     const output = try allocator.alloc([]const u8, keep_count);
     errdefer allocator.free(output);
     var it = std.mem.splitScalar(u8, blob, delim);
     var source_index: usize = 0;
+    var header_index: usize = 0;
+    var body_index: usize = 0;
     var n: usize = 0;
     while (it.next()) |part| {
-        if (source_index < skip_count) {
-            source_index += 1;
-            continue;
+        if (source_index >= total_count) break;
+        const line = if (!options.read0 and part.len != 0 and part[part.len - 1] == '\r') part[0 .. part.len - 1] else part;
+        if (source_index < header_count) {
+            header[header_index] = line;
+            header_index += 1;
+        } else {
+            if (body_index >= skip_body and n < keep_count) {
+                output[n] = line;
+                n += 1;
+            }
+            body_index += 1;
         }
-        if (n >= keep_count) break;
-        output[n] = if (!options.read0 and part.len != 0 and part[part.len - 1] == '\r') part[0 .. part.len - 1] else part;
-        n += 1;
         source_index += 1;
     }
-    count = keep_count;
+    const count = keep_count;
     if (options.tac) std.mem.reverse([]const u8, output);
 
     var display: [][]const u8 = output;
@@ -3038,7 +3136,7 @@ fn candidatesFromOwnedBlob(allocator: Allocator, blob: []u8, options: *const Opt
 
     const base_search = if (options.with_nth != null) display else output;
     if (options.nth == null and !options.ansi) {
-        return .{ .blob = blob, .output = output, .display = display, .search = base_search, .owned_display = owned_display, .owned_search = false };
+        return .{ .blob = blob, .header = header, .output = output, .display = display, .search = base_search, .owned_display = owned_display, .owned_search = false };
     }
 
     const search = try allocator.alloc([]const u8, count);
@@ -3060,7 +3158,7 @@ fn candidatesFromOwnedBlob(allocator: Allocator, blob: []u8, options: *const Opt
         }
         built_search += 1;
     }
-    return .{ .blob = blob, .output = output, .display = display, .search = search, .owned_display = owned_display, .owned_search = true };
+    return .{ .blob = blob, .header = header, .output = output, .display = display, .search = search, .owned_display = owned_display, .owned_search = true };
 }
 
 const TermKind = enum { fuzzy, exact, prefix, suffix, boundary_exact, equal };
@@ -3981,6 +4079,10 @@ const usage =
     \\      --no-sort            preserve input order after filtering
     \\      --tiebreak=CRI       score tie-breaks: length/chunk/pathname/begin/end/index
     \\      --tail=N             keep only the last N input items in memory
+    \\      --track              keep current item focused across result updates
+    \\      --id-nth=EXPR        identity fields for tracking/reload selection
+    \\      --history=FILE       load and persist query history
+    \\      --history-size=N     cap persisted history entries (default 1000)
     \\  -d, --delimiter=STR      literal field delimiter
     \\  -n, --nth=EXPR           limit searchable fields
     \\      --with-nth=EXPR      transform displayed fields
@@ -4006,6 +4108,8 @@ const usage =
     \\      --pointer=STR        current-item pointer
     \\      --marker=STR         selected-item marker
     \\      --header=STR         header text
+    \\      --header-lines=N     treat first N input lines as non-selectable header
+    \\      --header-first       print header before prompt in reverse layout
     \\      --footer=STR         footer text
     \\      --no-border          disable border reservation
     \\      --no-mouse           disable xterm mouse tracking
@@ -4016,7 +4120,8 @@ const usage =
     \\
     \\Keys
     \\  Enter accept, Esc/Ctrl-C abort, arrows/Ctrl-J/Ctrl-K move,
-    \\  Tab toggle, Ctrl-A/E line edges, Ctrl-U clear, Ctrl-W erase word.
+    \\  Ctrl-P/N history when --history is active, Tab toggle,
+    \\  Ctrl-A/E line edges, Ctrl-U clear, Ctrl-W erase word.
 ;
 
 test "query history preserves edited navigation slots" {
@@ -4049,7 +4154,7 @@ test "walker options match fzf defaults and parse explicit modes" {
 
 test "stream input retains bounded tail across partial records" {
     const a = std.testing.allocator;
-    var stream = StreamInput.init(a, '\n', 2);
+    var stream = StreamInput.init(a, '\n', 2, 0);
     defer stream.deinit();
     try std.testing.expect(try stream.consume("a\nb\nc\n"));
     var blob = try stream.materializeBlob();
@@ -4060,6 +4165,27 @@ test "stream input retains bounded tail across partial records" {
     blob = try stream.materializeBlob();
     defer a.free(blob);
     try std.testing.expectEqualStrings("c\nd\n", blob);
+}
+
+test "header lines remain outside bounded tail" {
+    const a = std.testing.allocator;
+    var options: Options = .{ .header_lines = 1, .tail = 2 };
+    defer options.deinit(a);
+    const blob = try a.dupe(u8, "HEADER\none\ntwo\nthree\n");
+    var candidates = try candidatesFromOwnedBlob(a, blob, &options);
+    defer candidates.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), candidates.header.len);
+    try std.testing.expectEqualStrings("HEADER", candidates.header[0]);
+    try std.testing.expectEqual(@as(usize, 2), candidates.output.len);
+    try std.testing.expectEqualStrings("two", candidates.output[0]);
+    try std.testing.expectEqualStrings("three", candidates.output[1]);
+
+    var stream = StreamInput.init(a, '\n', 2, 1);
+    defer stream.deinit();
+    try std.testing.expect(try stream.consume("HEADER\none\ntwo\nthree\n"));
+    const streamed = try stream.materializeBlob();
+    defer a.free(streamed);
+    try std.testing.expectEqualStrings("HEADER\ntwo\nthree\n", streamed);
 }
 
 test "tail retains last records and empty input stays empty" {
