@@ -4788,22 +4788,124 @@ fn everyIntervalMilliseconds(trigger: []const u8) ?u64 {
     return @intFromFloat(ms_f);
 }
 
+fn asciiStartsWithIgnoreCase(text: []const u8, prefix: []const u8) bool {
+    return text.len >= prefix.len and std.ascii.eqlIgnoreCase(text[0..prefix.len], prefix);
+}
+
+fn isArgumentActionName(name: []const u8) bool {
+    const exact = [_][]const u8{
+        "become",       "execute",   "execute-multi",         "execute-silent", "reload",       "reload-sync", "preview",
+        "bg-transform", "transform", "change-preview-window", "change-preview", "change-multi", "rebind",      "unbind",
+        "toggle-bind",  "pos",       "put",                   "print",          "search",       "trigger",
+    };
+    for (exact) |candidate| if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
+
+    const suffixes = [_][]const u8{
+        "query",        "prompt",       "border-label", "list-label", "preview-label", "input-label", "header-label",
+        "footer-label", "header-lines", "header",       "footer",     "search",        "with-nth",    "nth",
+        "pointer",      "ghost",
+    };
+    const prefixes = [_][]const u8{ "change-", "transform-", "bg-transform-" };
+    for (prefixes) |prefix| {
+        if (!asciiStartsWithIgnoreCase(name, prefix)) continue;
+        const suffix = name[prefix.len..];
+        for (suffixes) |candidate| if (std.ascii.eqlIgnoreCase(suffix, candidate)) return true;
+    }
+    return false;
+}
+
+fn actionDelimiterClose(open: u8) ?u8 {
+    return switch (open) {
+        '(' => ')',
+        '{' => '}',
+        '[' => ']',
+        '<' => '>',
+        '~', '!', '@', '#', '$', '%', '^', '&', '*', ';', '/', '|' => open,
+        else => null,
+    };
+}
+
+fn actionNameEnd(text: []const u8, start: usize) usize {
+    var i = start;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (!(std.ascii.isAlphabetic(c) or c == '-')) break;
+    }
+    return i;
+}
+
+fn maskActionContents(allocator: Allocator, text: []const u8) ![]u8 {
+    const masked = try allocator.dupe(u8, text);
+    var search: usize = 0;
+    while (search < text.len) {
+        var found = false;
+        var name_end: usize = 0;
+        var i = search;
+        while (i < text.len) : (i += 1) {
+            if (text[i] != ':' and text[i] != '+') continue;
+            const begin = i + 1;
+            const end = actionNameEnd(text, begin);
+            if (end == begin or !isArgumentActionName(text[begin..end])) continue;
+            found = true;
+            name_end = end;
+            break;
+        }
+        if (!found) break;
+        if (name_end >= text.len) break;
+
+        const open = text[name_end];
+        if (open == ':') {
+            @memset(masked[name_end..], ' ');
+            break;
+        }
+        const close = actionDelimiterClose(open) orelse {
+            search = name_end;
+            continue;
+        };
+
+        var close_index: ?usize = null;
+        i = name_end + 1;
+        while (i < text.len) : (i += 1) {
+            if (text[i] != close) continue;
+            if (i + 1 == text.len or text[i + 1] == '+' or text[i + 1] == ',') {
+                close_index = i;
+                break;
+            }
+        }
+        const finish = close_index orelse break;
+        @memset(masked[name_end .. finish + 1], ' ');
+        search = finish + 1;
+    }
+    return masked;
+}
+
+fn maskActionListContents(allocator: Allocator, text: []const u8) ![]u8 {
+    const prefixed = try allocator.alloc(u8, text.len + 1);
+    defer allocator.free(prefixed);
+    prefixed[0] = ':';
+    @memcpy(prefixed[1..], text);
+    return maskActionContents(allocator, prefixed);
+}
+
 fn parseBindings(allocator: Allocator, out: *std.ArrayList(Binding), spec: []const u8) !void {
+    const masked = try maskActionContents(allocator, spec);
+    defer allocator.free(masked);
+
     var start: usize = 0;
-    var depth: usize = 0;
     var i: usize = 0;
     while (i <= spec.len) : (i += 1) {
         const at_end = i == spec.len;
-        const c: u8 = if (at_end) ',' else spec[i];
-        if (!at_end) {
-            if (c == '(') depth += 1 else if (c == ')' and depth != 0) depth -= 1;
-        }
-        if (c != ',' or depth != 0) continue;
-        const part = std.mem.trim(u8, spec[start..i], " \t");
+        if (!at_end and masked[i] != ',') continue;
+        const raw_part = spec[start..i];
+        const masked_part_raw = masked[start..i];
         start = i + 1;
+        const part = std.mem.trim(u8, raw_part, " \t");
         if (part.len == 0) continue;
-        const colon = std.mem.indexOfScalar(u8, part, ':') orelse return error.InvalidBinding;
+        const leading = @intFromPtr(part.ptr) - @intFromPtr(raw_part.ptr);
+        const masked_part = masked_part_raw[leading .. leading + part.len];
+        const colon = std.mem.indexOfScalar(u8, masked_part, ':') orelse return error.InvalidBinding;
         const trigger = std.mem.trim(u8, part[0..colon], " \t");
+        if (trigger.len == 0) return error.InvalidBinding;
         if (std.mem.startsWith(u8, trigger, "every(") and everyIntervalMilliseconds(trigger) == null) return error.InvalidEveryEvent;
         const action_text = std.mem.trim(u8, part[colon + 1 ..], " \t");
         try appendBindingActions(allocator, out, trigger, action_text);
@@ -4811,16 +4913,15 @@ fn parseBindings(allocator: Allocator, out: *std.ArrayList(Binding), spec: []con
 }
 
 fn appendBindingActions(allocator: Allocator, out: *std.ArrayList(Binding), trigger: []const u8, text: []const u8) !void {
+    const masked = try maskActionListContents(allocator, text);
+    defer allocator.free(masked);
+    const action_mask = masked[1..];
+
     var start: usize = 0;
-    var depth: usize = 0;
     var i: usize = 0;
     while (i <= text.len) : (i += 1) {
         const at_end = i == text.len;
-        const c: u8 = if (at_end) '+' else text[i];
-        if (!at_end) {
-            if (c == '(') depth += 1 else if (c == ')' and depth != 0) depth -= 1;
-        }
-        if (c != '+' or depth != 0) continue;
+        if (!at_end and action_mask[i] != '+') continue;
         const action_text = std.mem.trim(u8, text[start..i], " \t");
         start = i + 1;
         if (action_text.len == 0) continue;
@@ -4829,31 +4930,36 @@ fn appendBindingActions(allocator: Allocator, out: *std.ArrayList(Binding), trig
 }
 
 fn actionName(text: []const u8) []const u8 {
-    const paren = std.mem.indexOfScalar(u8, text, '(');
-    const colon = std.mem.indexOfScalar(u8, text, ':');
-    const end = if (paren) |p| if (colon) |c| @min(p, c) else p else if (colon) |c| c else text.len;
-    return std.mem.trim(u8, text[0..end], " \t");
+    const trimmed = std.mem.trim(u8, text, " \t");
+    var i: usize = 0;
+    while (i < trimmed.len) : (i += 1) {
+        const c = trimmed[i];
+        if (c != ':' and actionDelimiterClose(c) == null) continue;
+        const candidate = std.mem.trim(u8, trimmed[0..i], " \t");
+        if (isArgumentActionName(candidate)) return candidate;
+    }
+    return trimmed;
 }
 
 fn validateActionSequence(text: []const u8) bool {
+    const allocator = std.heap.page_allocator;
+    const masked = maskActionListContents(allocator, text) catch return false;
+    defer allocator.free(masked);
+    const action_mask = masked[1..];
+
     var start: usize = 0;
-    var depth: usize = 0;
     var count: usize = 0;
     var i: usize = 0;
     while (i <= text.len) : (i += 1) {
         const at_end = i == text.len;
-        const c: u8 = if (at_end) '+' else text[i];
-        if (!at_end) {
-            if (c == '(') depth += 1 else if (c == ')' and depth != 0) depth -= 1;
-        }
-        if (c != '+' or depth != 0) continue;
+        if (!at_end and action_mask[i] != '+') continue;
         const action_text = std.mem.trim(u8, text[start..i], " \t");
         start = i + 1;
         if (action_text.len == 0) continue;
         _ = parseAction(action_text) catch return false;
         count += 1;
     }
-    return count != 0 and depth == 0;
+    return count != 0;
 }
 
 fn parseAction(s: []const u8) !Action {
@@ -5008,11 +5114,13 @@ fn parseAction(s: []const u8) !Action {
 }
 
 fn commandAction(s: []const u8, name: []const u8) ?[]const u8 {
-    if (s.len < name.len or !std.ascii.eqlIgnoreCase(s[0..name.len], name)) return null;
+    if (!asciiStartsWithIgnoreCase(s, name)) return null;
     const rest = s[name.len..];
-    if (rest.len >= 2 and rest[0] == '(' and rest[rest.len - 1] == ')') return rest[1 .. rest.len - 1];
-    if (rest.len >= 2 and rest[0] == ':') return rest[1..];
-    return null;
+    if (rest.len >= 1 and rest[0] == ':') return rest[1..];
+    if (rest.len < 2) return null;
+    const close = actionDelimiterClose(rest[0]) orelse return null;
+    if (rest[rest.len - 1] != close) return null;
+    return rest[1 .. rest.len - 1];
 }
 
 fn hasArg(args: []const []const u8, needle: []const u8) bool {
@@ -7835,6 +7943,58 @@ test "binding parser" {
     try std.testing.expect(bindings.items[2].action == .accept);
 }
 
+test "binding parser accepts fzf action argument delimiters" {
+    const a = std.testing.allocator;
+    var bindings: std.ArrayList(Binding) = .empty;
+    defer bindings.deinit(a);
+
+    try parseBindings(
+        a,
+        &bindings,
+        "a:execute/echo a+b,c/+down,b:execute[echo 'x+y,z']+up,c:change-query@foo+bar,baz@+accept",
+    );
+    try std.testing.expectEqual(@as(usize, 6), bindings.items.len);
+    try std.testing.expectEqualStrings("a", bindings.items[0].trigger);
+    try std.testing.expectEqualStrings("echo a+b,c", bindings.items[0].action.execute);
+    try std.testing.expect(bindings.items[1].action == .down);
+    try std.testing.expectEqualStrings("b", bindings.items[2].trigger);
+    try std.testing.expectEqualStrings("echo 'x+y,z'", bindings.items[2].action.execute);
+    try std.testing.expect(bindings.items[3].action == .up);
+    try std.testing.expectEqualStrings("foo+bar,baz", bindings.items[4].action.change_query);
+    try std.testing.expect(bindings.items[5].action == .accept);
+
+    const empty_query = try parseAction("change-query:");
+    try std.testing.expectEqualStrings("", empty_query.change_query);
+
+    const cases = [_]struct { text: []const u8, payload: []const u8 }{
+        .{ .text = "execute(echo p)", .payload = "echo p" },
+        .{ .text = "execute[echo b]", .payload = "echo b" },
+        .{ .text = "execute{echo c}", .payload = "echo c" },
+        .{ .text = "execute<echo a>", .payload = "echo a" },
+        .{ .text = "execute/echo slash/", .payload = "echo slash" },
+        .{ .text = "execute@echo at@", .payload = "echo at" },
+        .{ .text = "execute;echo semi;", .payload = "echo semi" },
+        .{ .text = "execute|echo pipe|", .payload = "echo pipe" },
+        .{ .text = "execute!echo bang!", .payload = "echo bang" },
+    };
+    for (cases) |case| {
+        const action = try parseAction(case.text);
+        try std.testing.expectEqualStrings(case.payload, action.execute);
+    }
+
+    try std.testing.expectEqualStrings("delete-char/eof", actionName("delete-char/eof"));
+    try std.testing.expectEqualStrings("Execute", actionName("Execute/foo/"));
+}
+
+test "colon action argument consumes remaining binding text" {
+    const a = std.testing.allocator;
+    var bindings: std.ArrayList(Binding) = .empty;
+    defer bindings.deinit(a);
+    try parseBindings(a, &bindings, "x:execute:printf a+b,y:accept");
+    try std.testing.expectEqual(@as(usize, 1), bindings.items.len);
+    try std.testing.expectEqualStrings("printf a+b,y:accept", bindings.items[0].action.execute);
+}
+
 test "reload actions distinguish async and sync variants" {
     const asynchronous = try parseAction("reload(echo async)");
     try std.testing.expect(std.mem.eql(u8, asynchronous.reload, "echo async"));
@@ -8209,6 +8369,7 @@ test "listen option forms and action validation" {
     try std.testing.expectError(error.InvalidListenAddress, parseOptions(a, &.{ "zfuzz", "--listen=a:b:6269" }));
 
     try std.testing.expect(validateActionSequence("change-query(foo)+down"));
+    try std.testing.expect(validateActionSequence("execute/printf a+b,c/+down"));
     try std.testing.expect(validateActionSequence("execute-silent(true)"));
     try std.testing.expect(!validateActionSequence("not-a-real-action"));
 }
