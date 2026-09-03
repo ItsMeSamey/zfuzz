@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const fuzzy = @import("fuzzy");
 const fuzzy_engine = @import("engine");
 const listen = @import("listen.zig");
@@ -209,6 +210,7 @@ const Action = union(enum) {
     bg_transform_header: []const u8,
     bg_transform_footer: []const u8,
     bg_transform_preview: []const u8,
+    bg_cancel,
     print: []const u8,
     reload: []const u8,
     reload_sync: []const u8,
@@ -735,6 +737,8 @@ const BackgroundQueue = struct {
     io: Io,
     mutex: Io.Mutex = .init,
     results: std.ArrayList(BackgroundResult) = .empty,
+    running_pgroups: std.ArrayList(i64) = .empty,
+    cancel_generation: u64 = 0,
     active: usize = 0,
     alive: bool = true,
 
@@ -744,17 +748,54 @@ const BackgroundQueue = struct {
         return self;
     }
 
-    fn begin(self: *BackgroundQueue) bool {
+    fn begin(self: *BackgroundQueue) ?u64 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (!self.alive) return false;
+        if (!self.alive) return null;
         self.active += 1;
+        return self.cancel_generation;
+    }
+
+    fn registerProcess(self: *BackgroundQueue, cancel_generation: u64, pgid: i64) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.alive or cancel_generation != self.cancel_generation) return false;
+        try self.running_pgroups.append(self.allocator, pgid);
         return true;
     }
 
-    fn finish(self: *BackgroundQueue, kind: BackgroundKind, output: ?[]u8, generation: u64, binding_slot: ?usize) void {
+    fn unregisterProcess(self: *BackgroundQueue, pgid: i64) void {
         self.mutex.lockUncancelable(self.io);
-        if (self.alive) {
+        defer self.mutex.unlock(self.io);
+        for (self.running_pgroups.items, 0..) |value, i| {
+            if (value == pgid) {
+                _ = self.running_pgroups.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    fn cancel(self: *BackgroundQueue) void {
+        self.mutex.lockUncancelable(self.io);
+        self.cancel_generation +%= 1;
+        var keep: usize = 0;
+        for (self.results.items) |result| {
+            if (result.kind == .reload) {
+                self.results.items[keep] = result;
+                keep += 1;
+            } else {
+                self.allocator.free(result.output);
+            }
+        }
+        self.results.items.len = keep;
+        for (self.running_pgroups.items) |pgid| killBackgroundProcessGroup(pgid);
+        self.mutex.unlock(self.io);
+    }
+
+    fn finish(self: *BackgroundQueue, kind: BackgroundKind, output: ?[]u8, generation: u64, binding_slot: ?usize, cancel_generation: u64) void {
+        self.mutex.lockUncancelable(self.io);
+        const current = kind == .reload or cancel_generation == self.cancel_generation;
+        if (self.alive and current) {
             if (output) |value| {
                 self.results.append(self.allocator, .{ .kind = kind, .output = value, .generation = generation, .binding_slot = binding_slot }) catch self.allocator.free(value);
             }
@@ -778,6 +819,8 @@ const BackgroundQueue = struct {
     fn close(self: *BackgroundQueue) void {
         self.mutex.lockUncancelable(self.io);
         self.alive = false;
+        self.cancel_generation +%= 1;
+        for (self.running_pgroups.items) |pgid| killBackgroundProcessGroup(pgid);
         for (self.results.items) |result| self.allocator.free(result.output);
         self.results.deinit(self.allocator);
         self.results = .empty;
@@ -788,6 +831,7 @@ const BackgroundQueue = struct {
 
     fn destroy(self: *BackgroundQueue) void {
         const allocator = self.allocator;
+        self.running_pgroups.deinit(allocator);
         allocator.destroy(self);
     }
 };
@@ -815,6 +859,7 @@ const BackgroundContext = struct {
     kind: BackgroundKind,
     generation: u64,
     binding_slot: ?usize,
+    cancel_generation: u64,
     expanded: ExpandedCommand,
     env: std.process.Environ.Map,
 };
@@ -835,6 +880,65 @@ fn resolveEffectiveSearch(visible_query: []const u8, disabled: bool, search_over
     return .{ .query = visible_query, .disabled = false };
 }
 
+fn killBackgroundProcessGroup(pgid: i64) void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    const pid: std.posix.pid_t = @intCast(pgid);
+    std.posix.kill(-pid, .KILL) catch {};
+}
+
+fn runCancellableBackground(ctx: *BackgroundContext, max_stdout: usize) !std.process.RunResult {
+    var child = try std.process.spawn(ctx.io, .{
+        .argv = &.{ "/bin/sh", "-c", ctx.expanded.text },
+        .environ_map = &ctx.env,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = if (builtin.os.tag == .windows or builtin.os.tag == .wasi) null else 0,
+    });
+    defer child.kill(ctx.io);
+
+    const pgid: i64 = switch (builtin.os.tag) {
+        .windows, .wasi => 0,
+        else => @intCast(child.id.?),
+    };
+    const registered = if (pgid == 0) false else ctx.queue.registerProcess(ctx.cancel_generation, pgid) catch |err| {
+        killBackgroundProcessGroup(pgid);
+        return err;
+    };
+    if (pgid != 0 and !registered) killBackgroundProcessGroup(pgid);
+    defer if (registered) ctx.queue.unregisterProcess(pgid);
+
+    var multi_reader_buffer: Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: Io.File.MultiReader = undefined;
+    multi_reader.init(ctx.allocator, ctx.io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+
+    const stdout_reader = multi_reader.reader(0);
+    const stderr_reader = multi_reader.reader(1);
+    while (multi_reader.fill(64, .none)) |_| {
+        if (stdout_reader.buffered().len > max_stdout or stderr_reader.buffered().len > 1024 * 1024) {
+            if (pgid != 0) killBackgroundProcessGroup(pgid);
+            return error.StreamTooLong;
+        }
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| {
+            if (pgid != 0) killBackgroundProcessGroup(pgid);
+            return e;
+        },
+    }
+    multi_reader.checkAnyError() catch |err| {
+        if (pgid != 0) killBackgroundProcessGroup(pgid);
+        return err;
+    };
+
+    const term = try child.wait(ctx.io);
+    const stdout_slice = try multi_reader.toOwnedSlice(0);
+    errdefer ctx.allocator.free(stdout_slice);
+    const stderr_slice = try multi_reader.toOwnedSlice(1);
+    return .{ .term = term, .stdout = stdout_slice, .stderr = stderr_slice };
+}
+
 fn backgroundTransformThread(ctx: *BackgroundContext) void {
     const allocator = ctx.allocator;
     defer {
@@ -843,18 +947,24 @@ fn backgroundTransformThread(ctx: *BackgroundContext) void {
         allocator.destroy(ctx);
     }
     const max_stdout: usize = if (ctx.kind == .reload) 64 * 1024 * 1024 else 1024 * 1024;
-    const result = std.process.run(allocator, ctx.io, .{
-        .argv = &.{ "/bin/sh", "-c", ctx.expanded.text },
-        .environ_map = &ctx.env,
-        .stdout_limit = .limited(max_stdout),
-        .stderr_limit = .limited(1024 * 1024),
-    }) catch {
-        ctx.queue.finish(ctx.kind, null, ctx.generation, ctx.binding_slot);
-        return;
-    };
+    const result = if (ctx.kind == .reload)
+        std.process.run(allocator, ctx.io, .{
+            .argv = &.{ "/bin/sh", "-c", ctx.expanded.text },
+            .environ_map = &ctx.env,
+            .stdout_limit = .limited(max_stdout),
+            .stderr_limit = .limited(1024 * 1024),
+        }) catch {
+            ctx.queue.finish(ctx.kind, null, ctx.generation, ctx.binding_slot, ctx.cancel_generation);
+            return;
+        }
+    else
+        runCancellableBackground(ctx, max_stdout) catch {
+            ctx.queue.finish(ctx.kind, null, ctx.generation, ctx.binding_slot, ctx.cancel_generation);
+            return;
+        };
     allocator.free(result.stderr);
     if (ctx.kind == .reload) {
-        ctx.queue.finish(ctx.kind, result.stdout, ctx.generation, ctx.binding_slot);
+        ctx.queue.finish(ctx.kind, result.stdout, ctx.generation, ctx.binding_slot, ctx.cancel_generation);
         return;
     }
     defer allocator.free(result.stdout);
@@ -864,10 +974,10 @@ fn backgroundTransformThread(ctx: *BackgroundContext) void {
         else => trimmed,
     };
     const output = allocator.dupe(u8, text) catch {
-        ctx.queue.finish(ctx.kind, null, ctx.generation, ctx.binding_slot);
+        ctx.queue.finish(ctx.kind, null, ctx.generation, ctx.binding_slot, ctx.cancel_generation);
         return;
     };
-    ctx.queue.finish(ctx.kind, output, ctx.generation, ctx.binding_slot);
+    ctx.queue.finish(ctx.kind, output, ctx.generation, ctx.binding_slot, ctx.cancel_generation);
 }
 
 const Ui = struct {
@@ -1954,6 +2064,7 @@ const Ui = struct {
             .bg_transform_header => |cmd| try self.launchBackgroundTransform(.header, cmd),
             .bg_transform_footer => |cmd| try self.launchBackgroundTransform(.footer, cmd),
             .bg_transform_preview => |cmd| try self.launchBackgroundTransform(.preview, cmd),
+            .bg_cancel => self.bg_queue.cancel(),
             .print => |value| try self.print_queue.append(self.allocator, try self.allocator.dupe(u8, value)),
             .reload => |cmd| try self.launchAsyncReload(cmd),
             .reload_sync => |cmd| try self.reloadFromCommand(cmd),
@@ -2174,13 +2285,13 @@ const Ui = struct {
         errdefer expanded.deinit();
         var env = try self.commandEnvironment();
         errdefer env.deinit();
-        if (!self.bg_queue.begin()) {
+        const cancel_generation = self.bg_queue.begin() orelse {
             expanded.deinit();
             env.deinit();
             return;
-        }
+        };
         const ctx = self.allocator.create(BackgroundContext) catch |err| {
-            self.bg_queue.finish(kind, null, generation, binding_slot);
+            self.bg_queue.finish(kind, null, generation, binding_slot, cancel_generation);
             return err;
         };
         errdefer self.allocator.destroy(ctx);
@@ -2191,11 +2302,12 @@ const Ui = struct {
             .kind = kind,
             .generation = generation,
             .binding_slot = binding_slot,
+            .cancel_generation = cancel_generation,
             .expanded = expanded,
             .env = env,
         };
         const thread = std.Thread.spawn(.{}, backgroundTransformThread, .{ctx}) catch |err| {
-            self.bg_queue.finish(kind, null, generation, binding_slot);
+            self.bg_queue.finish(kind, null, generation, binding_slot, cancel_generation);
             return err;
         };
         thread.detach();
@@ -4538,6 +4650,7 @@ fn parseAction(s: []const u8) !Action {
     if (commandAction(s, "bg-transform-footer")) |cmd| return .{ .bg_transform_footer = cmd };
     if (commandAction(s, "bg-transform-preview")) |cmd| return .{ .bg_transform_preview = cmd };
     if (commandAction(s, "bg-transform")) |cmd| return .{ .bg_transform = cmd };
+    if (std.mem.eql(u8, s, "bg-cancel")) return .bg_cancel;
     if (commandAction(s, "transform")) |cmd| return .{ .transform = cmd };
     if (commandAction(s, "print")) |value| return .{ .print = value };
     if (commandAction(s, "reload-sync")) |cmd| return .{ .reload_sync = cmd };
@@ -6974,6 +7087,36 @@ test "dynamic visual actions parse" {
     try std.testing.expectEqualStrings("printf details", bg_preview.bg_transform_preview_label);
 }
 
+test "background cancellation invalidates transforms but preserves reload" {
+    const a = std.testing.allocator;
+    const queue = try BackgroundQueue.create(a, std.testing.io);
+    defer queue.close();
+
+    const stale_generation = queue.begin().?;
+    queue.cancel();
+    queue.finish(.query, try a.dupe(u8, "stale"), 0, null, stale_generation);
+
+    const queued_generation = queue.begin().?;
+    queue.finish(.prompt, try a.dupe(u8, "queued-stale"), 0, null, queued_generation);
+    const reload_generation = queue.begin().?;
+    queue.finish(.reload, try a.dupe(u8, "reload"), 1, null, reload_generation);
+    queue.cancel();
+
+    const fresh_generation = queue.begin().?;
+    queue.finish(.query, try a.dupe(u8, "fresh"), 0, null, fresh_generation);
+
+    var results = queue.takeAll();
+    defer {
+        for (results.items) |result| a.free(result.output);
+        results.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, 2), results.items.len);
+    try std.testing.expect(results.items[0].kind == .reload);
+    try std.testing.expectEqualStrings("reload", results.items[0].output);
+    try std.testing.expect(results.items[1].kind == .query);
+    try std.testing.expectEqualStrings("fresh", results.items[1].output);
+}
+
 test "transform first-line capture matches fzf" {
     try std.testing.expectEqualStrings("alpha", firstCommandOutputLine("alpha\nbeta"));
     try std.testing.expectEqualStrings("alpha", firstCommandOutputLine("alpha\r\nbeta"));
@@ -7033,6 +7176,7 @@ test "raw and exclusion actions parse" {
 test "background transform actions parse command payloads" {
     const generic = try parseAction("bg-transform(echo accept)");
     try std.testing.expect(std.mem.eql(u8, generic.bg_transform, "echo accept"));
+    try std.testing.expect((try parseAction("bg-cancel")) == .bg_cancel);
     const prompt = try parseAction("bg-transform-prompt:echo ready");
     try std.testing.expect(std.mem.eql(u8, prompt.bg_transform_prompt, "echo ready"));
 }
