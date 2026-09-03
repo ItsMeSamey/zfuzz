@@ -1,6 +1,7 @@
 const std = @import("std");
 const fuzzy = @import("fuzzy");
 const fuzzy_engine = @import("engine");
+const listen = @import("listen.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -176,6 +177,8 @@ const Options = struct {
     history_size: usize = 1000,
     track: bool = false,
     id_nth: ?[]const u8 = null,
+    listen_addr: ?[]const u8 = null,
+    listen_unsafe: bool = false,
     mouse: bool = true,
     style_preset: StylePreset = .default,
     border: bool = true,
@@ -605,6 +608,8 @@ const Ui = struct {
     index: *fuzzy.Index,
     terminal: *Terminal,
     stream: ?*StreamInput,
+    server: ?*listen.Server,
+    child_env: *const std.process.Environ.Map,
     history: ?QueryHistory = null,
     track_once: bool = false,
     pending_track_key: ?[]u8 = null,
@@ -638,6 +643,8 @@ const Ui = struct {
         index: *fuzzy.Index,
         terminal: *Terminal,
         stream: ?*StreamInput,
+        server: ?*listen.Server,
+        child_env: *const std.process.Environ.Map,
     ) !Ui {
         var query: std.ArrayList(u8) = .empty;
         try query.appendSlice(allocator, options.query);
@@ -658,6 +665,8 @@ const Ui = struct {
             .index = index,
             .terminal = terminal,
             .stream = stream,
+            .server = server,
+            .child_env = child_env,
             .history = history,
             .query = query,
             .cursor = options.query.len,
@@ -726,6 +735,7 @@ const Ui = struct {
                 self.focus_event_pending = false;
                 if (try self.fireEvent("focus")) |code| return code;
             }
+            if (try self.processServerRequests()) |code| return code;
             try self.render();
             const key = try readKey(self.terminal);
             if (try self.handleKey(key)) |code| return code;
@@ -1025,6 +1035,87 @@ const Ui = struct {
         return null;
     }
 
+    fn processServerRequests(self: *Ui) !?u8 {
+        const server = self.server orelse return null;
+        while (server.takeRequest()) |request| {
+            switch (request) {
+                .post => |body| {
+                    defer self.allocator.free(body);
+                    var actions: std.ArrayList(Binding) = .empty;
+                    defer actions.deinit(self.allocator);
+                    appendBindingActions(self.allocator, &actions, "http", body) catch continue;
+                    for (actions.items) |binding| {
+                        if (try self.runAction(binding.action)) |code| return code;
+                    }
+                },
+                .get => |waiter| {
+                    const response = self.dumpStatus(waiter.params) catch null;
+                    server.completeGet(waiter, response orelse try self.allocator.dupe(u8, "{\"error\":\"status\"}"));
+                },
+            }
+        }
+        return null;
+    }
+
+    fn dumpStatus(self: *Ui, params: listen.GetParams) ![]u8 {
+        const StatusItem = struct {
+            index: usize,
+            text: []const u8,
+        };
+        const start = @min(params.offset, self.result_len);
+        const match_count = @min(params.limit, self.result_len - start);
+        const matches = try self.allocator.alloc(StatusItem, match_count);
+        defer self.allocator.free(matches);
+        for (matches, 0..) |*item, i| {
+            const idx = self.results[start + i];
+            item.* = .{ .index = idx, .text = self.candidates.output[idx] };
+        }
+
+        var selected_indices: std.ArrayList(usize) = .empty;
+        defer selected_indices.deinit(self.allocator);
+        for (self.selection_order.items) |idx| if (idx < self.selected.len and self.selected[idx]) try selected_indices.append(self.allocator, idx);
+        const selected_start = @min(params.offset, selected_indices.items.len);
+        const selected_count = @min(params.limit, selected_indices.items.len - selected_start);
+        const selected = try self.allocator.alloc(StatusItem, selected_count);
+        defer self.allocator.free(selected);
+        for (selected, 0..) |*item, i| {
+            const idx = selected_indices.items[selected_start + i];
+            item.* = .{ .index = idx, .text = self.candidates.output[idx] };
+        }
+
+        const current: ?StatusItem = if (self.result_len == 0) null else blk: {
+            const idx = self.results[self.focus];
+            break :blk .{ .index = idx, .text = self.candidates.output[idx] };
+        };
+        const Status = struct {
+            reading: bool,
+            progress: u8,
+            query: []const u8,
+            position: usize,
+            sort: bool,
+            totalCount: usize,
+            matchCount: usize,
+            current: ?StatusItem,
+            matches: []const StatusItem,
+            selected: []const StatusItem,
+        };
+        var out: Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        try std.json.Stringify.value(Status{
+            .reading = self.stream != null and !self.stream.?.eof,
+            .progress = if (self.stream != null and !self.stream.?.eof) 0 else 100,
+            .query = self.query.items,
+            .position = self.focus,
+            .sort = !self.options.no_sort,
+            .totalCount = self.candidates.display.len,
+            .matchCount = self.result_len,
+            .current = current,
+            .matches = matches,
+            .selected = selected,
+        }, .{}, &out.writer);
+        return try out.toOwnedSlice();
+    }
+
     fn fireEvent(self: *Ui, event: []const u8) !?u8 {
         for (self.options.bindings.items) |binding| {
             if (!std.mem.eql(u8, binding.trigger, event)) continue;
@@ -1282,6 +1373,7 @@ const Ui = struct {
         defer self.allocator.free(expanded);
         const result = try std.process.run(self.allocator, self.io, .{
             .argv = &.{ "/bin/sh", "-c", expanded },
+            .environ_map = self.child_env,
             .stdout_limit = .limited(64 * 1024 * 1024),
             .stderr_limit = .limited(1024 * 1024),
         });
@@ -1299,6 +1391,7 @@ const Ui = struct {
         if (silent) {
             const result = try std.process.run(self.allocator, self.io, .{
                 .argv = &.{ "/bin/sh", "-c", expanded },
+                .environ_map = self.child_env,
                 .stdout_limit = .limited(1024 * 1024),
                 .stderr_limit = .limited(1024 * 1024),
             });
@@ -1310,6 +1403,7 @@ const Ui = struct {
         defer self.terminal.enter() catch {};
         var child = try std.process.spawn(self.io, .{
             .argv = &.{ "/bin/sh", "-c", expanded },
+            .environ_map = self.child_env,
             .stdin = .{ .file = self.terminal.file },
             .stdout = .{ .file = self.terminal.file },
             .stderr = .{ .file = self.terminal.file },
@@ -1324,6 +1418,7 @@ const Ui = struct {
         self.terminal.leave();
         var child = try std.process.spawn(self.io, .{
             .argv = &.{ "/bin/sh", "-c", expanded },
+            .environ_map = self.child_env,
             .stdin = .{ .file = self.terminal.file },
             .stdout = .{ .file = self.terminal.file },
             .stderr = .{ .file = self.terminal.file },
@@ -1691,6 +1786,7 @@ const Ui = struct {
         defer self.allocator.free(expanded);
         const result = std.process.run(self.allocator, self.io, .{
             .argv = &.{ "/bin/sh", "-c", expanded },
+            .environ_map = self.child_env,
             .stdout_limit = .limited(512 * 1024),
             .stderr_limit = .limited(128 * 1024),
         }) catch {
@@ -2119,6 +2215,24 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    var child_env = try init.environ_map.clone(allocator);
+    defer child_env.deinit();
+    var server: ?*listen.Server = null;
+    if (options.listen_addr) |address| {
+        server = try listen.Server.start(allocator, init.io, .{
+            .address = address,
+            .unsafe_remote_exec = options.listen_unsafe,
+            .api_key = init.environ_map.get("FZF_API_KEY") orelse "",
+            .validate_actions = validateActionSequence,
+        });
+        if (server.?.port != 0) {
+            var port_buf: [16]u8 = undefined;
+            const port_text = try std.fmt.bufPrint(&port_buf, "{d}", .{server.?.port});
+            try child_env.put("FZF_PORT", port_text);
+        }
+    }
+    defer if (server) |value| value.deinit();
+
     var terminal_opt: ?Terminal = if (options.filter == null)
         Terminal.open(init.io, options.mouse, options.height_percent) catch null
     else
@@ -2153,10 +2267,16 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
 
-    var ui = try Ui.init(allocator, init.io, &options, &candidates, &index, terminal, if (stream_input) |*stream| stream else null);
+    var ui = try Ui.init(allocator, init.io, &options, &candidates, &index, terminal, if (stream_input) |*stream| stream else null, server, &child_env);
     defer ui.deinit();
     const code = try ui.run();
-    if (code != 0) std.process.exit(code);
+    if (code != 0) {
+        if (server) |value| {
+            value.deinit();
+            server = null;
+        }
+        std.process.exit(code);
+    }
 }
 
 fn shellSplitArgs(allocator: Allocator, text: []const u8) ![][]const u8 {
@@ -2223,6 +2343,27 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             std.mem.eql(u8, a, "--bash") or std.mem.eql(u8, a, "--zsh") or std.mem.eql(u8, a, "--fish")) continue;
         if (std.mem.eql(u8, a, "--sync")) {
             o.*.sync = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--listen")) {
+            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+                i += 1;
+                o.*.listen_addr = args[i];
+            } else {
+                o.*.listen_addr = "";
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-listen")) {
+            o.*.listen_addr = null;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--listen=")) {
+            o.*.listen_addr = a[9..];
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--listen-unsafe")) {
+            o.*.listen_unsafe = true;
             continue;
         }
         if (std.mem.startsWith(u8, a, "--walker=")) {
@@ -2812,6 +2953,27 @@ fn appendBindingActions(allocator: Allocator, out: *std.ArrayList(Binding), trig
         if (action_text.len == 0) continue;
         try out.append(allocator, .{ .trigger = trigger, .action = try parseAction(action_text) });
     }
+}
+
+fn validateActionSequence(text: []const u8) bool {
+    var start: usize = 0;
+    var depth: usize = 0;
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i <= text.len) : (i += 1) {
+        const at_end = i == text.len;
+        const c: u8 = if (at_end) '+' else text[i];
+        if (!at_end) {
+            if (c == '(') depth += 1 else if (c == ')' and depth != 0) depth -= 1;
+        }
+        if (c != '+' or depth != 0) continue;
+        const action_text = std.mem.trim(u8, text[start..i], " \t");
+        start = i + 1;
+        if (action_text.len == 0) continue;
+        _ = parseAction(action_text) catch return false;
+        count += 1;
+    }
+    return count != 0 and depth == 0;
 }
 
 fn parseAction(s: []const u8) !Action {
@@ -4489,4 +4651,28 @@ test "finder and preview border labels parse" {
     try std.testing.expectEqual(PreviewPosition.left, options.preview.position);
     try std.testing.expectEqual(@as(u8, 40), options.preview.percent);
     try std.testing.expectEqual(BorderStyle.dashed, options.preview.border_style);
+}
+
+test "listen option forms and action validation" {
+    const a = std.testing.allocator;
+
+    const args_port = [_][]const u8{ "zfuzz", "--listen", "6266", "--listen-unsafe" };
+    var with_port = try parseOptions(a, &args_port);
+    defer with_port.deinit(a);
+    try std.testing.expectEqualStrings("6266", with_port.listen_addr.?);
+    try std.testing.expect(with_port.listen_unsafe);
+
+    const args_ephemeral = [_][]const u8{ "zfuzz", "--listen", "--height=20%" };
+    var ephemeral = try parseOptions(a, &args_ephemeral);
+    defer ephemeral.deinit(a);
+    try std.testing.expectEqualStrings("", ephemeral.listen_addr.?);
+
+    const args_disabled = [_][]const u8{ "zfuzz", "--listen=6267", "--no-listen" };
+    var disabled = try parseOptions(a, &args_disabled);
+    defer disabled.deinit(a);
+    try std.testing.expect(disabled.listen_addr == null);
+
+    try std.testing.expect(validateActionSequence("change-query(foo)+down"));
+    try std.testing.expect(validateActionSequence("execute-silent(true)"));
+    try std.testing.expect(!validateActionSequence("not-a-real-action"));
 }
