@@ -4170,6 +4170,11 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.exact = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "--extended-exact")) {
+            o.*.exact = true;
+            o.*.extended = true;
+            continue;
+        }
         if (std.mem.eql(u8, a, "+e") or std.mem.eql(u8, a, "--no-exact")) {
             o.*.exact = false;
             continue;
@@ -4284,6 +4289,15 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
         }
         if (std.mem.eql(u8, a, "--no-info")) {
             o.*.info_style = .hidden;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--inline-info")) {
+            o.*.info_style = .inline_left;
+            o.*.info_prefix = " < ";
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-inline-info")) {
+            o.*.info_style = .default;
             continue;
         }
         if (std.mem.startsWith(u8, a, "--separator=")) {
@@ -8109,6 +8123,38 @@ test "listen option forms and action validation" {
     try std.testing.expect(validateActionSequence("change-query(foo)+down"));
     try std.testing.expect(validateActionSequence("execute-silent(true)"));
     try std.testing.expect(!validateActionSequence("not-a-real-action"));
+}
+
+test "extended-exact alias restores both exact and extended search" {
+    const a = std.testing.allocator;
+
+    const args = [_][]const u8{ "zfuzz", "--exact", "--no-exact", "--no-extended", "--extended-exact" };
+    var options = try parseOptions(a, &args);
+    defer options.deinit(a);
+    try std.testing.expect(options.exact);
+    try std.testing.expect(options.extended);
+
+    const reset_args = [_][]const u8{ "zfuzz", "--extended-exact", "--no-exact", "--no-extended" };
+    var reset = try parseOptions(a, &reset_args);
+    defer reset.deinit(a);
+    try std.testing.expect(!reset.exact);
+    try std.testing.expect(!reset.extended);
+}
+
+test "legacy inline info aliases match fzf ordering" {
+    const a = std.testing.allocator;
+
+    const enable_args = [_][]const u8{ "zfuzz", "--info=inline-right:custom", "--inline-info" };
+    var enabled = try parseOptions(a, &enable_args);
+    defer enabled.deinit(a);
+    try std.testing.expectEqual(InfoStyle.inline_left, enabled.info_style);
+    try std.testing.expectEqualStrings(" < ", enabled.info_prefix);
+
+    const disable_args = [_][]const u8{ "zfuzz", "--inline-info", "--info=inline-right:custom", "--no-inline-info" };
+    var disabled = try parseOptions(a, &disable_args);
+    defer disabled.deinit(a);
+    try std.testing.expectEqual(InfoStyle.default, disabled.info_style);
+    try std.testing.expectEqualStrings("custom", disabled.info_prefix);
 }
 
 test "fzf parser reset options are last-one-wins" {
