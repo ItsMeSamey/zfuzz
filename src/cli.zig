@@ -112,6 +112,13 @@ const Binding = struct {
     action: Action,
 };
 
+const WalkerOptions = struct {
+    file: bool = true,
+    dir: bool = false,
+    follow: bool = true,
+    hidden: bool = true,
+};
+
 const Options = struct {
     query: []const u8 = "",
     filter: ?[]const u8 = null,
@@ -141,6 +148,9 @@ const Options = struct {
     tac: bool = false,
     tail: ?usize = null,
     sync: bool = false,
+    walker: WalkerOptions = .{},
+    walker_roots: std.ArrayList([]const u8) = .empty,
+    walker_skip: []const u8 = ".git,node_modules",
     mouse: bool = true,
     style_preset: StylePreset = .default,
     border: bool = true,
@@ -167,6 +177,7 @@ const Options = struct {
     fn deinit(self: *Options, allocator: Allocator) void {
         self.expect.deinit(allocator);
         self.bindings.deinit(allocator);
+        self.walker_roots.deinit(allocator);
     }
 };
 
@@ -1843,6 +1854,36 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.sync = true;
             continue;
         }
+        if (std.mem.startsWith(u8, a, "--walker=")) {
+            o.*.walker = try parseWalkerOptions(a[9..]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--walker")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.walker = try parseWalkerOptions(args[i]);
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--walker-root=")) {
+            try o.*.walker_roots.append(allocator, a[14..]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--walker-root")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            try o.*.walker_roots.append(allocator, args[i]);
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--walker-skip=")) {
+            o.*.walker_skip = a[14..];
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--walker-skip")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.walker_skip = args[i];
+            continue;
+        }
         if (std.mem.eql(u8, a, "-m") or std.mem.eql(u8, a, "--multi")) {
             o.*.multi = true;
             continue;
@@ -2399,17 +2440,91 @@ fn parsePreviewWindow(p: *PreviewOptions, spec: []const u8) void {
     }
 }
 
+fn parseWalkerOptions(spec: []const u8) !WalkerOptions {
+    var out: WalkerOptions = .{ .file = false, .follow = false, .hidden = false };
+    if (spec.len == 0) return out;
+    var parts = std.mem.splitScalar(u8, spec, ',');
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, "file")) out.file = true else if (std.mem.eql(u8, part, "dir")) out.dir = true else if (std.mem.eql(u8, part, "follow")) out.follow = true else if (std.mem.eql(u8, part, "hidden")) out.hidden = true else return error.InvalidWalkerOption;
+    }
+    return out;
+}
+
+fn appendWalkerSkipExpr(allocator: Allocator, argv: *std.ArrayList([]const u8), options: *const Options) !bool {
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(allocator);
+    var it = std.mem.splitScalar(u8, options.walker_skip, ',');
+    while (it.next()) |name| if (name.len != 0) try names.append(allocator, name);
+    const skip_hidden = !options.walker.hidden;
+    if (names.items.len == 0 and !skip_hidden) return false;
+
+    try argv.appendSlice(allocator, &.{ "(", "-type", "d", "(" });
+    var first = true;
+    for (names.items) |name| {
+        if (!first) try argv.append(allocator, "-o");
+        try argv.appendSlice(allocator, &.{ "-name", name });
+        first = false;
+    }
+    if (skip_hidden) {
+        if (!first) try argv.append(allocator, "-o");
+        try argv.appendSlice(allocator, &.{ "-name", ".*" });
+    }
+    try argv.appendSlice(allocator, &.{ ")", ")", "-prune", "-o" });
+    return true;
+}
+
+fn runWalker(allocator: Allocator, io: Io, options: *const Options) ![]u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "/usr/bin/find");
+    if (options.walker.follow) try argv.append(allocator, "-L");
+    if (options.walker_roots.items.len == 0) try argv.append(allocator, ".") else try argv.appendSlice(allocator, options.walker_roots.items);
+    try argv.appendSlice(allocator, &.{ "-mindepth", "1" });
+    _ = try appendWalkerSkipExpr(allocator, &argv, options);
+
+    if (options.walker.file and options.walker.dir) {
+        try argv.appendSlice(allocator, &.{ "(", "-type", "f", "-o", "-type", "d", ")" });
+    } else if (options.walker.file) {
+        try argv.appendSlice(allocator, &.{ "-type", "f" });
+    } else if (options.walker.dir) {
+        try argv.appendSlice(allocator, &.{ "-type", "d" });
+    } else {
+        return try allocator.alloc(u8, 0);
+    }
+    try argv.append(allocator, if (options.read0) "-print0" else "-print");
+
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv.items,
+        .stdout_limit = .limited(256 * 1024 * 1024),
+        .stderr_limit = .limited(4 * 1024 * 1024),
+    });
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            allocator.free(result.stdout);
+            return error.WalkerFailed;
+        },
+        else => {
+            allocator.free(result.stdout);
+            return error.WalkerFailed;
+        },
+    }
+    return result.stdout;
+}
+
 fn readCandidates(allocator: Allocator, io: Io, options: *const Options, default_command: ?[]const u8) !CandidateSet {
     if (std.c.isatty(std.posix.STDIN_FILENO) == 1) {
-        const command = default_command orelse
-            "find . -path './.git' -prune -o -path './node_modules' -prune -o \\( -type f -o -type d \\) -print";
-        const result = try std.process.run(allocator, io, .{
-            .argv = &.{ "/bin/sh", "-c", command },
-            .stdout_limit = .limited(256 * 1024 * 1024),
-            .stderr_limit = .limited(4 * 1024 * 1024),
-        });
-        allocator.free(result.stderr);
-        return candidatesFromOwnedBlob(allocator, result.stdout, options);
+        const blob = if (default_command) |command| blk: {
+            if (command.len == 0) break :blk try runWalker(allocator, io, options);
+            const result = try std.process.run(allocator, io, .{
+                .argv = &.{ "/bin/sh", "-c", command },
+                .stdout_limit = .limited(256 * 1024 * 1024),
+                .stderr_limit = .limited(4 * 1024 * 1024),
+            });
+            allocator.free(result.stderr);
+            break :blk result.stdout;
+        } else try runWalker(allocator, io, options);
+        return candidatesFromOwnedBlob(allocator, blob, options);
     }
     if (options.tail) |tail| {
         const blob = try readTailBlobStdin(allocator, tail, if (options.read0) 0 else '\n');
@@ -3518,6 +3633,21 @@ const usage =
     \\  Enter accept, Esc/Ctrl-C abort, arrows/Ctrl-J/Ctrl-K move,
     \\  Tab toggle, Ctrl-A/E line edges, Ctrl-U clear, Ctrl-W erase word.
 ;
+
+test "walker options match fzf defaults and parse explicit modes" {
+    const default: WalkerOptions = .{};
+    try std.testing.expect(default.file);
+    try std.testing.expect(!default.dir);
+    try std.testing.expect(default.follow);
+    try std.testing.expect(default.hidden);
+
+    const dirs = try parseWalkerOptions("dir,follow");
+    try std.testing.expect(!dirs.file);
+    try std.testing.expect(dirs.dir);
+    try std.testing.expect(dirs.follow);
+    try std.testing.expect(!dirs.hidden);
+    try std.testing.expectError(error.InvalidWalkerOption, parseWalkerOptions("file,bogus"));
+}
 
 test "stream input retains bounded tail across partial records" {
     const a = std.testing.allocator;
