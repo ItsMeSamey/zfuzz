@@ -5138,6 +5138,7 @@ fn parseBindings(allocator: Allocator, out: *std.ArrayList(Binding), spec: []con
         try applyBindingSpec(allocator, out, trigger, action_text);
         pending.clearRetainingCapacity();
     }
+    if (pending.items.len != 0) return error.InvalidBinding;
 }
 
 fn applyBindingSpec(allocator: Allocator, out: *std.ArrayList(Binding), trigger: []const u8, action_text: []const u8) !void {
@@ -8539,8 +8540,7 @@ test "binding parser groups pending fzf keys" {
 
     var pending_only: std.ArrayList(Binding) = .empty;
     defer pending_only.deinit(a);
-    try parseBindings(a, &pending_only, "a,b");
-    try std.testing.expectEqual(@as(usize, 0), pending_only.items.len);
+    try std.testing.expectError(error.InvalidBinding, parseBindings(a, &pending_only, "a,b"));
     try std.testing.expectError(error.InvalidBinding, parseBindings(a, &pending_only, "a,,b:accept"));
 }
 
