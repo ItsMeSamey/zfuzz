@@ -96,8 +96,12 @@ const Action = union(enum) {
     delete_char_eof,
     backward_word,
     forward_word,
+    backward_subword,
+    forward_subword,
     backward_kill_word,
     kill_word,
+    backward_kill_subword,
+    kill_subword,
     kill_line,
     unix_line_discard,
     yank,
@@ -1676,8 +1680,12 @@ const Ui = struct {
             .best => self.focusBestMatch(),
             .backward_word => self.cursor = wordBoundaryBackward(self.query.items, self.cursor),
             .forward_word => self.cursor = wordBoundaryForward(self.query.items, self.cursor),
+            .backward_subword => self.cursor = subwordBoundaryBackward(self.query.items, self.cursor),
+            .forward_subword => self.cursor = subwordBoundaryForward(self.query.items, self.cursor),
             .backward_kill_word => _ = try self.killWordBackward(),
             .kill_word => _ = try self.killWordForward(),
+            .backward_kill_subword => _ = try self.killSubwordBackward(),
+            .kill_subword => _ = try self.killSubwordForward(),
             .kill_line => _ = try self.killLine(),
             .unix_line_discard => _ = try self.unixLineDiscard(),
             .yank => _ = try self.yankQuery(),
@@ -2849,6 +2857,26 @@ const Ui = struct {
 
     fn killWordForward(self: *Ui) !bool {
         const end = wordBoundaryForward(self.query.items, self.cursor);
+        if (end == self.cursor) return false;
+        try self.setYanked(self.query.items[self.cursor..end]);
+        try self.query.replaceRange(self.allocator, self.cursor, end - self.cursor, &.{});
+        self.markQueryChanged();
+        return true;
+    }
+
+    fn killSubwordBackward(self: *Ui) !bool {
+        if (self.cursor == 0) return false;
+        const begin = subwordBoundaryBackward(self.query.items, self.cursor);
+        if (begin == self.cursor) return false;
+        try self.setYanked(self.query.items[begin..self.cursor]);
+        try self.query.replaceRange(self.allocator, begin, self.cursor - begin, &.{});
+        self.cursor = begin;
+        self.markQueryChanged();
+        return true;
+    }
+
+    fn killSubwordForward(self: *Ui) !bool {
+        const end = subwordBoundaryForward(self.query.items, self.cursor);
         if (end == self.cursor) return false;
         try self.setYanked(self.query.items[self.cursor..end]);
         try self.query.replaceRange(self.allocator, self.cursor, end - self.cursor, &.{});
@@ -4393,8 +4421,12 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "delete-char/eof")) return .delete_char_eof;
     if (std.mem.eql(u8, s, "backward-word")) return .backward_word;
     if (std.mem.eql(u8, s, "forward-word")) return .forward_word;
+    if (std.mem.eql(u8, s, "backward-subword")) return .backward_subword;
+    if (std.mem.eql(u8, s, "forward-subword")) return .forward_subword;
     if (std.mem.eql(u8, s, "backward-kill-word")) return .backward_kill_word;
     if (std.mem.eql(u8, s, "kill-word")) return .kill_word;
+    if (std.mem.eql(u8, s, "backward-kill-subword")) return .backward_kill_subword;
+    if (std.mem.eql(u8, s, "kill-subword")) return .kill_subword;
     if (std.mem.eql(u8, s, "kill-line")) return .kill_line;
     if (std.mem.eql(u8, s, "unix-line-discard") or std.mem.eql(u8, s, "line-discard")) return .unix_line_discard;
     if (std.mem.eql(u8, s, "unix-word-rubout") or std.mem.eql(u8, s, "word-rubout")) return .backward_kill_word;
@@ -5675,6 +5707,44 @@ fn wordBoundaryForward(s: []const u8, pos: usize) usize {
     return p;
 }
 
+fn subwordAlnum(cp: u21) bool {
+    return fuzzy_engine.cliRuneIsLetterOrNumber(cp);
+}
+
+fn subwordCamelBoundary(left: u21, right: u21) bool {
+    return left >= 'a' and left <= 'z' and right >= 'A' and right <= 'Z';
+}
+
+fn subwordBoundaryForward(s: []const u8, pos: usize) usize {
+    if (pos >= s.len) return s.len;
+    if (!std.unicode.utf8ValidateSlice(s)) return wordBoundaryForward(s, pos);
+    var it = std.unicode.Utf8Iterator{ .bytes = s, .i = pos };
+    var left = it.nextCodepoint() orelse return s.len;
+    while (it.i < s.len) {
+        const boundary = it.i;
+        const right = it.nextCodepoint() orelse return s.len;
+        if (subwordCamelBoundary(left, right) or (subwordAlnum(left) and !subwordAlnum(right))) return boundary;
+        left = right;
+    }
+    return s.len;
+}
+
+fn subwordBoundaryBackward(s: []const u8, pos: usize) usize {
+    const end = @min(pos, s.len);
+    if (end == 0) return 0;
+    if (!std.unicode.utf8ValidateSlice(s)) return wordBoundaryBackward(s, end);
+    var it = std.unicode.Utf8Iterator{ .bytes = s[0..end], .i = 0 };
+    var left = it.nextCodepoint() orelse return 0;
+    var last: usize = 0;
+    while (it.i < end) {
+        const boundary = it.i;
+        const right = it.nextCodepoint() orelse break;
+        if (subwordCamelBoundary(left, right) or (!subwordAlnum(left) and subwordAlnum(right))) last = boundary;
+        left = right;
+    }
+    return last;
+}
+
 fn prevUtf8Boundary(s: []const u8, pos: usize) usize {
     if (pos == 0) return 0;
     var p = pos - 1;
@@ -6808,6 +6878,10 @@ test "stateful binding actions parse" {
     try std.testing.expect((try parseAction("line-discard")) == .unix_line_discard);
     try std.testing.expect((try parseAction("unix-word-rubout")) == .backward_kill_word);
     try std.testing.expect((try parseAction("word-rubout")) == .backward_kill_word);
+    try std.testing.expect((try parseAction("backward-subword")) == .backward_subword);
+    try std.testing.expect((try parseAction("forward-subword")) == .forward_subword);
+    try std.testing.expect((try parseAction("backward-kill-subword")) == .backward_kill_subword);
+    try std.testing.expect((try parseAction("kill-subword")) == .kill_subword);
     try std.testing.expect((try parseAction("yank")) == .yank);
     try std.testing.expect((try parseAction("cancel")) == .cancel);
     try std.testing.expect((try parseAction("clear-selection")) == .deselect_all);
@@ -7300,4 +7374,12 @@ test "Unicode tiebreak lengths use rune offsets and Unicode whitespace" {
     };
     try std.testing.expectEqual(@as(usize, 3), tiebreakValue(.length, "　éab　", score));
     try std.testing.expectEqual(@as(usize, 1), tiebreakValue(.begin, "　éab　", score));
+}
+
+test "subword boundary helpers match fzf fixtures" {
+    const q = "foo bar foo-bar fooFooBar";
+    try std.testing.expectEqual(@as(usize, 3), subwordBoundaryForward(q, 0));
+    try std.testing.expectEqual(@as(usize, q.len - 3), subwordBoundaryBackward(q, q.len));
+    try std.testing.expectEqual(@as(usize, "αβ".len), subwordBoundaryForward("αβ-γδ", 0));
+    try std.testing.expectEqual(@as(usize, "αβ-".len), subwordBoundaryBackward("αβ-γδ", "αβ-γδ".len));
 }

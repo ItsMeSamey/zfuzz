@@ -3608,6 +3608,14 @@ pub fn cliRuneIsWhitespace(cp: u21) bool {
     return unicode_cli.classOf(cp) == .white;
 }
 
+pub fn cliRuneIsLetterOrNumber(cp: u21) bool {
+    if (cp <= 0x7f) return std.ascii.isAlphanumeric(@intCast(cp));
+    return switch (unicode_cli.classOf(cp)) {
+        .lower, .upper, .letter, .number => true,
+        else => false,
+    };
+}
+
 fn cliUnicodeContiguousScore(index: *const Index, start: usize, len: usize) i32 {
     var total: i32 = 0;
     var consecutive: usize = 0;

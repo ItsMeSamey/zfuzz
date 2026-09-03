@@ -82,8 +82,10 @@ environment semantics; background transform variants are supported as well.
 changed. Bindable query-edit actions also include fzf-compatible
 `beginning-of-line`, `end-of-line`, `backward-char`, `forward-char`,
 `backward-delete-char`, `delete-char`, and their `/eof` variants; character
-movement and deletion remain UTF-8 boundary-safe. Kill/yank editing follows the same
-query buffer: `kill-line`, `kill-word`, backward word rubout,
+movement and deletion remain UTF-8 boundary-safe. `backward-subword` and
+`forward-subword` follow fzf camel-case and Unicode letter/number boundaries.
+Kill/yank editing follows the same query buffer: `kill-line`, `kill-word`,
+`kill-subword`, backward word/subword rubout,
 `unix-line-discard`, `cancel`, and `yank` preserve and restore the most recently
 removed text; Ctrl-U/Ctrl-W/Ctrl-Y use those same paths. `put(...)`, `replace-query`,
 `print-query`, `accept-non-empty`, and `accept-or-print-query` are also
