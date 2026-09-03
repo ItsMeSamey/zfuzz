@@ -146,12 +146,16 @@ const Action = union(enum) {
     execute: []const u8,
     execute_silent: []const u8,
     become: []const u8,
+    unbind: []const u8,
+    rebind: []const u8,
+    toggle_bind: []const u8,
 };
 
 const Binding = struct {
     trigger: []const u8,
     name: []const u8,
     action: Action,
+    enabled: bool = true,
 };
 
 const WalkerOptions = struct {
@@ -972,6 +976,7 @@ const Ui = struct {
         }
         var binding_handled = false;
         for (self.options.bindings.items) |binding| {
+            if (!binding.enabled) continue;
             if (std.mem.eql(u8, binding.trigger, "start") or std.mem.eql(u8, binding.trigger, "load") or
                 std.mem.eql(u8, binding.trigger, "change") or std.mem.eql(u8, binding.trigger, "result") or
                 std.mem.eql(u8, binding.trigger, "result-final") or std.mem.eql(u8, binding.trigger, "zero") or
@@ -1257,6 +1262,7 @@ const Ui = struct {
 
     fn fireEvent(self: *Ui, event: []const u8) !?u8 {
         for (self.options.bindings.items) |binding| {
+            if (!binding.enabled) continue;
             if (!std.mem.eql(u8, binding.trigger, event)) continue;
             self.last_action = binding.name;
             self.last_key = "";
@@ -1268,6 +1274,7 @@ const Ui = struct {
     fn fireTimers(self: *Ui) !?u8 {
         const now_ms = monotonicMilliseconds(self.io);
         for (self.options.bindings.items, 0..) |binding, i| {
+            if (!binding.enabled) continue;
             const interval_ms = everyIntervalMilliseconds(binding.trigger) orelse continue;
             if (now_ms -| self.timer_last_ms[i] < interval_ms) continue;
             self.timer_last_ms[i] = now_ms;
@@ -1469,8 +1476,29 @@ const Ui = struct {
             .execute => |cmd| try self.executeCommand(cmd, false),
             .execute_silent => |cmd| try self.executeCommand(cmd, true),
             .become => |cmd| return try self.becomeCommand(cmd),
+            .unbind => |targets| self.setBindingsEnabled(targets, .disable),
+            .rebind => |targets| self.setBindingsEnabled(targets, .enable),
+            .toggle_bind => |targets| self.setBindingsEnabled(targets, .toggle),
         }
         return null;
+    }
+
+    const BindingStateChange = enum { disable, enable, toggle };
+
+    fn setBindingsEnabled(self: *Ui, targets: []const u8, change: BindingStateChange) void {
+        var target_it = std.mem.splitScalar(u8, targets, ',');
+        while (target_it.next()) |raw_target| {
+            const target = std.mem.trim(u8, raw_target, " \t");
+            if (target.len == 0) continue;
+            for (self.options.bindings.items) |*binding| {
+                if (!std.mem.eql(u8, binding.trigger, target)) continue;
+                binding.enabled = switch (change) {
+                    .disable => false,
+                    .enable => true,
+                    .toggle => !binding.enabled,
+                };
+            }
+        }
     }
 
     fn commandEnvironment(self: *Ui) !std.process.Environ.Map {
@@ -3399,6 +3427,9 @@ fn parseAction(s: []const u8) !Action {
     if (commandAction(s, "execute-silent")) |cmd| return .{ .execute_silent = cmd };
     if (commandAction(s, "execute")) |cmd| return .{ .execute = cmd };
     if (commandAction(s, "become")) |cmd| return .{ .become = cmd };
+    if (commandAction(s, "unbind")) |targets| return .{ .unbind = targets };
+    if (commandAction(s, "rebind")) |targets| return .{ .rebind = targets };
+    if (commandAction(s, "toggle-bind")) |targets| return .{ .toggle_bind = targets };
     return error.UnsupportedBindingAction;
 }
 
@@ -4922,6 +4953,15 @@ test "binding parser" {
     try std.testing.expectEqualStrings("printf 'a,b'", bindings.items[0].action.reload);
     try std.testing.expectEqualStrings("ready", bindings.items[1].action.change_header);
     try std.testing.expect(bindings.items[2].action == .accept);
+}
+
+test "binding control actions parse target chord lists" {
+    const unbind = try parseAction("unbind(ctrl-a,ctrl-b)");
+    try std.testing.expect(std.mem.eql(u8, unbind.unbind, "ctrl-a,ctrl-b"));
+    const rebind = try parseAction("rebind(ctrl-a)");
+    try std.testing.expect(std.mem.eql(u8, rebind.rebind, "ctrl-a"));
+    const toggle = try parseAction("toggle-bind(ctrl-a)");
+    try std.testing.expect(std.mem.eql(u8, toggle.toggle_bind, "ctrl-a"));
 }
 
 test "CSI decoder consumes modified keys and bracketed paste markers" {
