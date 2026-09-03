@@ -141,6 +141,12 @@ const Action = union(enum) {
     transform_header: []const u8,
     transform_footer: []const u8,
     transform_preview: []const u8,
+    bg_transform: []const u8,
+    bg_transform_query: []const u8,
+    bg_transform_prompt: []const u8,
+    bg_transform_header: []const u8,
+    bg_transform_footer: []const u8,
+    bg_transform_preview: []const u8,
     print: []const u8,
     reload: []const u8,
     execute: []const u8,
@@ -630,6 +636,110 @@ const QueryHistory = struct {
     }
 };
 
+const BackgroundKind = enum { actions, query, prompt, header, footer, preview };
+
+const BackgroundResult = struct {
+    kind: BackgroundKind,
+    output: []u8,
+};
+
+const BackgroundQueue = struct {
+    allocator: Allocator,
+    io: Io,
+    mutex: Io.Mutex = .init,
+    results: std.ArrayList(BackgroundResult) = .empty,
+    active: usize = 0,
+    alive: bool = true,
+
+    fn create(allocator: Allocator, io: Io) !*BackgroundQueue {
+        const self = try allocator.create(BackgroundQueue);
+        self.* = .{ .allocator = allocator, .io = io };
+        return self;
+    }
+
+    fn begin(self: *BackgroundQueue) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.alive) return false;
+        self.active += 1;
+        return true;
+    }
+
+    fn finish(self: *BackgroundQueue, kind: BackgroundKind, output: ?[]u8) void {
+        self.mutex.lockUncancelable(self.io);
+        if (self.alive) {
+            if (output) |value| {
+                self.results.append(self.allocator, .{ .kind = kind, .output = value }) catch self.allocator.free(value);
+            }
+        } else if (output) |value| {
+            self.allocator.free(value);
+        }
+        self.active -= 1;
+        const should_destroy = !self.alive and self.active == 0;
+        self.mutex.unlock(self.io);
+        if (should_destroy) self.destroy();
+    }
+
+    fn takeAll(self: *BackgroundQueue) std.ArrayList(BackgroundResult) {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const out = self.results;
+        self.results = .empty;
+        return out;
+    }
+
+    fn close(self: *BackgroundQueue) void {
+        self.mutex.lockUncancelable(self.io);
+        self.alive = false;
+        for (self.results.items) |result| self.allocator.free(result.output);
+        self.results.deinit(self.allocator);
+        self.results = .empty;
+        const should_destroy = self.active == 0;
+        self.mutex.unlock(self.io);
+        if (should_destroy) self.destroy();
+    }
+
+    fn destroy(self: *BackgroundQueue) void {
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+};
+
+const BackgroundContext = struct {
+    queue: *BackgroundQueue,
+    allocator: Allocator,
+    io: Io,
+    kind: BackgroundKind,
+    command: []u8,
+    env: std.process.Environ.Map,
+};
+
+fn backgroundTransformThread(ctx: *BackgroundContext) void {
+    const allocator = ctx.allocator;
+    defer {
+        allocator.free(ctx.command);
+        ctx.env.deinit();
+        allocator.destroy(ctx);
+    }
+    const result = std.process.run(allocator, ctx.io, .{
+        .argv = &.{ "/bin/sh", "-c", ctx.command },
+        .environ_map = &ctx.env,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    }) catch {
+        ctx.queue.finish(ctx.kind, null);
+        return;
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    const text = std.mem.trimEnd(u8, result.stdout, "\r\n");
+    const output = allocator.dupe(u8, text) catch {
+        ctx.queue.finish(ctx.kind, null);
+        return;
+    };
+    ctx.queue.finish(ctx.kind, output);
+}
+
 const Ui = struct {
     allocator: Allocator,
     io: Io,
@@ -640,6 +750,7 @@ const Ui = struct {
     stream: ?*StreamInput,
     server: ?*listen.Server,
     child_env: *const std.process.Environ.Map,
+    bg_queue: *BackgroundQueue,
     history: ?QueryHistory = null,
     track_once: bool = false,
     pending_track_key: ?[]u8 = null,
@@ -705,6 +816,8 @@ const Ui = struct {
         errdefer allocator.free(timer_last_ms);
         const now_ms = monotonicMilliseconds(io);
         @memset(timer_last_ms, now_ms);
+        const bg_queue = try BackgroundQueue.create(allocator, io);
+        errdefer bg_queue.close();
         return .{
             .allocator = allocator,
             .io = io,
@@ -715,6 +828,7 @@ const Ui = struct {
             .stream = stream,
             .server = server,
             .child_env = child_env,
+            .bg_queue = bg_queue,
             .history = history,
             .query = query,
             .cursor = options.query.len,
@@ -727,6 +841,7 @@ const Ui = struct {
     }
 
     fn deinit(self: *Ui) void {
+        self.bg_queue.close();
         if (self.history) |*history| history.deinit();
         if (self.pending_track_key) |key| self.allocator.free(key);
         self.query.deinit(self.allocator);
@@ -807,6 +922,7 @@ const Ui = struct {
             }
             if (try self.fireTimers()) |code| return code;
             if (try self.processServerRequests()) |code| return code;
+            if (try self.processBackgroundResults()) |code| return code;
             try self.render();
             const key = try readKey(self.terminal);
             if (key != .unknown) self.last_activity_ms = monotonicMilliseconds(self.io);
@@ -1201,6 +1317,53 @@ const Ui = struct {
         return null;
     }
 
+    fn processBackgroundResults(self: *Ui) !?u8 {
+        var results = self.bg_queue.takeAll();
+        defer results.deinit(self.allocator);
+        for (results.items) |result| {
+            var owned: ?[]u8 = result.output;
+            defer if (owned) |value| self.allocator.free(value);
+            switch (result.kind) {
+                .actions => {
+                    if (result.output.len == 0) continue;
+                    var actions: std.ArrayList(Binding) = .empty;
+                    defer actions.deinit(self.allocator);
+                    try appendBindingActions(self.allocator, &actions, "bg-transform", result.output);
+                    for (actions.items) |binding| {
+                        self.last_action = binding.name;
+                        if (try self.runAction(binding.action)) |code| return code;
+                    }
+                },
+                .query => {
+                    self.query.clearRetainingCapacity();
+                    try self.query.appendSlice(self.allocator, result.output);
+                    self.cursor = self.query.items.len;
+                    self.markQueryChanged();
+                },
+                .prompt => {
+                    self.replaceOwnedText(&self.owned_prompt, &self.options.prompt, result.output);
+                    owned = null;
+                },
+                .header => {
+                    self.replaceOwnedOptionalText(&self.owned_header, &self.options.header, result.output);
+                    owned = null;
+                },
+                .footer => {
+                    self.replaceOwnedOptionalText(&self.owned_footer, &self.options.footer, result.output);
+                    owned = null;
+                },
+                .preview => {
+                    self.replaceOwnedOptionalText(&self.owned_preview, &self.options.preview.command, result.output);
+                    self.options.preview.hidden = false;
+                    self.preview_cache_key = null;
+                    self.preview_offset = 0;
+                    owned = null;
+                },
+            }
+        }
+        return null;
+    }
+
     fn dumpStatus(self: *Ui, params: listen.GetParams) ![]u8 {
         const StatusItem = struct {
             index: usize,
@@ -1471,6 +1634,12 @@ const Ui = struct {
                 self.preview_cache_key = null;
                 self.preview_offset = 0;
             },
+            .bg_transform => |cmd| try self.launchBackgroundTransform(.actions, cmd),
+            .bg_transform_query => |cmd| try self.launchBackgroundTransform(.query, cmd),
+            .bg_transform_prompt => |cmd| try self.launchBackgroundTransform(.prompt, cmd),
+            .bg_transform_header => |cmd| try self.launchBackgroundTransform(.header, cmd),
+            .bg_transform_footer => |cmd| try self.launchBackgroundTransform(.footer, cmd),
+            .bg_transform_preview => |cmd| try self.launchBackgroundTransform(.preview, cmd),
             .print => |value| try self.print_queue.append(self.allocator, try self.allocator.dupe(u8, value)),
             .reload => |cmd| try self.reloadFromCommand(cmd),
             .execute => |cmd| try self.executeCommand(cmd, false),
@@ -1528,6 +1697,36 @@ const Ui = struct {
         try env.put("FZF_IDLE_TIME_MS", try std.fmt.bufPrint(&idle_ms_buf, "{d}", .{idle_ms}));
         try env.put("FZF_IDLE_TIME", try std.fmt.bufPrint(&idle_s_buf, "{d}", .{idle_ms / 1000}));
         return env;
+    }
+
+    fn launchBackgroundTransform(self: *Ui, kind: BackgroundKind, command: []const u8) !void {
+        const expanded = try self.expandedCommand(command);
+        errdefer self.allocator.free(expanded);
+        var env = try self.commandEnvironment();
+        errdefer env.deinit();
+        if (!self.bg_queue.begin()) {
+            self.allocator.free(expanded);
+            env.deinit();
+            return;
+        }
+        const ctx = self.allocator.create(BackgroundContext) catch |err| {
+            self.bg_queue.finish(kind, null);
+            return err;
+        };
+        errdefer self.allocator.destroy(ctx);
+        ctx.* = .{
+            .queue = self.bg_queue,
+            .allocator = self.allocator,
+            .io = self.io,
+            .kind = kind,
+            .command = expanded,
+            .env = env,
+        };
+        const thread = std.Thread.spawn(.{}, backgroundTransformThread, .{ctx}) catch |err| {
+            self.bg_queue.finish(kind, null);
+            return err;
+        };
+        thread.detach();
     }
 
     fn runTransformCommand(self: *Ui, command: []const u8) ![]u8 {
@@ -3421,6 +3620,12 @@ fn parseAction(s: []const u8) !Action {
     if (commandAction(s, "transform-header")) |cmd| return .{ .transform_header = cmd };
     if (commandAction(s, "transform-footer")) |cmd| return .{ .transform_footer = cmd };
     if (commandAction(s, "transform-preview")) |cmd| return .{ .transform_preview = cmd };
+    if (commandAction(s, "bg-transform-query")) |cmd| return .{ .bg_transform_query = cmd };
+    if (commandAction(s, "bg-transform-prompt")) |cmd| return .{ .bg_transform_prompt = cmd };
+    if (commandAction(s, "bg-transform-header")) |cmd| return .{ .bg_transform_header = cmd };
+    if (commandAction(s, "bg-transform-footer")) |cmd| return .{ .bg_transform_footer = cmd };
+    if (commandAction(s, "bg-transform-preview")) |cmd| return .{ .bg_transform_preview = cmd };
+    if (commandAction(s, "bg-transform")) |cmd| return .{ .bg_transform = cmd };
     if (commandAction(s, "transform")) |cmd| return .{ .transform = cmd };
     if (commandAction(s, "print")) |value| return .{ .print = value };
     if (commandAction(s, "reload")) |cmd| return .{ .reload = cmd };
@@ -4953,6 +5158,13 @@ test "binding parser" {
     try std.testing.expectEqualStrings("printf 'a,b'", bindings.items[0].action.reload);
     try std.testing.expectEqualStrings("ready", bindings.items[1].action.change_header);
     try std.testing.expect(bindings.items[2].action == .accept);
+}
+
+test "background transform actions parse command payloads" {
+    const generic = try parseAction("bg-transform(echo accept)");
+    try std.testing.expect(std.mem.eql(u8, generic.bg_transform, "echo accept"));
+    const prompt = try parseAction("bg-transform-prompt:echo ready");
+    try std.testing.expect(std.mem.eql(u8, prompt.bg_transform_prompt, "echo ready"));
 }
 
 test "binding control actions parse target chord lists" {
