@@ -664,6 +664,8 @@ const Ui = struct {
     header_hidden: bool = false,
     last_action: []const u8 = "",
     last_key: []const u8 = "",
+    timer_last_ms: []u64 = &.{},
+    last_activity_ms: u64 = 0,
 
     fn init(
         allocator: Allocator,
@@ -687,6 +689,10 @@ const Ui = struct {
         var history: ?QueryHistory = null;
         if (options.history_file) |path| history = try QueryHistory.init(allocator, io, path, options.history_size, options.query);
         errdefer if (history) |*value| value.deinit();
+        const timer_last_ms = try allocator.alloc(u64, options.bindings.items.len);
+        errdefer allocator.free(timer_last_ms);
+        const now_ms = monotonicMilliseconds(io);
+        @memset(timer_last_ms, now_ms);
         return .{
             .allocator = allocator,
             .io = io,
@@ -703,6 +709,8 @@ const Ui = struct {
             .results = results,
             .extended_ranks = extended_ranks,
             .selected = selected,
+            .timer_last_ms = timer_last_ms,
+            .last_activity_ms = now_ms,
         };
     }
 
@@ -721,6 +729,7 @@ const Ui = struct {
         if (self.owned_preview) |value| self.allocator.free(value);
         for (self.print_queue.items) |value| self.allocator.free(value);
         self.print_queue.deinit(self.allocator);
+        if (self.timer_last_ms.len != 0) self.allocator.free(self.timer_last_ms);
     }
 
     fn run(self: *Ui) !u8 {
@@ -784,9 +793,11 @@ const Ui = struct {
                 self.focus_event_pending = false;
                 if (try self.fireEvent("focus")) |code| return code;
             }
+            if (try self.fireTimers()) |code| return code;
             if (try self.processServerRequests()) |code| return code;
             try self.render();
             const key = try readKey(self.terminal);
+            if (key != .unknown) self.last_activity_ms = monotonicMilliseconds(self.io);
             if (try self.handleKey(key)) |code| return code;
         }
     }
@@ -1189,6 +1200,19 @@ const Ui = struct {
         return null;
     }
 
+    fn fireTimers(self: *Ui) !?u8 {
+        const now_ms = monotonicMilliseconds(self.io);
+        for (self.options.bindings.items, 0..) |binding, i| {
+            const interval_ms = everyIntervalMilliseconds(binding.trigger) orelse continue;
+            if (now_ms -| self.timer_last_ms[i] < interval_ms) continue;
+            self.timer_last_ms[i] = now_ms;
+            self.last_action = binding.name;
+            self.last_key = "";
+            if (try self.runAction(binding.action)) |code| return code;
+        }
+        return null;
+    }
+
     fn runAction(self: *Ui, action: Action) anyerror!?u8 {
         switch (action) {
             .up => self.move(-1),
@@ -1392,6 +1416,11 @@ const Ui = struct {
         if (item.len <= 64 * 1024 and std.mem.indexOfScalar(u8, item, 0) == null) try env.put("FZF_CURRENT_ITEM", item);
         if (self.options.border_label) |value| try env.put("FZF_BORDER_LABEL", value);
         if (self.options.preview.label) |value| try env.put("FZF_PREVIEW_LABEL", value);
+        const idle_ms = monotonicMilliseconds(self.io) -| self.last_activity_ms;
+        var idle_ms_buf: [32]u8 = undefined;
+        var idle_s_buf: [32]u8 = undefined;
+        try env.put("FZF_IDLE_TIME_MS", try std.fmt.bufPrint(&idle_ms_buf, "{d}", .{idle_ms}));
+        try env.put("FZF_IDLE_TIME", try std.fmt.bufPrint(&idle_s_buf, "{d}", .{idle_ms / 1000}));
         return env;
     }
 
@@ -3141,6 +3170,20 @@ fn parseTiebreaks(options: *Options, spec: []const u8) !void {
     options.tiebreak_count = @intCast(count);
 }
 
+fn monotonicMilliseconds(io: Io) u64 {
+    const ms = Io.Clock.awake.now(io).toMilliseconds();
+    return if (ms <= 0) 0 else @intCast(ms);
+}
+
+fn everyIntervalMilliseconds(trigger: []const u8) ?u64 {
+    if (!std.mem.startsWith(u8, trigger, "every(") or trigger.len < 8 or trigger[trigger.len - 1] != ')') return null;
+    const secs = std.fmt.parseFloat(f64, trigger[6 .. trigger.len - 1]) catch return null;
+    if (!std.math.isFinite(secs) or secs <= 0) return null;
+    const ms_f = secs * 1000.0;
+    if (ms_f < 1.0 or ms_f >= 2147483648.0) return null;
+    return @intFromFloat(ms_f);
+}
+
 fn parseBindings(allocator: Allocator, out: *std.ArrayList(Binding), spec: []const u8) !void {
     var start: usize = 0;
     var depth: usize = 0;
@@ -3157,6 +3200,7 @@ fn parseBindings(allocator: Allocator, out: *std.ArrayList(Binding), spec: []con
         if (part.len == 0) continue;
         const colon = std.mem.indexOfScalar(u8, part, ':') orelse return error.InvalidBinding;
         const trigger = std.mem.trim(u8, part[0..colon], " \t");
+        if (std.mem.startsWith(u8, trigger, "every(") and everyIntervalMilliseconds(trigger) == null) return error.InvalidEveryEvent;
         const action_text = std.mem.trim(u8, part[colon + 1 ..], " \t");
         try appendBindingActions(allocator, out, trigger, action_text);
     }
@@ -4751,6 +4795,15 @@ test "binding parser" {
     try std.testing.expectEqualStrings("printf 'a,b'", bindings.items[0].action.reload);
     try std.testing.expectEqualStrings("ready", bindings.items[1].action.change_header);
     try std.testing.expect(bindings.items[2].action == .accept);
+}
+
+test "every event interval parsing" {
+    try std.testing.expectEqual(@as(?u64, 200), everyIntervalMilliseconds("every(0.2)"));
+    try std.testing.expectEqual(@as(?u64, 2000), everyIntervalMilliseconds("every(2)"));
+    try std.testing.expect(everyIntervalMilliseconds("every(0)") == null);
+    try std.testing.expect(everyIntervalMilliseconds("every(-1)") == null);
+    try std.testing.expect(everyIntervalMilliseconds("every(abc)") == null);
+    try std.testing.expect(everyIntervalMilliseconds("every(2147484)") == null);
 }
 
 test "fzf parser equal inverse fuzzy and boundary exact" {
