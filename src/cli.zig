@@ -100,6 +100,10 @@ const Action = union(enum) {
     unix_line_discard,
     yank,
     cancel,
+    print_query,
+    accept_non_empty,
+    accept_or_print_query,
+    put: []const u8,
     first,
     last,
     toggle,
@@ -1677,6 +1681,32 @@ const Ui = struct {
                 self.cursor = 0;
                 self.markQueryChanged();
             },
+            .print_query => {
+                try self.emitQueryOnly();
+                return 0;
+            },
+            .accept_non_empty => {
+                const input_complete = self.stream == null or self.stream.?.eof;
+                if (self.selected_count != 0 or self.result_len != 0 or (input_complete and self.candidates.display.len == 0)) {
+                    try self.emitSelection(null);
+                    return 0;
+                }
+            },
+            .accept_or_print_query => {
+                if (self.selected_count != 0 or self.result_len != 0) {
+                    try self.emitSelection(null);
+                } else {
+                    try self.emitQueryOnly();
+                }
+                return 0;
+            },
+            .put => |value| {
+                if (value.len != 0) {
+                    try self.query.insertSlice(self.allocator, self.cursor, value);
+                    self.cursor += value.len;
+                    self.markQueryChanged();
+                }
+            },
             .first => if (self.result_len != 0) {
                 if (self.focus != 0) {
                     self.focus_event_pending = true;
@@ -2812,6 +2842,15 @@ const Ui = struct {
         self.cursor += self.yanked.items.len;
         self.markQueryChanged();
         return true;
+    }
+
+    fn emitQueryOnly(self: *Ui) !void {
+        const sep: []const u8 = if (self.options.print0) "\x00" else "\n";
+        var stdout_buffer: [8192]u8 = undefined;
+        var writer = Io.File.stdout().writerStreaming(self.io, &stdout_buffer);
+        try writer.interface.writeAll(self.query.items);
+        try writer.interface.writeAll(sep);
+        try writer.flush();
     }
 
     fn emitSelection(self: *Ui, expect_key: ?[]const u8) !void {
@@ -4322,6 +4361,10 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "unix-word-rubout") or std.mem.eql(u8, s, "word-rubout")) return .backward_kill_word;
     if (std.mem.eql(u8, s, "yank")) return .yank;
     if (std.mem.eql(u8, s, "cancel")) return .cancel;
+    if (std.mem.eql(u8, s, "print-query")) return .print_query;
+    if (std.mem.eql(u8, s, "accept-non-empty")) return .accept_non_empty;
+    if (std.mem.eql(u8, s, "accept-or-print-query")) return .accept_or_print_query;
+    if (commandAction(s, "put")) |value| return .{ .put = value };
     if (std.mem.eql(u8, s, "first")) return .first;
     if (std.mem.eql(u8, s, "last")) return .last;
     if (std.mem.eql(u8, s, "toggle")) return .toggle;
@@ -6722,6 +6765,11 @@ test "stateful binding actions parse" {
     try std.testing.expect((try parseAction("cancel")) == .cancel);
     try std.testing.expect((try parseAction("clear-selection")) == .deselect_all);
     try std.testing.expect((try parseAction("clear-multi")) == .deselect_all);
+    try std.testing.expect((try parseAction("print-query")) == .print_query);
+    try std.testing.expect((try parseAction("accept-non-empty")) == .accept_non_empty);
+    try std.testing.expect((try parseAction("accept-or-print-query")) == .accept_or_print_query);
+    const put = try parseAction("put(λx)");
+    try std.testing.expectEqualStrings("λx", put.put);
     const printed = try parseAction("print(ctrl-y)");
     try std.testing.expectEqualStrings("ctrl-y", printed.print);
 
