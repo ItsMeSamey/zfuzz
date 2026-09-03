@@ -4258,6 +4258,24 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.no_sort = true;
             continue;
         }
+        if (std.mem.startsWith(u8, a, "--sort=")) {
+            const value = try std.fmt.parseInt(isize, a[7..], 10);
+            o.*.no_sort = value <= 0;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "-s") or std.mem.eql(u8, a, "--sort")) {
+            var value: isize = 1;
+            if (i + 1 < args.len and args[i + 1].len != 0 and std.ascii.isDigit(args[i + 1][0])) {
+                i += 1;
+                value = try std.fmt.parseInt(isize, args[i], 10);
+            }
+            o.*.no_sort = value <= 0;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "-s") and a.len > 2) {
+            o.*.no_sort = false;
+            continue;
+        }
         if (std.mem.eql(u8, a, "--disabled") or std.mem.eql(u8, a, "--phony")) {
             o.*.disabled = true;
             continue;
@@ -7183,6 +7201,7 @@ const usage =
     \\                           enable / disable single-match auto-accept
     \\  -0, --exit-0 / +0, --no-exit-0
     \\                           enable / disable no-match auto-exit
+    \\  -s, --sort[=N]        enable sorting when N > 0 (default 1)
     \\      --no-sort            preserve input order after filtering
     \\      --raw                show non-matching items dimmed alongside matches
     \\      --tiebreak=CRI       score tie-breaks: length/chunk/pathname/begin/end/index
@@ -7785,6 +7804,66 @@ test "multi modes match fzf zero and unlimited semantics" {
     defer negative_compact.deinit(a);
     try std.testing.expect(!negative_compact.multi);
     try std.testing.expect(negative_compact.multi_max == null);
+}
+
+test "sort option forms match fzf numeric semantics" {
+    const a = std.testing.allocator;
+
+    const bare_args = [_][]const u8{ "zfuzz", "--no-sort", "--sort" };
+    var bare = try parseOptions(a, &bare_args);
+    defer bare.deinit(a);
+    try std.testing.expect(!bare.no_sort);
+
+    const short_args = [_][]const u8{ "zfuzz", "+s", "-s" };
+    var short = try parseOptions(a, &short_args);
+    defer short.deinit(a);
+    try std.testing.expect(!short.no_sort);
+
+    const zero_args = [_][]const u8{ "zfuzz", "--sort=0" };
+    var zero = try parseOptions(a, &zero_args);
+    defer zero.deinit(a);
+    try std.testing.expect(zero.no_sort);
+
+    const negative_args = [_][]const u8{ "zfuzz", "--sort=-2" };
+    var negative = try parseOptions(a, &negative_args);
+    defer negative.deinit(a);
+    try std.testing.expect(negative.no_sort);
+
+    const positive_args = [_][]const u8{ "zfuzz", "--sort=2" };
+    var positive = try parseOptions(a, &positive_args);
+    defer positive.deinit(a);
+    try std.testing.expect(!positive.no_sort);
+
+    const separate_zero_args = [_][]const u8{ "zfuzz", "--sort", "0" };
+    var separate_zero = try parseOptions(a, &separate_zero_args);
+    defer separate_zero.deinit(a);
+    try std.testing.expect(separate_zero.no_sort);
+
+    const separate_positive_args = [_][]const u8{ "zfuzz", "--sort", "3" };
+    var separate_positive = try parseOptions(a, &separate_positive_args);
+    defer separate_positive.deinit(a);
+    try std.testing.expect(!separate_positive.no_sort);
+
+    const compact_zero_args = [_][]const u8{ "zfuzz", "+s", "-s0" };
+    var compact_zero = try parseOptions(a, &compact_zero_args);
+    defer compact_zero.deinit(a);
+    try std.testing.expect(!compact_zero.no_sort);
+
+    const compact_negative_args = [_][]const u8{ "zfuzz", "+s", "-s-1" };
+    var compact_negative = try parseOptions(a, &compact_negative_args);
+    defer compact_negative.deinit(a);
+    try std.testing.expect(!compact_negative.no_sort);
+
+    const compact_text_args = [_][]const u8{ "zfuzz", "+s", "-sanything" };
+    var compact_text = try parseOptions(a, &compact_text_args);
+    defer compact_text.deinit(a);
+    try std.testing.expect(!compact_text.no_sort);
+
+    const separate_negative_args = [_][]const u8{ "zfuzz", "+s", "--sort", "-1" };
+    var separate_negative = try parseOptions(a, &separate_negative_args);
+    defer separate_negative.deinit(a);
+    try std.testing.expect(!separate_negative.no_sort);
+    try std.testing.expect(separate_negative.select_1);
 }
 
 test "no-input option starts the existing input visibility state hidden" {
