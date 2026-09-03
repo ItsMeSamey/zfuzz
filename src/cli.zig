@@ -149,6 +149,7 @@ const Action = union(enum) {
     bg_transform_preview: []const u8,
     print: []const u8,
     reload: []const u8,
+    reload_sync: []const u8,
     execute: []const u8,
     execute_silent: []const u8,
     become: []const u8,
@@ -636,11 +637,12 @@ const QueryHistory = struct {
     }
 };
 
-const BackgroundKind = enum { actions, query, prompt, header, footer, preview };
+const BackgroundKind = enum { actions, query, prompt, header, footer, preview, reload };
 
 const BackgroundResult = struct {
     kind: BackgroundKind,
     output: []u8,
+    generation: u64,
 };
 
 const BackgroundQueue = struct {
@@ -665,11 +667,11 @@ const BackgroundQueue = struct {
         return true;
     }
 
-    fn finish(self: *BackgroundQueue, kind: BackgroundKind, output: ?[]u8) void {
+    fn finish(self: *BackgroundQueue, kind: BackgroundKind, output: ?[]u8, generation: u64) void {
         self.mutex.lockUncancelable(self.io);
         if (self.alive) {
             if (output) |value| {
-                self.results.append(self.allocator, .{ .kind = kind, .output = value }) catch self.allocator.free(value);
+                self.results.append(self.allocator, .{ .kind = kind, .output = value, .generation = generation }) catch self.allocator.free(value);
             }
         } else if (output) |value| {
             self.allocator.free(value);
@@ -710,6 +712,7 @@ const BackgroundContext = struct {
     allocator: Allocator,
     io: Io,
     kind: BackgroundKind,
+    generation: u64,
     command: []u8,
     env: std.process.Environ.Map,
 };
@@ -721,23 +724,28 @@ fn backgroundTransformThread(ctx: *BackgroundContext) void {
         ctx.env.deinit();
         allocator.destroy(ctx);
     }
+    const max_stdout: usize = if (ctx.kind == .reload) 64 * 1024 * 1024 else 1024 * 1024;
     const result = std.process.run(allocator, ctx.io, .{
         .argv = &.{ "/bin/sh", "-c", ctx.command },
         .environ_map = &ctx.env,
-        .stdout_limit = .limited(1024 * 1024),
+        .stdout_limit = .limited(max_stdout),
         .stderr_limit = .limited(1024 * 1024),
     }) catch {
-        ctx.queue.finish(ctx.kind, null);
+        ctx.queue.finish(ctx.kind, null, ctx.generation);
         return;
     };
+    allocator.free(result.stderr);
+    if (ctx.kind == .reload) {
+        ctx.queue.finish(ctx.kind, result.stdout, ctx.generation);
+        return;
+    }
     defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
     const text = std.mem.trimEnd(u8, result.stdout, "\r\n");
     const output = allocator.dupe(u8, text) catch {
-        ctx.queue.finish(ctx.kind, null);
+        ctx.queue.finish(ctx.kind, null, ctx.generation);
         return;
     };
-    ctx.queue.finish(ctx.kind, output);
+    ctx.queue.finish(ctx.kind, output, ctx.generation);
 }
 
 const Ui = struct {
@@ -789,6 +797,7 @@ const Ui = struct {
     last_key: []const u8 = "",
     timer_last_ms: []u64 = &.{},
     last_activity_ms: u64 = 0,
+    reload_generation: u64 = 0,
 
     fn init(
         allocator: Allocator,
@@ -1359,6 +1368,15 @@ const Ui = struct {
                     self.preview_offset = 0;
                     owned = null;
                 },
+                .reload => {
+                    if (result.generation != self.reload_generation) continue;
+                    var new_candidates = try candidatesFromOwnedBlob(self.allocator, result.output, self.options);
+                    owned = null;
+                    errdefer new_candidates.deinit(self.allocator);
+                    var new_index = try fuzzy.init(self.allocator, new_candidates.search);
+                    errdefer new_index.deinit();
+                    try self.replaceCandidates(new_candidates, new_index, true);
+                },
             }
         }
         return null;
@@ -1641,7 +1659,8 @@ const Ui = struct {
             .bg_transform_footer => |cmd| try self.launchBackgroundTransform(.footer, cmd),
             .bg_transform_preview => |cmd| try self.launchBackgroundTransform(.preview, cmd),
             .print => |value| try self.print_queue.append(self.allocator, try self.allocator.dupe(u8, value)),
-            .reload => |cmd| try self.reloadFromCommand(cmd),
+            .reload => |cmd| try self.launchAsyncReload(cmd),
+            .reload_sync => |cmd| try self.reloadFromCommand(cmd),
             .execute => |cmd| try self.executeCommand(cmd, false),
             .execute_silent => |cmd| try self.executeCommand(cmd, true),
             .become => |cmd| return try self.becomeCommand(cmd),
@@ -1699,7 +1718,7 @@ const Ui = struct {
         return env;
     }
 
-    fn launchBackgroundTransform(self: *Ui, kind: BackgroundKind, command: []const u8) !void {
+    fn launchBackgroundCommand(self: *Ui, kind: BackgroundKind, command: []const u8, generation: u64) !void {
         const expanded = try self.expandedCommand(command);
         errdefer self.allocator.free(expanded);
         var env = try self.commandEnvironment();
@@ -1710,7 +1729,7 @@ const Ui = struct {
             return;
         }
         const ctx = self.allocator.create(BackgroundContext) catch |err| {
-            self.bg_queue.finish(kind, null);
+            self.bg_queue.finish(kind, null, generation);
             return err;
         };
         errdefer self.allocator.destroy(ctx);
@@ -1719,14 +1738,25 @@ const Ui = struct {
             .allocator = self.allocator,
             .io = self.io,
             .kind = kind,
+            .generation = generation,
             .command = expanded,
             .env = env,
         };
         const thread = std.Thread.spawn(.{}, backgroundTransformThread, .{ctx}) catch |err| {
-            self.bg_queue.finish(kind, null);
+            self.bg_queue.finish(kind, null, generation);
             return err;
         };
         thread.detach();
+    }
+
+    fn launchBackgroundTransform(self: *Ui, kind: BackgroundKind, command: []const u8) !void {
+        try self.launchBackgroundCommand(kind, command, 0);
+    }
+
+    fn launchAsyncReload(self: *Ui, command: []const u8) !void {
+        self.stream = null;
+        self.reload_generation +%= 1;
+        try self.launchBackgroundCommand(.reload, command, self.reload_generation);
     }
 
     fn runTransformCommand(self: *Ui, command: []const u8) ![]u8 {
@@ -3628,6 +3658,7 @@ fn parseAction(s: []const u8) !Action {
     if (commandAction(s, "bg-transform")) |cmd| return .{ .bg_transform = cmd };
     if (commandAction(s, "transform")) |cmd| return .{ .transform = cmd };
     if (commandAction(s, "print")) |value| return .{ .print = value };
+    if (commandAction(s, "reload-sync")) |cmd| return .{ .reload_sync = cmd };
     if (commandAction(s, "reload")) |cmd| return .{ .reload = cmd };
     if (commandAction(s, "execute-silent")) |cmd| return .{ .execute_silent = cmd };
     if (commandAction(s, "execute")) |cmd| return .{ .execute = cmd };
@@ -5158,6 +5189,13 @@ test "binding parser" {
     try std.testing.expectEqualStrings("printf 'a,b'", bindings.items[0].action.reload);
     try std.testing.expectEqualStrings("ready", bindings.items[1].action.change_header);
     try std.testing.expect(bindings.items[2].action == .accept);
+}
+
+test "reload actions distinguish async and sync variants" {
+    const asynchronous = try parseAction("reload(echo async)");
+    try std.testing.expect(std.mem.eql(u8, asynchronous.reload, "echo async"));
+    const synchronous = try parseAction("reload-sync(echo sync)");
+    try std.testing.expect(std.mem.eql(u8, synchronous.reload_sync, "echo sync"));
 }
 
 test "background transform actions parse command payloads" {
