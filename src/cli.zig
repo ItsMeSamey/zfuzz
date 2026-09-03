@@ -11,6 +11,41 @@ const Layout = enum { default, reverse };
 const CaseMode = enum { smart, ignore, respect };
 const PreviewPosition = enum { right, left, up, down };
 const TieBreak = enum { length, chunk, pathname, begin, end };
+const StylePreset = enum { default, minimal, full };
+const BorderStyle = enum { none, rounded, sharp, bold, double, dashed, horizontal, vertical, top, bottom, left, right };
+
+const Color = union(enum) {
+    ansi: u8,
+    rgb: struct { r: u8, g: u8, b: u8 },
+};
+
+const RoleStyle = struct {
+    fg: ?Color = null,
+    bg: ?Color = null,
+    bold: bool = false,
+    dim: bool = false,
+    italic: bool = false,
+    underline: bool = false,
+    reverse: bool = false,
+    strike: bool = false,
+};
+
+const Theme = struct {
+    enabled: bool = true,
+    normal: RoleStyle = .{},
+    current: RoleStyle = .{ .reverse = true },
+    highlight: RoleStyle = .{ .fg = .{ .ansi = 14 }, .bold = true },
+    highlight_current: RoleStyle = .{ .fg = .{ .ansi = 14 }, .bold = true },
+    info: RoleStyle = .{ .dim = true },
+    border: RoleStyle = .{ .fg = .{ .ansi = 8 }, .dim = true },
+    preview_border: RoleStyle = .{ .fg = .{ .ansi = 8 }, .dim = true },
+    prompt: RoleStyle = .{ .fg = .{ .ansi = 14 }, .bold = true },
+    pointer: RoleStyle = .{ .fg = .{ .ansi = 14 }, .bold = true },
+    marker: RoleStyle = .{ .fg = .{ .ansi = 11 }, .bold = true },
+    header: RoleStyle = .{ .fg = .{ .ansi = 10 } },
+    footer: RoleStyle = .{ .fg = .{ .ansi = 10 } },
+    query: RoleStyle = .{},
+};
 
 const PreviewOptions = struct {
     command: ?[]const u8 = null,
@@ -86,7 +121,11 @@ const Options = struct {
     tail: ?usize = null,
     sync: bool = false,
     mouse: bool = true,
+    style_preset: StylePreset = .default,
     border: bool = true,
+    border_style: BorderStyle = .rounded,
+    bold: bool = true,
+    theme: Theme = .{},
     height_percent: u8 = 100,
     preview: PreviewOptions = .{},
     delimiter: ?[]const u8 = null,
@@ -123,7 +162,6 @@ const CandidateSet = struct {
         allocator.free(self.blob);
     }
 };
-
 
 const StreamUpdate = struct {
     changed: bool = false,
@@ -578,8 +616,19 @@ const Ui = struct {
     }
 
     fn contentPane(self: *Ui, pane: Pane) Pane {
-        if (!self.options.border or pane.rows < 3 or pane.cols < 5) return pane;
-        return .{ .row = pane.row + 1, .col = pane.col + 2, .rows = pane.rows - 2, .cols = pane.cols - 4 };
+        if (!self.options.border or self.options.border_style == .none) return pane;
+        const sides = borderSides(self.options.border_style);
+        const top: usize = @intFromBool(sides.top);
+        const bottom: usize = @intFromBool(sides.bottom);
+        const left: usize = if (sides.left) 2 else 0;
+        const right: usize = if (sides.right) 2 else 0;
+        if (pane.rows <= top + bottom or pane.cols <= left + right) return pane;
+        return .{
+            .row = pane.row + top,
+            .col = pane.col + left,
+            .rows = pane.rows - top - bottom,
+            .cols = pane.cols - left - right,
+        };
     }
 
     fn visibleListRows(self: *Ui) usize {
@@ -1071,27 +1120,27 @@ const Ui = struct {
             try w.writeAll("\x1b[H\x1b[2J");
         }
 
-        if (self.options.border) try drawPaneBorder(w, geom.main, self.terminal.inline_mode);
+        if (self.options.border) try drawPaneBorder(w, geom.main, self.terminal.inline_mode, self.options.border_style, self.options.theme.border, self.options.theme.enabled, self.options.bold);
         const content = self.contentPane(geom.main);
         var row = content.row;
         if (self.options.layout == .reverse) {
             try self.renderPrompt(w, row, content.col, content.cols);
             row += 1;
             if (self.options.header) |h| {
-                try self.renderPlainLine(w, row, content.col, h, content.cols);
+                try self.renderPlainLine(w, row, content.col, h, content.cols, self.options.theme.header);
                 row += 1;
             }
             row = try self.renderList(w, row, content, true);
-            if (self.options.footer) |f| try self.renderPlainLine(w, row, content.col, f, content.cols);
+            if (self.options.footer) |f| try self.renderPlainLine(w, row, content.col, f, content.cols, self.options.theme.footer);
         } else {
             row = try self.renderList(w, row, content, false);
             if (self.options.header) |h| {
-                try self.renderPlainLine(w, row, content.col, h, content.cols);
+                try self.renderPlainLine(w, row, content.col, h, content.cols, self.options.theme.header);
                 row += 1;
             }
             try self.renderPrompt(w, row, content.col, content.cols);
             row += 1;
-            if (self.options.footer) |f| try self.renderPlainLine(w, row, content.col, f, content.cols);
+            if (self.options.footer) |f| try self.renderPlainLine(w, row, content.col, f, content.cols, self.options.theme.footer);
         }
 
         if (geom.preview) |preview| {
@@ -1104,31 +1153,40 @@ const Ui = struct {
 
     fn renderPrompt(self: *Ui, w: anytype, row: usize, col: usize, cols: usize) !void {
         try cursorTo(w, row, col, self.terminal.inline_mode);
-        try w.print("\x1b[1m{s}\x1b[0m", .{self.options.prompt});
+        try writeRoleStyle(w, self.options.theme.prompt, self.options.theme.enabled, self.options.bold);
+        try w.writeAll(self.options.prompt);
+        try writeReset(w);
+        try writeRoleStyle(w, self.options.theme.query, self.options.theme.enabled, self.options.bold);
         try w.writeAll(self.query.items[0..self.cursor]);
         if (self.cursor < self.query.items.len) {
             const next = nextUtf8Boundary(self.query.items, self.cursor);
             try w.writeAll("\x1b[7m");
             try w.writeAll(self.query.items[self.cursor..next]);
-            try w.writeAll("\x1b[0m");
+            try writeReset(w);
+            try writeRoleStyle(w, self.options.theme.query, self.options.theme.enabled, self.options.bold);
             try w.writeAll(self.query.items[next..]);
         } else {
-            try w.writeAll("\x1b[7m \x1b[0m");
+            try w.writeAll("\x1b[7m \x1b[27m");
         }
+        try writeReset(w);
         const shown = if (self.result_len == self.result_cap and self.result_cap < self.candidates.display.len)
             try std.fmt.allocPrint(self.allocator, "  {d}+/{d}", .{ self.result_len, self.candidates.display.len })
         else
             try std.fmt.allocPrint(self.allocator, "  {d}/{d}", .{ self.result_len, self.candidates.display.len });
         defer self.allocator.free(shown);
+        try writeRoleStyle(w, self.options.theme.info, self.options.theme.enabled, self.options.bold);
         if (self.options.multi) {
-            try w.print("\x1b[2m{s} ({d})\x1b[0m", .{ shown, self.selected_count });
-        } else try w.print("\x1b[2m{s}\x1b[0m", .{shown});
+            try w.print("{s} ({d})", .{ shown, self.selected_count });
+        } else try w.writeAll(shown);
+        try writeReset(w);
         _ = cols;
     }
 
-    fn renderPlainLine(self: *Ui, w: anytype, row: usize, col: usize, text: []const u8, cols: usize) !void {
+    fn renderPlainLine(self: *Ui, w: anytype, row: usize, col: usize, text: []const u8, cols: usize, style: RoleStyle) !void {
         try cursorTo(w, row, col, self.terminal.inline_mode);
+        try writeRoleStyle(w, style, self.options.theme.enabled, self.options.bold);
         try writeTruncated(w, text, cols, false, "");
+        try writeReset(w);
     }
 
     fn renderList(self: *Ui, w: anytype, start_row: usize, content: Pane, top_down: bool) !usize {
@@ -1143,13 +1201,21 @@ const Ui = struct {
             const idx = self.results[logical];
             const focused = logical == self.focus;
             const marked = self.selected[idx];
-            if (focused) try w.writeAll("\x1b[7m");
-            try w.print("{s} {s} ", .{
-                if (focused) self.options.pointer else " ",
-                if (marked) self.options.marker else " ",
-            });
-            try writeHighlighted(w, self.candidates.display[idx], self.query.items, if (content.cols > 4) content.cols - 4 else content.cols, self.options.wrap, self.options.ansi);
-            if (focused) try w.writeAll("\x1b[0m");
+            try writeRoleStyle(w, if (focused) self.options.theme.current else self.options.theme.normal, self.options.theme.enabled, self.options.bold);
+            if (focused) {
+                try writeRoleStyleOverlay(w, self.options.theme.pointer, self.options.theme.enabled, self.options.bold);
+                try w.writeAll(self.options.pointer);
+                try writeRoleStyle(w, self.options.theme.current, self.options.theme.enabled, self.options.bold);
+            } else try w.writeAll(" ");
+            try w.writeAll(" ");
+            if (marked) {
+                try writeRoleStyleOverlay(w, self.options.theme.marker, self.options.theme.enabled, self.options.bold);
+                try w.writeAll(self.options.marker);
+                try writeRoleStyle(w, if (focused) self.options.theme.current else self.options.theme.normal, self.options.theme.enabled, self.options.bold);
+            } else try w.writeAll(" ");
+            try w.writeAll(" ");
+            try writeHighlighted(w, self.candidates.display[idx], self.query.items, if (content.cols > 4) content.cols - 4 else content.cols, self.options.wrap, self.options.ansi, &self.options.theme, focused, self.options.bold);
+            try writeReset(w);
         }
         return start_row + rows;
     }
@@ -1182,10 +1248,10 @@ const Ui = struct {
     fn renderPreviewOverlay(self: *Ui, frame: *Io.Writer.Allocating, size: anytype, geom: PaneGeometry, preview: Pane) !void {
         const w = &frame.writer;
         switch (self.options.preview.position) {
-            .right => try drawVerticalSeparator(w, 1, size.rows, preview.col - 1, self.terminal.inline_mode),
-            .left => try drawVerticalSeparator(w, 1, size.rows, geom.main.col - 1, self.terminal.inline_mode),
-            .down => try drawHorizontalSeparator(w, preview.row - 1, 1, size.cols, self.terminal.inline_mode),
-            .up => try drawHorizontalSeparator(w, geom.main.row - 1, 1, size.cols, self.terminal.inline_mode),
+            .right => try drawVerticalSeparator(w, 1, size.rows, preview.col - 1, self.terminal.inline_mode, self.options.theme.preview_border, self.options.theme.enabled, self.options.bold),
+            .left => try drawVerticalSeparator(w, 1, size.rows, geom.main.col - 1, self.terminal.inline_mode, self.options.theme.preview_border, self.options.theme.enabled, self.options.bold),
+            .down => try drawHorizontalSeparator(w, preview.row - 1, 1, size.cols, self.terminal.inline_mode, self.options.theme.preview_border, self.options.theme.enabled, self.options.bold),
+            .up => try drawHorizontalSeparator(w, geom.main.row - 1, 1, size.cols, self.terminal.inline_mode, self.options.theme.preview_border, self.options.theme.enabled, self.options.bold),
         }
 
         var lines = std.mem.splitScalar(u8, self.preview_text, '\n');
@@ -1208,49 +1274,263 @@ fn cursorTo(w: anytype, row: usize, col: usize, inline_mode: bool) !void {
     try w.print("\x1b[{d}G", .{col});
 }
 
-fn drawPaneBorder(w: anytype, pane: Pane, inline_mode: bool) !void {
-    if (pane.rows < 2 or pane.cols < 2) return;
-    try cursorTo(w, pane.row, pane.col, inline_mode);
-    try w.writeAll("╭");
-    var i: usize = 0;
-    while (i + 2 < pane.cols) : (i += 1) try w.writeAll("─");
-    try w.writeAll("╮");
-    var r: usize = 1;
-    while (r + 1 < pane.rows) : (r += 1) {
-        try cursorTo(w, pane.row + r, pane.col, inline_mode);
-        try w.writeAll("│");
-        try cursorTo(w, pane.row + r, pane.col + pane.cols - 1, inline_mode);
-        try w.writeAll("│");
-    }
-    try cursorTo(w, pane.row + pane.rows - 1, pane.col, inline_mode);
-    try w.writeAll("╰");
-    i = 0;
-    while (i + 2 < pane.cols) : (i += 1) try w.writeAll("─");
-    try w.writeAll("╯");
+const BorderGlyphs = struct {
+    tl: []const u8,
+    tr: []const u8,
+    bl: []const u8,
+    br: []const u8,
+    h: []const u8,
+    v: []const u8,
+};
+
+fn borderGlyphs(style: BorderStyle) BorderGlyphs {
+    return switch (style) {
+        .double => .{ .tl = "╔", .tr = "╗", .bl = "╚", .br = "╝", .h = "═", .v = "║" },
+        .bold => .{ .tl = "┏", .tr = "┓", .bl = "┗", .br = "┛", .h = "━", .v = "┃" },
+        .sharp, .horizontal, .vertical, .top, .bottom, .left, .right => .{ .tl = "┌", .tr = "┐", .bl = "└", .br = "┘", .h = "─", .v = "│" },
+        .dashed => .{ .tl = "┌", .tr = "┐", .bl = "└", .br = "┘", .h = "┄", .v = "┆" },
+        else => .{ .tl = "╭", .tr = "╮", .bl = "╰", .br = "╯", .h = "─", .v = "│" },
+    };
 }
 
-fn drawVerticalSeparator(w: anytype, first_row: usize, rows: usize, col: usize, inline_mode: bool) !void {
+fn borderSides(style: BorderStyle) struct { top: bool, bottom: bool, left: bool, right: bool } {
+    return switch (style) {
+        .none => .{ .top = false, .bottom = false, .left = false, .right = false },
+        .horizontal => .{ .top = true, .bottom = true, .left = false, .right = false },
+        .vertical => .{ .top = false, .bottom = false, .left = true, .right = true },
+        .top => .{ .top = true, .bottom = false, .left = false, .right = false },
+        .bottom => .{ .top = false, .bottom = true, .left = false, .right = false },
+        .left => .{ .top = false, .bottom = false, .left = true, .right = false },
+        .right => .{ .top = false, .bottom = false, .left = false, .right = true },
+        else => .{ .top = true, .bottom = true, .left = true, .right = true },
+    };
+}
+
+fn drawPaneBorder(w: anytype, pane: Pane, inline_mode: bool, style: BorderStyle, role: RoleStyle, colors: bool, bold_enabled: bool) !void {
+    if (style == .none or pane.rows < 2 or pane.cols < 2) return;
+    const g = borderGlyphs(style);
+    const sides = borderSides(style);
+    try writeRoleStyle(w, role, colors, bold_enabled);
+    if (sides.top) {
+        try cursorTo(w, pane.row, pane.col, inline_mode);
+        if (sides.left) try w.writeAll(g.tl);
+        var i: usize = if (sides.left) 1 else 0;
+        const end = pane.cols - @intFromBool(sides.right);
+        while (i < end) : (i += 1) try w.writeAll(g.h);
+        if (sides.right) try w.writeAll(g.tr);
+    }
+    var r: usize = if (sides.top) 1 else 0;
+    const row_end = pane.rows - @intFromBool(sides.bottom);
+    while (r < row_end) : (r += 1) {
+        if (sides.left) {
+            try cursorTo(w, pane.row + r, pane.col, inline_mode);
+            try w.writeAll(g.v);
+        }
+        if (sides.right) {
+            try cursorTo(w, pane.row + r, pane.col + pane.cols - 1, inline_mode);
+            try w.writeAll(g.v);
+        }
+    }
+    if (sides.bottom) {
+        try cursorTo(w, pane.row + pane.rows - 1, pane.col, inline_mode);
+        if (sides.left) try w.writeAll(g.bl);
+        var i: usize = if (sides.left) 1 else 0;
+        const end = pane.cols - @intFromBool(sides.right);
+        while (i < end) : (i += 1) try w.writeAll(g.h);
+        if (sides.right) try w.writeAll(g.br);
+    }
+    try writeReset(w);
+}
+
+fn drawVerticalSeparator(w: anytype, first_row: usize, rows: usize, col: usize, inline_mode: bool, role: RoleStyle, colors: bool, bold_enabled: bool) !void {
     if (col == 0) return;
+    try writeRoleStyle(w, role, colors, bold_enabled);
     var r: usize = 0;
     while (r < rows) : (r += 1) {
         try cursorTo(w, first_row + r, col, inline_mode);
-        try w.writeAll("\x1b[2m│\x1b[0m");
+        try w.writeAll("│");
+    }
+    try writeReset(w);
+}
+
+fn drawHorizontalSeparator(w: anytype, row: usize, first_col: usize, cols: usize, inline_mode: bool, role: RoleStyle, colors: bool, bold_enabled: bool) !void {
+    if (row == 0) return;
+    try cursorTo(w, row, first_col, inline_mode);
+    try writeRoleStyle(w, role, colors, bold_enabled);
+    var c: usize = 0;
+    while (c < cols) : (c += 1) try w.writeAll("─");
+    try writeReset(w);
+}
+
+fn writeReset(w: anytype) !void {
+    try w.writeAll("\x1b[0m");
+}
+
+fn writeColor(w: anytype, color: Color, background: bool) !void {
+    switch (color) {
+        .ansi => |n| {
+            if (n < 8) {
+                try w.print("\x1b[{d}m", .{(if (background) @as(u16, 40) else 30) + n});
+            } else if (n < 16) {
+                try w.print("\x1b[{d}m", .{(if (background) @as(u16, 100) else 90) + (n - 8)});
+            } else {
+                try w.print("\x1b[{d};5;{d}m", .{ if (background) @as(u8, 48) else 38, n });
+            }
+        },
+        .rgb => |rgb| try w.print("\x1b[{d};2;{d};{d};{d}m", .{ if (background) @as(u8, 48) else 38, rgb.r, rgb.g, rgb.b }),
     }
 }
 
-fn drawHorizontalSeparator(w: anytype, row: usize, first_col: usize, cols: usize, inline_mode: bool) !void {
-    if (row == 0) return;
-    try cursorTo(w, row, first_col, inline_mode);
-    try w.writeAll("\x1b[2m");
-    var c: usize = 0;
-    while (c < cols) : (c += 1) try w.writeAll("─");
-    try w.writeAll("\x1b[0m");
+fn writeRoleStyleOverlay(w: anytype, style: RoleStyle, colors: bool, bold_enabled: bool) !void {
+    if (style.bold and bold_enabled) try w.writeAll("\x1b[1m");
+    if (style.dim) try w.writeAll("\x1b[2m");
+    if (style.italic) try w.writeAll("\x1b[3m");
+    if (style.underline) try w.writeAll("\x1b[4m");
+    if (style.reverse) try w.writeAll("\x1b[7m");
+    if (style.strike) try w.writeAll("\x1b[9m");
+    if (colors) {
+        if (style.fg) |fg| try writeColor(w, fg, false);
+        if (style.bg) |bg| try writeColor(w, bg, true);
+    }
+}
+
+fn writeRoleStyle(w: anytype, style: RoleStyle, colors: bool, bold_enabled: bool) !void {
+    try writeReset(w);
+    try writeRoleStyleOverlay(w, style, colors, bold_enabled);
+}
+
+fn namedAnsiColor(name: []const u8) ?u8 {
+    const names = [_][]const u8{ "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white", "bright-black", "bright-red", "bright-green", "bright-yellow", "bright-blue", "bright-magenta", "bright-cyan", "bright-white" };
+    for (names, 0..) |candidate, i| if (std.ascii.eqlIgnoreCase(name, candidate)) return @intCast(i);
+    return null;
+}
+
+fn parseColor(value: []const u8) !?Color {
+    if (std.mem.eql(u8, value, "-1") or std.ascii.eqlIgnoreCase(value, "default")) return null;
+    if (namedAnsiColor(value)) |ansi| return .{ .ansi = ansi };
+    if (value.len == 7 and value[0] == '#') {
+        return .{ .rgb = .{
+            .r = try std.fmt.parseInt(u8, value[1..3], 16),
+            .g = try std.fmt.parseInt(u8, value[3..5], 16),
+            .b = try std.fmt.parseInt(u8, value[5..7], 16),
+        } };
+    }
+    return .{ .ansi = try std.fmt.parseInt(u8, value, 10) };
+}
+
+fn applyAttribute(style: *RoleStyle, attr: []const u8) !void {
+    if (attr.len == 0) return;
+    if (std.ascii.eqlIgnoreCase(attr, "regular")) {
+        style.bold = false;
+        style.dim = false;
+        style.italic = false;
+        style.underline = false;
+        style.reverse = false;
+        style.strike = false;
+    } else if (std.ascii.eqlIgnoreCase(attr, "bold")) style.bold = true else if (std.ascii.eqlIgnoreCase(attr, "dim")) style.dim = true else if (std.ascii.eqlIgnoreCase(attr, "italic")) style.italic = true else if (std.ascii.eqlIgnoreCase(attr, "underline")) style.underline = true else if (std.ascii.eqlIgnoreCase(attr, "reverse")) style.reverse = true else if (std.ascii.eqlIgnoreCase(attr, "strikethrough") or std.ascii.eqlIgnoreCase(attr, "strike")) style.strike = true else return error.InvalidColorAttribute;
+}
+
+fn themeRole(theme: *Theme, name: []const u8) ?*RoleStyle {
+    if (std.mem.eql(u8, name, "fg") or std.mem.eql(u8, name, "bg")) return &theme.normal;
+    if (std.mem.eql(u8, name, "fg+") or std.mem.eql(u8, name, "bg+")) return &theme.current;
+    if (std.mem.eql(u8, name, "hl")) return &theme.highlight;
+    if (std.mem.eql(u8, name, "hl+")) return &theme.highlight_current;
+    if (std.mem.eql(u8, name, "info")) return &theme.info;
+    if (std.mem.eql(u8, name, "border") or std.mem.eql(u8, name, "separator")) return &theme.border;
+    if (std.mem.eql(u8, name, "preview-border")) return &theme.preview_border;
+    if (std.mem.eql(u8, name, "prompt")) return &theme.prompt;
+    if (std.mem.eql(u8, name, "pointer") or std.mem.eql(u8, name, "gutter")) return &theme.pointer;
+    if (std.mem.eql(u8, name, "marker")) return &theme.marker;
+    if (std.mem.eql(u8, name, "header")) return &theme.header;
+    if (std.mem.eql(u8, name, "footer")) return &theme.footer;
+    if (std.mem.eql(u8, name, "query")) return &theme.query;
+    return null;
+}
+
+fn applyBaseTheme(theme: *Theme, name: []const u8) !bool {
+    if (std.ascii.eqlIgnoreCase(name, "bw")) {
+        theme.enabled = false;
+        return true;
+    }
+    if (std.ascii.eqlIgnoreCase(name, "dark") or std.ascii.eqlIgnoreCase(name, "base16")) {
+        theme.* = .{};
+        return true;
+    }
+    if (std.ascii.eqlIgnoreCase(name, "light")) {
+        theme.* = .{};
+        theme.normal.fg = .{ .ansi = 0 };
+        theme.normal.bg = .{ .ansi = 15 };
+        theme.current.fg = .{ .ansi = 0 };
+        theme.current.bg = .{ .ansi = 7 };
+        theme.current.reverse = false;
+        theme.highlight.fg = .{ .ansi = 4 };
+        theme.highlight_current.fg = .{ .ansi = 4 };
+        theme.border.fg = .{ .ansi = 8 };
+        theme.preview_border.fg = .{ .ansi = 8 };
+        theme.prompt.fg = .{ .ansi = 4 };
+        theme.pointer.fg = .{ .ansi = 5 };
+        theme.marker.fg = .{ .ansi = 1 };
+        theme.header.fg = .{ .ansi = 2 };
+        theme.footer.fg = .{ .ansi = 2 };
+        return true;
+    }
+    return false;
+}
+
+fn parseColorSpec(theme: *Theme, spec: []const u8) !void {
+    var it = std.mem.tokenizeAny(u8, spec, ", \t\r\n");
+    while (it.next()) |token| {
+        if (try applyBaseTheme(theme, token)) continue;
+        var fields = std.mem.splitScalar(u8, token, ':');
+        const name = fields.next() orelse continue;
+        const style = themeRole(theme, name) orelse return error.InvalidColorName;
+        if (fields.next()) |color_text| {
+            const color = try parseColor(color_text);
+            if (std.mem.eql(u8, name, "bg") or std.mem.eql(u8, name, "bg+")) style.bg = color else style.fg = color;
+            if ((std.mem.eql(u8, name, "fg+") or std.mem.eql(u8, name, "bg+")) and color != null) style.reverse = false;
+        }
+        while (fields.next()) |attr| try applyAttribute(style, attr);
+        theme.enabled = true;
+    }
+}
+
+fn parseBorderStyle(text: []const u8) !BorderStyle {
+    inline for (@typeInfo(BorderStyle).@"enum".fields) |field| {
+        if (std.ascii.eqlIgnoreCase(text, field.name)) return @enumFromInt(field.value);
+    }
+    if (std.ascii.eqlIgnoreCase(text, "line")) return .sharp;
+    if (std.ascii.eqlIgnoreCase(text, "block") or std.ascii.eqlIgnoreCase(text, "thinblock")) return .bold;
+    return error.InvalidBorderStyle;
+}
+
+fn applyStylePreset(options: *Options, text: []const u8) !void {
+    var parts = std.mem.splitScalar(u8, text, ':');
+    const preset = parts.next() orelse return error.InvalidStylePreset;
+    if (std.ascii.eqlIgnoreCase(preset, "default")) {
+        options.style_preset = .default;
+        options.border = true;
+        options.border_style = .rounded;
+    } else if (std.ascii.eqlIgnoreCase(preset, "minimal")) {
+        options.style_preset = .minimal;
+        options.border = false;
+        options.border_style = .none;
+    } else if (std.ascii.eqlIgnoreCase(preset, "full")) {
+        options.style_preset = .full;
+        options.border = true;
+        options.border_style = .rounded;
+    } else return error.InvalidStylePreset;
+    if (parts.next()) |border| {
+        options.border_style = try parseBorderStyle(border);
+        options.border = options.border_style != .none;
+    }
+    if (parts.next() != null) return error.InvalidStylePreset;
 }
 
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(allocator);
     var options: Options = .{};
+    if (init.environ_map.get("NO_COLOR") != null) options.theme.enabled = false;
     if (init.environ_map.get("FZF_DEFAULT_OPTS")) |defaults_text| {
         const default_args = try shellSplitArgs(allocator, defaults_text);
         try parseOptionsInto(allocator, &options, default_args, 0);
@@ -1490,16 +1770,55 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.tac = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "--no-color")) {
+            o.*.theme.enabled = false;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--color=")) {
+            try parseColorSpec(&o.*.theme, a[8..]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--color")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            try parseColorSpec(&o.*.theme, args[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-bold")) {
+            o.*.bold = false;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--bold")) {
+            o.*.bold = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--style=")) {
+            try applyStylePreset(o, a[8..]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--style")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            try applyStylePreset(o, args[i]);
+            continue;
+        }
         if (std.mem.eql(u8, a, "--no-mouse")) {
             o.*.mouse = false;
             continue;
         }
         if (std.mem.eql(u8, a, "--border")) {
             o.*.border = true;
+            if (o.*.border_style == .none) o.*.border_style = .rounded;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--border=")) {
+            o.*.border_style = try parseBorderStyle(a[9..]);
+            o.*.border = o.*.border_style != .none;
             continue;
         }
         if (std.mem.eql(u8, a, "--no-border")) {
             o.*.border = false;
+            o.*.border_style = .none;
             continue;
         }
         if (std.mem.eql(u8, a, "--reverse") or std.mem.eql(u8, a, "--layout=reverse")) {
@@ -2655,10 +2974,12 @@ fn nextUtf8Boundary(s: []const u8, pos: usize) usize {
     return p;
 }
 
-fn writeHighlighted(w: anytype, text: []const u8, query: []const u8, cols: usize, wrap: bool, ansi: bool) !void {
+fn writeHighlighted(w: anytype, text: []const u8, query: []const u8, cols: usize, wrap: bool, ansi: bool, theme: *const Theme, focused: bool, bold_enabled: bool) !void {
     var qi: usize = 0;
     var printed: usize = 0;
     var i: usize = 0;
+    const base = if (focused) theme.current else theme.normal;
+    const highlight = if (focused) theme.highlight_current else theme.highlight;
     while (i < text.len) {
         if (ansi and text[i] == 0x1b and i + 1 < text.len and text[i + 1] == '[') {
             const esc_start = i;
@@ -2676,9 +2997,9 @@ fn writeHighlighted(w: anytype, text: []const u8, query: []const u8, cols: usize
         const c = text[i];
         const match = qi < query.len and std.ascii.toLower(c) == std.ascii.toLower(query[qi]);
         if (match) {
-            try w.writeAll("\x1b[1;36m");
+            try writeRoleStyleOverlay(w, highlight, theme.enabled, bold_enabled);
             try w.writeByte(c);
-            try w.writeAll("\x1b[0m");
+            try writeRoleStyle(w, base, theme.enabled, bold_enabled);
             qi += 1;
         } else try w.writeByte(c);
         printed += 1;
@@ -2910,7 +3231,6 @@ const usage =
     \\  Tab toggle, Ctrl-A/E line edges, Ctrl-U clear, Ctrl-W erase word.
 ;
 
-
 test "stream input retains bounded tail across partial records" {
     const a = std.testing.allocator;
     var stream = StreamInput.init(a, '\n', 2);
@@ -3111,4 +3431,51 @@ test "fzf tiebreak values use match bounds" {
     try std.testing.expectEqual(@as(usize, 7), tiebreakValue(.length, "  abcdefg  ", score));
     try std.testing.expectEqual(@as(usize, 7), tiebreakValue(.chunk, "  abcdefg  ", score));
     try std.testing.expectEqual(@as(usize, 1), tiebreakValue(.pathname, "xx/abcdefg", score));
+}
+
+test "style color and border option forms" {
+    const a = std.testing.allocator;
+    const args = [_][]const u8{
+        "zfuzz",
+        "--style=full:double",
+        "--color=fg:252,bg+:236,hl:#719872:bold,prompt:red:underline",
+        "--no-bold",
+    };
+    var options = try parseOptions(a, &args);
+    defer options.deinit(a);
+    try std.testing.expectEqual(StylePreset.full, options.style_preset);
+    try std.testing.expect(options.border);
+    try std.testing.expectEqual(BorderStyle.double, options.border_style);
+    try std.testing.expect(!options.bold);
+    try std.testing.expect(options.theme.enabled);
+    switch (options.theme.normal.fg.?) {
+        .ansi => |n| try std.testing.expectEqual(@as(u8, 252), n),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (options.theme.current.bg.?) {
+        .ansi => |n| try std.testing.expectEqual(@as(u8, 236), n),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(!options.theme.current.reverse);
+    switch (options.theme.highlight.fg.?) {
+        .rgb => |rgb| {
+            try std.testing.expectEqual(@as(u8, 0x71), rgb.r);
+            try std.testing.expectEqual(@as(u8, 0x98), rgb.g);
+            try std.testing.expectEqual(@as(u8, 0x72), rgb.b);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(options.theme.highlight.bold);
+    try std.testing.expect(options.theme.prompt.underline);
+}
+
+test "minimal style and no color disable decoration" {
+    const a = std.testing.allocator;
+    const args = [_][]const u8{ "zfuzz", "--style=minimal", "--no-color" };
+    var options = try parseOptions(a, &args);
+    defer options.deinit(a);
+    try std.testing.expectEqual(StylePreset.minimal, options.style_preset);
+    try std.testing.expect(!options.border);
+    try std.testing.expectEqual(BorderStyle.none, options.border_style);
+    try std.testing.expect(!options.theme.enabled);
 }
