@@ -96,6 +96,10 @@ const Action = union(enum) {
     enable_search,
     disable_search,
     toggle_search,
+    toggle_track,
+    track_current,
+    untrack_current,
+    toggle_track_current,
     prev_history,
     next_history,
     change_query: []const u8,
@@ -155,6 +159,8 @@ const Options = struct {
     walker_skip: []const u8 = ".git,node_modules",
     history_file: ?[]const u8 = null,
     history_size: usize = 1000,
+    track: bool = false,
+    id_nth: ?[]const u8 = null,
     mouse: bool = true,
     style_preset: StylePreset = .default,
     border: bool = true,
@@ -566,6 +572,8 @@ const Ui = struct {
     terminal: *Terminal,
     stream: ?*StreamInput,
     history: ?QueryHistory = null,
+    track_once: bool = false,
+    pending_track_key: ?[]u8 = null,
     query: std.ArrayList(u8) = .empty,
     cursor: usize = 0,
     results: []usize,
@@ -626,6 +634,7 @@ const Ui = struct {
 
     fn deinit(self: *Ui) void {
         if (self.history) |*history| history.deinit();
+        if (self.pending_track_key) |key| self.allocator.free(key);
         self.query.deinit(self.allocator);
         self.allocator.free(self.results);
         self.allocator.free(self.extended_ranks);
@@ -690,21 +699,31 @@ const Ui = struct {
 
     fn refreshSearch(self: *Ui, force_all_for_auto: bool) !void {
         const n = self.candidates.display.len;
+        var track_key = self.pending_track_key;
+        self.pending_track_key = null;
+        if (track_key == null and self.trackingActive()) track_key = try self.captureCurrentTrackKey();
+        defer if (track_key) |key| self.allocator.free(key);
+
         const size = self.terminal.size();
         const base_cap = @min(n, @max(@as(usize, 256), size.rows * 8));
         if (self.result_cap == 0) self.result_cap = base_cap;
         if (force_all_for_auto and (self.options.select_1 or self.options.exit_0)) self.result_cap = n;
-        if (self.options.no_sort) self.result_cap = n;
+        if (self.options.no_sort or track_key != null) self.result_cap = n;
 
         const effective_query: []const u8 = if (self.options.disabled) "" else self.query.items;
         const old_focus_idx: ?usize = if (self.result_len == 0) null else self.results[self.focus];
         const found = try searchCandidates(self.index, self.candidates, self.options, effective_query, self.results, self.extended_ranks, self.result_cap);
         self.result_len = found.len;
         if (self.options.no_sort) std.mem.sort(usize, self.results[0..self.result_len], {}, comptime std.sort.asc(usize));
+        const tracked_pos = if (track_key) |key| try self.findTrackedResult(key) else null;
         if (self.result_len == 0) {
             self.focus = 0;
             self.scroll = 0;
+        } else if (tracked_pos) |pos| {
+            self.focus = pos;
+            self.ensureVisible();
         } else {
+            if (track_key != null and self.track_once and !self.options.track) self.track_once = false;
             if (self.focus >= self.result_len) self.focus = self.result_len - 1;
             self.ensureVisible();
         }
@@ -897,6 +916,49 @@ const Ui = struct {
         self.markQueryChanged();
     }
 
+    fn trackingActive(self: *const Ui) bool {
+        return self.options.track or self.track_once;
+    }
+
+    fn clearPendingTrackKey(self: *Ui) void {
+        if (self.pending_track_key) |key| self.allocator.free(key);
+        self.pending_track_key = null;
+    }
+
+    fn cancelOneShotTracking(self: *Ui) void {
+        if (self.options.track) return;
+        self.track_once = false;
+        self.clearPendingTrackKey();
+    }
+
+    fn candidateIdentity(self: *Ui, candidates: *const CandidateSet, idx: usize) ![]u8 {
+        const line = candidates.output[idx];
+        const spec = self.options.id_nth orelse return self.allocator.dupe(u8, line);
+        const trimmed = std.mem.trim(u8, spec, " \t");
+        if (std.mem.eql(u8, trimmed, "..")) return self.allocator.dupe(u8, line);
+        return transformFields(self.allocator, line, self.options.delimiter, spec, idx);
+    }
+
+    fn captureCurrentTrackKey(self: *Ui) !?[]u8 {
+        if (self.result_len == 0) return null;
+        return try self.candidateIdentity(self.candidates, self.results[self.focus]);
+    }
+
+    fn findTrackedResult(self: *Ui, key: []const u8) !?usize {
+        const spec = self.options.id_nth;
+        const direct = spec == null or std.mem.eql(u8, std.mem.trim(u8, spec.?, " \t"), "..");
+        for (self.results[0..self.result_len], 0..) |idx, pos| {
+            if (direct) {
+                if (std.mem.eql(u8, self.candidates.output[idx], key)) return pos;
+                continue;
+            }
+            const candidate_key = try self.candidateIdentity(self.candidates, idx);
+            defer self.allocator.free(candidate_key);
+            if (std.mem.eql(u8, candidate_key, key)) return pos;
+        }
+        return null;
+    }
+
     fn fireEvent(self: *Ui, event: []const u8) !?u8 {
         for (self.options.bindings.items) |binding| {
             if (!std.mem.eql(u8, binding.trigger, event)) continue;
@@ -912,14 +974,20 @@ const Ui = struct {
             .page_up => self.page(-1),
             .page_down => self.page(1),
             .first => if (self.result_len != 0) {
-                if (self.focus != 0) self.focus_event_pending = true;
+                if (self.focus != 0) {
+                    self.focus_event_pending = true;
+                    self.cancelOneShotTracking();
+                }
                 self.focus = 0;
                 self.ensureVisible();
                 self.preview_cache_key = null;
             },
             .last => if (self.result_len != 0) {
                 const target = self.result_len - 1;
-                if (self.focus != target) self.focus_event_pending = true;
+                if (self.focus != target) {
+                    self.focus_event_pending = true;
+                    self.cancelOneShotTracking();
+                }
                 self.focus = target;
                 self.ensureVisible();
                 self.preview_cache_key = null;
@@ -981,6 +1049,23 @@ const Ui = struct {
                 self.options.disabled = !self.options.disabled;
                 self.dirty_search = true;
             },
+            .toggle_track => {
+                self.options.track = !self.options.track;
+                self.track_once = false;
+                self.clearPendingTrackKey();
+            },
+            .track_current => if (!self.options.track) {
+                self.track_once = true;
+                self.clearPendingTrackKey();
+            },
+            .untrack_current => if (!self.options.track) {
+                self.track_once = false;
+                self.clearPendingTrackKey();
+            },
+            .toggle_track_current => if (!self.options.track) {
+                self.track_once = !self.track_once;
+                self.clearPendingTrackKey();
+            },
             .prev_history => try self.navigateHistory(-1),
             .next_history => try self.navigateHistory(1),
             .change_query => |value| {
@@ -1025,6 +1110,11 @@ const Ui = struct {
     }
 
     fn replaceCandidates(self: *Ui, new_candidates: CandidateSet, new_index: fuzzy.Index, mark_load: bool) !void {
+        var track_key = self.pending_track_key;
+        self.pending_track_key = null;
+        if (track_key == null and self.trackingActive()) track_key = try self.captureCurrentTrackKey();
+        errdefer if (track_key) |key| self.allocator.free(key);
+
         const new_results = try self.allocator.alloc(usize, new_candidates.display.len);
         errdefer self.allocator.free(new_results);
         const new_extended_ranks = try self.allocator.alloc(ExtendedRank, new_candidates.display.len);
@@ -1037,10 +1127,26 @@ const Ui = struct {
         errdefer new_order.deinit(self.allocator);
         for (self.selection_order.items) |old_idx| {
             if (old_idx >= self.candidates.output.len or !self.selected[old_idx]) continue;
-            const old_value = self.candidates.output[old_idx];
-            for (new_candidates.output, 0..) |new_value, new_idx| {
+            if (self.options.id_nth == null) {
+                const old_value = self.candidates.output[old_idx];
+                for (new_candidates.output, 0..) |new_value, new_idx| {
+                    if (new_selected[new_idx]) continue;
+                    if (std.mem.eql(u8, old_value, new_value)) {
+                        new_selected[new_idx] = true;
+                        try new_order.append(self.allocator, new_idx);
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            const old_key = try self.candidateIdentity(self.candidates, old_idx);
+            defer self.allocator.free(old_key);
+            for (new_candidates.output, 0..) |_, new_idx| {
                 if (new_selected[new_idx]) continue;
-                if (std.mem.eql(u8, old_value, new_value)) {
+                const new_key = try self.candidateIdentity(&new_candidates, new_idx);
+                defer self.allocator.free(new_key);
+                if (std.mem.eql(u8, old_key, new_key)) {
                     new_selected[new_idx] = true;
                     try new_order.append(self.allocator, new_idx);
                     break;
@@ -1064,6 +1170,8 @@ const Ui = struct {
         self.selected_count = self.selection_order.items.len;
         self.result_len = 0;
         self.result_cap = 0;
+        self.pending_track_key = track_key;
+        track_key = null;
         self.focus = 0;
         self.scroll = 0;
         self.dirty_search = true;
@@ -1164,7 +1272,10 @@ const Ui = struct {
         const rel = m.y - list_start;
         const item = if (self.options.layout == .reverse) self.scroll + rel else self.scroll + (rows - 1 - rel);
         if (item < self.result_len) {
-            if (self.focus != item) self.focus_event_pending = true;
+            if (self.focus != item) {
+                self.focus_event_pending = true;
+                self.cancelOneShotTracking();
+            }
             self.focus = item;
             self.ensureVisible();
             self.preview_cache_key = null;
@@ -1190,7 +1301,10 @@ const Ui = struct {
         }
         self.ensureVisible();
         self.preview_cache_key = null;
-        if (self.focus != old_focus) self.focus_event_pending = true;
+        if (self.focus != old_focus) {
+            self.focus_event_pending = true;
+            self.cancelOneShotTracking();
+        }
     }
 
     fn page(self: *Ui, delta: isize) void {
@@ -2022,6 +2136,24 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.history_size = value;
             continue;
         }
+        if (std.mem.eql(u8, a, "--track")) {
+            o.*.track = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-track")) {
+            o.*.track = false;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--id-nth=")) {
+            o.*.id_nth = a[9..];
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--id-nth")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.id_nth = args[i];
+            continue;
+        }
         if (std.mem.eql(u8, a, "-m") or std.mem.eql(u8, a, "--multi")) {
             o.*.multi = true;
             continue;
@@ -2541,6 +2673,10 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "enable-search")) return .enable_search;
     if (std.mem.eql(u8, s, "disable-search")) return .disable_search;
     if (std.mem.eql(u8, s, "toggle-search")) return .toggle_search;
+    if (std.mem.eql(u8, s, "toggle-track")) return .toggle_track;
+    if (std.mem.eql(u8, s, "track") or std.mem.eql(u8, s, "track-current")) return .track_current;
+    if (std.mem.eql(u8, s, "untrack-current")) return .untrack_current;
+    if (std.mem.eql(u8, s, "toggle-track-current")) return .toggle_track_current;
     if (std.mem.eql(u8, s, "prev-history") or std.mem.eql(u8, s, "previous-history")) return .prev_history;
     if (std.mem.eql(u8, s, "next-history")) return .next_history;
     if (commandAction(s, "change-query")) |value| return .{ .change_query = value };
