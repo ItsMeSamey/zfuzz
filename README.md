@@ -73,7 +73,10 @@ execute, reload, and transform actions. This includes current (`{}`), selected
 (`{+}`), matched (`{*}`), field/range (`{1}`, `{2..}`, `{+1}`), ordinal
 (`{n}`), query (`{q}`, `{q:2..}`), raw (`r`), whitespace-preserving (`s`), and
 temporary-file (`f`) forms. Prefix a valid placeholder with a backslash (for
-example `\{}`) to keep it literal.
+example `\{}`) to keep it literal. Dynamic `change-nth`/`transform-nth` and
+`change-with-nth`/`transform-with-nth` actions follow fzf's pipe-cycling,
+default-restoration, first-line transform, and `FZF_NTH`/`FZF_WITH_NTH`
+environment semantics; background transform variants are supported as well.
 
 ## Complexity
 

@@ -141,6 +141,8 @@ const Action = union(enum) {
     next_history,
     change_query: []const u8,
     search: []const u8,
+    change_nth: []const u8,
+    change_with_nth: []const u8,
     change_prompt: []const u8,
     change_ghost: []const u8,
     change_pointer: []const u8,
@@ -152,6 +154,8 @@ const Action = union(enum) {
     transform: []const u8,
     transform_query: []const u8,
     transform_search: []const u8,
+    transform_nth: []const u8,
+    transform_with_nth: []const u8,
     transform_prompt: []const u8,
     transform_ghost: []const u8,
     transform_pointer: []const u8,
@@ -163,6 +167,8 @@ const Action = union(enum) {
     bg_transform: []const u8,
     bg_transform_query: []const u8,
     bg_transform_search: []const u8,
+    bg_transform_nth: []const u8,
+    bg_transform_with_nth: []const u8,
     bg_transform_prompt: []const u8,
     bg_transform_ghost: []const u8,
     bg_transform_pointer: []const u8,
@@ -187,6 +193,7 @@ const Binding = struct {
     name: []const u8,
     action: Action,
     enabled: bool = true,
+    owned_payload: ?[]u8 = null,
 };
 
 const WalkerOptions = struct {
@@ -264,6 +271,7 @@ const Options = struct {
 
     fn deinit(self: *Options, allocator: Allocator) void {
         self.expect.deinit(allocator);
+        for (self.bindings.items) |binding| if (binding.owned_payload) |value| allocator.free(value);
         self.bindings.deinit(allocator);
         self.walker_roots.deinit(allocator);
     }
@@ -670,12 +678,13 @@ const QueryHistory = struct {
     }
 };
 
-const BackgroundKind = enum { actions, query, search, prompt, ghost, pointer, border_label, preview_label, header, footer, preview, reload };
+const BackgroundKind = enum { actions, query, search, nth, with_nth, prompt, ghost, pointer, border_label, preview_label, header, footer, preview, reload };
 
 const BackgroundResult = struct {
     kind: BackgroundKind,
     output: []u8,
     generation: u64,
+    binding_slot: ?usize = null,
 };
 
 const BackgroundQueue = struct {
@@ -700,11 +709,11 @@ const BackgroundQueue = struct {
         return true;
     }
 
-    fn finish(self: *BackgroundQueue, kind: BackgroundKind, output: ?[]u8, generation: u64) void {
+    fn finish(self: *BackgroundQueue, kind: BackgroundKind, output: ?[]u8, generation: u64, binding_slot: ?usize) void {
         self.mutex.lockUncancelable(self.io);
         if (self.alive) {
             if (output) |value| {
-                self.results.append(self.allocator, .{ .kind = kind, .output = value, .generation = generation }) catch self.allocator.free(value);
+                self.results.append(self.allocator, .{ .kind = kind, .output = value, .generation = generation, .binding_slot = binding_slot }) catch self.allocator.free(value);
             }
         } else if (output) |value| {
             self.allocator.free(value);
@@ -762,6 +771,7 @@ const BackgroundContext = struct {
     io: Io,
     kind: BackgroundKind,
     generation: u64,
+    binding_slot: ?usize,
     expanded: ExpandedCommand,
     env: std.process.Environ.Map,
 };
@@ -796,25 +806,25 @@ fn backgroundTransformThread(ctx: *BackgroundContext) void {
         .stdout_limit = .limited(max_stdout),
         .stderr_limit = .limited(1024 * 1024),
     }) catch {
-        ctx.queue.finish(ctx.kind, null, ctx.generation);
+        ctx.queue.finish(ctx.kind, null, ctx.generation, ctx.binding_slot);
         return;
     };
     allocator.free(result.stderr);
     if (ctx.kind == .reload) {
-        ctx.queue.finish(ctx.kind, result.stdout, ctx.generation);
+        ctx.queue.finish(ctx.kind, result.stdout, ctx.generation, ctx.binding_slot);
         return;
     }
     defer allocator.free(result.stdout);
     const trimmed = std.mem.trimEnd(u8, result.stdout, "\r\n");
     const text = switch (ctx.kind) {
-        .query, .search, .prompt, .ghost, .pointer, .border_label, .preview_label => firstCommandOutputLine(trimmed),
+        .query, .search, .nth, .with_nth, .prompt, .ghost, .pointer, .border_label, .preview_label => firstCommandOutputLine(trimmed),
         else => trimmed,
     };
     const output = allocator.dupe(u8, text) catch {
-        ctx.queue.finish(ctx.kind, null, ctx.generation);
+        ctx.queue.finish(ctx.kind, null, ctx.generation, ctx.binding_slot);
         return;
     };
-    ctx.queue.finish(ctx.kind, output, ctx.generation);
+    ctx.queue.finish(ctx.kind, output, ctx.generation, ctx.binding_slot);
 }
 
 const Ui = struct {
@@ -861,6 +871,11 @@ const Ui = struct {
     focus_event_pending: bool = false,
     owned_prompt: ?[]u8 = null,
     owned_search_override: ?[]u8 = null,
+    owned_nth: ?[]u8 = null,
+    owned_with_nth: ?[]u8 = null,
+    nth_default: ?[]const u8 = null,
+    with_nth_default: ?[]const u8 = null,
+    with_nth_enabled: bool = false,
     owned_ghost: ?[]u8 = null,
     owned_pointer: ?[]u8 = null,
     owned_border_label: ?[]u8 = null,
@@ -922,6 +937,9 @@ const Ui = struct {
             .child_env = child_env,
             .bg_queue = bg_queue,
             .history = history,
+            .nth_default = options.nth,
+            .with_nth_default = options.with_nth,
+            .with_nth_enabled = options.with_nth != null,
             .query = query,
             .cursor = options.query.len,
             .results = results,
@@ -948,6 +966,8 @@ const Ui = struct {
         if (self.preview_text.len != 0) self.allocator.free(self.preview_text);
         if (self.owned_prompt) |value| self.allocator.free(value);
         if (self.owned_search_override) |value| self.allocator.free(value);
+        if (self.owned_nth) |value| self.allocator.free(value);
+        if (self.owned_with_nth) |value| self.allocator.free(value);
         if (self.owned_ghost) |value| self.allocator.free(value);
         if (self.owned_pointer) |value| self.allocator.free(value);
         if (self.owned_border_label) |value| self.allocator.free(value);
@@ -1208,7 +1228,7 @@ const Ui = struct {
             else => {},
         }
         var binding_handled = false;
-        for (self.options.bindings.items) |binding| {
+        for (self.options.bindings.items, 0..) |binding, binding_slot| {
             if (!binding.enabled) continue;
             if (std.mem.eql(u8, binding.trigger, "start") or std.mem.eql(u8, binding.trigger, "load") or
                 std.mem.eql(u8, binding.trigger, "change") or std.mem.eql(u8, binding.trigger, "result") or
@@ -1218,7 +1238,7 @@ const Ui = struct {
             binding_handled = true;
             self.last_action = binding.name;
             self.last_key = binding.trigger;
-            if (try self.runAction(binding.action)) |code| return code;
+            if (try self.runAction(binding.action, binding_slot)) |code| return code;
         }
         if (binding_handled) return null;
         for (self.options.expect.items) |expected| {
@@ -1439,7 +1459,7 @@ const Ui = struct {
                     for (actions.items) |binding| {
                         self.last_action = binding.name;
                         self.last_key = "";
-                        if (try self.runAction(binding.action)) |code| return code;
+                        if (try self.runAction(binding.action, null)) |code| return code;
                     }
                 },
                 .get => |waiter| {
@@ -1465,7 +1485,7 @@ const Ui = struct {
                     try appendBindingActions(self.allocator, &actions, "bg-transform", result.output);
                     for (actions.items) |binding| {
                         self.last_action = binding.name;
-                        if (try self.runAction(binding.action)) |code| return code;
+                        if (try self.runAction(binding.action, null)) |code| return code;
                     }
                 },
                 .query => {
@@ -1478,6 +1498,8 @@ const Ui = struct {
                     self.setSearchOverrideOwned(result.output);
                     owned = null;
                 },
+                .nth => try self.applyNthAction(result.output, result.binding_slot),
+                .with_nth => try self.applyWithNthAction(result.output, result.binding_slot),
                 .prompt => {
                     self.replaceOwnedText(&self.owned_prompt, &self.options.prompt, result.output);
                     owned = null;
@@ -1587,12 +1609,12 @@ const Ui = struct {
     }
 
     fn fireEvent(self: *Ui, event: []const u8) !?u8 {
-        for (self.options.bindings.items) |binding| {
+        for (self.options.bindings.items, 0..) |binding, binding_slot| {
             if (!binding.enabled) continue;
             if (!std.mem.eql(u8, binding.trigger, event)) continue;
             self.last_action = binding.name;
             self.last_key = "";
-            if (try self.runAction(binding.action)) |code| return code;
+            if (try self.runAction(binding.action, binding_slot)) |code| return code;
         }
         return null;
     }
@@ -1606,12 +1628,12 @@ const Ui = struct {
             self.timer_last_ms[i] = now_ms;
             self.last_action = binding.name;
             self.last_key = "";
-            if (try self.runAction(binding.action)) |code| return code;
+            if (try self.runAction(binding.action, i)) |code| return code;
         }
         return null;
     }
 
-    fn runAction(self: *Ui, action: Action) anyerror!?u8 {
+    fn runAction(self: *Ui, action: Action, binding_slot: ?usize) anyerror!?u8 {
         switch (action) {
             .up => self.move(-1),
             .down => self.move(1),
@@ -1769,6 +1791,8 @@ const Ui = struct {
                 self.markQueryChanged();
             },
             .search => |value| try self.setSearchOverride(value),
+            .change_nth => |value| try self.applyNthAction(self.bindingPayload(binding_slot, value), binding_slot),
+            .change_with_nth => |value| if (self.with_nth_enabled) try self.applyWithNthAction(self.bindingPayload(binding_slot, value), binding_slot),
             .change_prompt => |value| self.options.prompt = value,
             .change_ghost => |value| self.options.ghost = value,
             .change_pointer => |value| self.options.pointer = value,
@@ -1792,6 +1816,16 @@ const Ui = struct {
                 self.markQueryChanged();
             },
             .transform_search => |cmd| self.setSearchOverrideOwned(try self.runTransformCommandFirstLine(cmd)),
+            .transform_nth => |cmd| {
+                const value = try self.runTransformCommandFirstLine(self.bindingPayload(binding_slot, cmd));
+                defer self.allocator.free(value);
+                try self.applyNthAction(value, binding_slot);
+            },
+            .transform_with_nth => |cmd| if (self.with_nth_enabled) {
+                const value = try self.runTransformCommandFirstLine(self.bindingPayload(binding_slot, cmd));
+                defer self.allocator.free(value);
+                try self.applyWithNthAction(value, binding_slot);
+            },
             .transform_prompt => |cmd| {
                 const value = try self.runTransformCommandFirstLine(cmd);
                 self.replaceOwnedText(&self.owned_prompt, &self.options.prompt, value);
@@ -1830,6 +1864,8 @@ const Ui = struct {
             .bg_transform => |cmd| try self.launchBackgroundTransform(.actions, cmd),
             .bg_transform_query => |cmd| try self.launchBackgroundTransform(.query, cmd),
             .bg_transform_search => |cmd| try self.launchBackgroundTransform(.search, cmd),
+            .bg_transform_nth => |cmd| try self.launchBackgroundCommand(.nth, self.bindingPayload(binding_slot, cmd), 0, binding_slot),
+            .bg_transform_with_nth => |cmd| if (self.with_nth_enabled) try self.launchBackgroundCommand(.with_nth, self.bindingPayload(binding_slot, cmd), 0, binding_slot),
             .bg_transform_prompt => |cmd| try self.launchBackgroundTransform(.prompt, cmd),
             .bg_transform_ghost => |cmd| try self.launchBackgroundTransform(.ghost, cmd),
             .bg_transform_pointer => |cmd| try self.launchBackgroundTransform(.pointer, cmd),
@@ -1849,6 +1885,114 @@ const Ui = struct {
             .toggle_bind => |targets| self.setBindingsEnabled(targets, .toggle),
         }
         return null;
+    }
+
+    fn bindingPayload(self: *Ui, binding_slot: ?usize, fallback: []const u8) []const u8 {
+        const slot = binding_slot orelse return fallback;
+        if (slot >= self.options.bindings.items.len) return fallback;
+        return self.options.bindings.items[slot].owned_payload orelse fallback;
+    }
+
+    fn rotateBindingPayload(self: *Ui, binding_slot: ?usize, payload: []const u8) !void {
+        const slot = binding_slot orelse return;
+        if (slot >= self.options.bindings.items.len) return;
+        const bar = std.mem.indexOfScalar(u8, payload, '|') orelse return;
+        var rotated: std.ArrayList(u8) = .empty;
+        errdefer rotated.deinit(self.allocator);
+        try rotated.appendSlice(self.allocator, payload[bar + 1 ..]);
+        try rotated.append(self.allocator, '|');
+        try rotated.appendSlice(self.allocator, payload[0..bar]);
+        const value = try rotated.toOwnedSlice(self.allocator);
+        const binding = &self.options.bindings.items[slot];
+        if (binding.owned_payload) |old| self.allocator.free(old);
+        binding.owned_payload = value;
+    }
+
+    fn optionalTextEql(a: ?[]const u8, b: ?[]const u8) bool {
+        if (a == null or b == null) return a == null and b == null;
+        return std.mem.eql(u8, a.?, b.?);
+    }
+
+    fn nthSpecValid(spec: []const u8) bool {
+        const trimmed = std.mem.trim(u8, spec, " \t");
+        return trimmed.len != 0 and placeholderRangesValid(trimmed);
+    }
+
+    fn withNthSpecValid(spec: []const u8) bool {
+        if (spec.len == 0) return true;
+        if (std.mem.indexOfScalar(u8, spec, '{') == null) return nthSpecValid(spec);
+        var i: usize = 0;
+        while (i < spec.len) {
+            if (spec[i] != '{') {
+                i += 1;
+                continue;
+            }
+            const close = std.mem.indexOfScalarPos(u8, spec, i + 1, '}') orelse return false;
+            const expr = spec[i + 1 .. close];
+            if (!std.mem.eql(u8, expr, "n") and !placeholderRangesValid(expr)) return false;
+            i = close + 1;
+        }
+        return true;
+    }
+
+    fn setNthSpec(self: *Ui, spec: ?[]const u8) !void {
+        if (optionalTextEql(self.options.nth, spec)) return;
+        var replacement: ?[]u8 = null;
+        if (spec) |value| replacement = try self.allocator.dupe(u8, value);
+        if (self.owned_nth) |old| self.allocator.free(old);
+        self.owned_nth = replacement;
+        self.options.nth = if (replacement) |value| value else null;
+        try self.rebuildFieldTransforms();
+    }
+
+    fn setWithNthSpec(self: *Ui, spec: ?[]const u8) !void {
+        if (optionalTextEql(self.options.with_nth, spec)) return;
+        var replacement: ?[]u8 = null;
+        if (spec) |value| replacement = try self.allocator.dupe(u8, value);
+        if (self.owned_with_nth) |old| self.allocator.free(old);
+        self.owned_with_nth = replacement;
+        self.options.with_nth = if (replacement) |value| value else null;
+        try self.rebuildFieldTransforms();
+    }
+
+    fn applyNthAction(self: *Ui, payload: []const u8, binding_slot: ?usize) !void {
+        var tokens = std.mem.splitScalar(u8, payload, '|');
+        const expr = tokens.next() orelse "";
+        if (payload.len == 0) {
+            try self.setNthSpec(null);
+        } else if (nthSpecValid(expr)) {
+            try self.setNthSpec(std.mem.trim(u8, expr, " \t"));
+        } else {
+            try self.setNthSpec(self.nth_default);
+        }
+        try self.rotateBindingPayload(binding_slot, payload);
+    }
+
+    fn applyWithNthAction(self: *Ui, payload: []const u8, binding_slot: ?usize) !void {
+        if (!self.with_nth_enabled) return;
+        var tokens = std.mem.splitScalar(u8, payload, '|');
+        const expr = tokens.next() orelse "";
+        var owned_expr: ?[]u8 = null;
+        defer if (owned_expr) |value| self.allocator.free(value);
+        const target: ?[]const u8 = if (expr.len == 0)
+            self.with_nth_default
+        else if (withNthSpecValid(expr)) blk: {
+            owned_expr = try self.allocator.dupe(u8, expr);
+            break :blk owned_expr.?;
+        } else null;
+        try self.rotateBindingPayload(binding_slot, payload);
+        if (expr.len != 0 and target == null) return;
+        try self.setWithNthSpec(target);
+    }
+
+    fn rebuildFieldTransforms(self: *Ui) !void {
+        const blob = try self.allocator.dupe(u8, self.candidates.blob);
+        errdefer self.allocator.free(blob);
+        var new_candidates = try candidatesFromOwnedBlob(self.allocator, blob, self.options);
+        errdefer new_candidates.deinit(self.allocator);
+        var new_index = try fuzzy.init(self.allocator, new_candidates.search);
+        errdefer new_index.deinit();
+        try self.replaceCandidates(new_candidates, new_index, false);
     }
 
     const BindingStateChange = enum { disable, enable, toggle };
@@ -1890,6 +2034,16 @@ const Ui = struct {
         if (item.len <= 64 * 1024 and std.mem.indexOfScalar(u8, item, 0) == null) try env.put("FZF_CURRENT_ITEM", item);
         if (self.options.border_label) |value| try env.put("FZF_BORDER_LABEL", value);
         if (self.options.preview.label) |value| try env.put("FZF_PREVIEW_LABEL", value);
+        if (self.options.nth) |value| if (value.len != 0) {
+            if (nthSpecValid(value)) {
+                const canonical = try canonicalNthSpec(self.allocator, value);
+                defer self.allocator.free(canonical);
+                try env.put("FZF_NTH", canonical);
+            } else {
+                try env.put("FZF_NTH", value);
+            }
+        };
+        if (self.options.with_nth) |value| if (value.len != 0) try env.put("FZF_WITH_NTH", value);
         const idle_ms = monotonicMilliseconds(self.io) -| self.last_activity_ms;
         var idle_ms_buf: [32]u8 = undefined;
         var idle_s_buf: [32]u8 = undefined;
@@ -1898,7 +2052,7 @@ const Ui = struct {
         return env;
     }
 
-    fn launchBackgroundCommand(self: *Ui, kind: BackgroundKind, command: []const u8, generation: u64) !void {
+    fn launchBackgroundCommand(self: *Ui, kind: BackgroundKind, command: []const u8, generation: u64, binding_slot: ?usize) !void {
         var expanded = try self.expandedCommand(command);
         errdefer expanded.deinit();
         var env = try self.commandEnvironment();
@@ -1909,7 +2063,7 @@ const Ui = struct {
             return;
         }
         const ctx = self.allocator.create(BackgroundContext) catch |err| {
-            self.bg_queue.finish(kind, null, generation);
+            self.bg_queue.finish(kind, null, generation, binding_slot);
             return err;
         };
         errdefer self.allocator.destroy(ctx);
@@ -1919,24 +2073,25 @@ const Ui = struct {
             .io = self.io,
             .kind = kind,
             .generation = generation,
+            .binding_slot = binding_slot,
             .expanded = expanded,
             .env = env,
         };
         const thread = std.Thread.spawn(.{}, backgroundTransformThread, .{ctx}) catch |err| {
-            self.bg_queue.finish(kind, null, generation);
+            self.bg_queue.finish(kind, null, generation, binding_slot);
             return err;
         };
         thread.detach();
     }
 
     fn launchBackgroundTransform(self: *Ui, kind: BackgroundKind, command: []const u8) !void {
-        try self.launchBackgroundCommand(kind, command, 0);
+        try self.launchBackgroundCommand(kind, command, 0, null);
     }
 
     fn launchAsyncReload(self: *Ui, command: []const u8) !void {
         self.stream = null;
         self.reload_generation +%= 1;
-        try self.launchBackgroundCommand(.reload, command, self.reload_generation);
+        try self.launchBackgroundCommand(.reload, command, self.reload_generation, null);
     }
 
     fn runTransformCommand(self: *Ui, command: []const u8) ![]u8 {
@@ -1971,7 +2126,7 @@ const Ui = struct {
         try appendBindingActions(self.allocator, &actions, "transform", text);
         for (actions.items) |binding| {
             self.last_action = binding.name;
-            if (try self.runAction(binding.action)) |code| return code;
+            if (try self.runAction(binding.action, null)) |code| return code;
         }
         return null;
     }
@@ -4067,6 +4222,8 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "next-history")) return .next_history;
     if (commandAction(s, "change-query")) |value| return .{ .change_query = value };
     if (commandAction(s, "search")) |value| return .{ .search = value };
+    if (commandAction(s, "change-nth")) |value| return .{ .change_nth = value };
+    if (commandAction(s, "change-with-nth")) |value| return .{ .change_with_nth = value };
     if (commandAction(s, "change-prompt")) |value| return .{ .change_prompt = value };
     if (commandAction(s, "change-ghost")) |value| return .{ .change_ghost = value };
     if (commandAction(s, "change-pointer")) |value| return .{ .change_pointer = value };
@@ -4077,6 +4234,8 @@ fn parseAction(s: []const u8) !Action {
     if (commandAction(s, "change-preview")) |value| return .{ .change_preview = value };
     if (commandAction(s, "transform-query")) |cmd| return .{ .transform_query = cmd };
     if (commandAction(s, "transform-search")) |cmd| return .{ .transform_search = cmd };
+    if (commandAction(s, "transform-nth")) |cmd| return .{ .transform_nth = cmd };
+    if (commandAction(s, "transform-with-nth")) |cmd| return .{ .transform_with_nth = cmd };
     if (commandAction(s, "transform-prompt")) |cmd| return .{ .transform_prompt = cmd };
     if (commandAction(s, "transform-ghost")) |cmd| return .{ .transform_ghost = cmd };
     if (commandAction(s, "transform-pointer")) |cmd| return .{ .transform_pointer = cmd };
@@ -4087,6 +4246,8 @@ fn parseAction(s: []const u8) !Action {
     if (commandAction(s, "transform-preview")) |cmd| return .{ .transform_preview = cmd };
     if (commandAction(s, "bg-transform-query")) |cmd| return .{ .bg_transform_query = cmd };
     if (commandAction(s, "bg-transform-search")) |cmd| return .{ .bg_transform_search = cmd };
+    if (commandAction(s, "bg-transform-nth")) |cmd| return .{ .bg_transform_nth = cmd };
+    if (commandAction(s, "bg-transform-with-nth")) |cmd| return .{ .bg_transform_with_nth = cmd };
     if (commandAction(s, "bg-transform-prompt")) |cmd| return .{ .bg_transform_prompt = cmd };
     if (commandAction(s, "bg-transform-ghost")) |cmd| return .{ .bg_transform_ghost = cmd };
     if (commandAction(s, "bg-transform-pointer")) |cmd| return .{ .bg_transform_pointer = cmd };
@@ -4977,6 +5138,39 @@ fn filterMode(allocator: Allocator, io: Io, index: *fuzzy.Index, candidates: *co
     }
     try writer.flush();
     if (options.exit_0 and found.len == 0) std.process.exit(1);
+}
+
+fn canonicalNthSpec(allocator: Allocator, spec: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var terms = std.mem.splitScalar(u8, spec, ',');
+    var first = true;
+    while (terms.next()) |term| {
+        const range = parsePlaceholderRange(term) orelse return error.InvalidNth;
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        if (range.begin == 0 and range.end == 0) {
+            try out.appendSlice(allocator, "..");
+            continue;
+        }
+        if (range.begin == range.end) {
+            var buf: [32]u8 = undefined;
+            try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{range.begin}));
+            continue;
+        }
+        if (range.begin != 0) {
+            var buf: [32]u8 = undefined;
+            try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{range.begin}));
+        }
+        if (range.begin != -1) {
+            try out.appendSlice(allocator, "..");
+            if (range.end != 0) {
+                var buf: [32]u8 = undefined;
+                try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{range.end}));
+            }
+        }
+    }
+    return try out.toOwnedSlice(allocator);
 }
 
 fn transformFields(allocator: Allocator, line: []const u8, delimiter: ?[]const u8, spec: []const u8, ordinal: usize) ![]u8 {
@@ -6334,6 +6528,34 @@ test "search override actions parse" {
     try std.testing.expectEqualStrings("printf beta", transformed.transform_search);
     const background = try parseAction("bg-transform-search(printf gamma)");
     try std.testing.expectEqualStrings("printf gamma", background.bg_transform_search);
+}
+
+test "dynamic nth actions parse and validate fzf expressions" {
+    const change_nth = try parseAction("change-nth(2|3..|-1)");
+    try std.testing.expectEqualStrings("2|3..|-1", change_nth.change_nth);
+    const change_with = try parseAction("change-with-nth({2}:{1}|)");
+    try std.testing.expectEqualStrings("{2}:{1}|", change_with.change_with_nth);
+    const transform_nth = try parseAction("transform-nth:printf 2");
+    try std.testing.expectEqualStrings("printf 2", transform_nth.transform_nth);
+    const transform_with = try parseAction("transform-with-nth(printf '{2}:{1}')");
+    try std.testing.expectEqualStrings("printf '{2}:{1}'", transform_with.transform_with_nth);
+    const bg_nth = try parseAction("bg-transform-nth(printf 3)");
+    try std.testing.expectEqualStrings("printf 3", bg_nth.bg_transform_nth);
+    const bg_with = try parseAction("bg-transform-with-nth(printf 1)");
+    try std.testing.expectEqualStrings("printf 1", bg_with.bg_transform_with_nth);
+
+    try std.testing.expect(Ui.nthSpecValid("1,2..4,-1"));
+    try std.testing.expect(Ui.nthSpecValid("..2"));
+    try std.testing.expect(!Ui.nthSpecValid("0"));
+    try std.testing.expect(!Ui.nthSpecValid("-2..3"));
+    try std.testing.expect(Ui.withNthSpecValid("{2}:{1}"));
+    try std.testing.expect(Ui.withNthSpecValid("2.."));
+    try std.testing.expect(!Ui.withNthSpecValid("{0}"));
+    try std.testing.expect(!Ui.withNthSpecValid("{2"));
+
+    const canonical = try canonicalNthSpec(std.testing.allocator, "1..,-1,-3..-1,..2");
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expectEqualStrings("..,-1,-3..,..2", canonical);
 }
 
 test "dynamic visual actions parse" {
