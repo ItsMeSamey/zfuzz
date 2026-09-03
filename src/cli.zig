@@ -4484,7 +4484,7 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
         }
         if (std.mem.eql(u8, a, "--border")) {
             o.*.border = true;
-            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-") and !std.mem.startsWith(u8, args[i + 1], "+")) {
                 i += 1;
                 o.*.border_style = try parseBorderStyle(args[i]);
                 o.*.border = o.*.border_style != .none;
@@ -4679,7 +4679,7 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             continue;
         }
         if (std.mem.eql(u8, a, "--preview-border")) {
-            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-") and !std.mem.startsWith(u8, args[i + 1], "+")) {
                 i += 1;
                 o.*.preview.border_style = try parseBorderStyle(args[i]);
             } else {
@@ -7911,6 +7911,18 @@ test "border and preview layout accept separated values" {
     try std.testing.expectEqual(PreviewPosition.left, options.preview.position);
     try std.testing.expectEqual(@as(u8, 40), options.preview.percent);
     try std.testing.expect(options.preview.hidden);
+}
+
+test "optional borders do not consume plus options" {
+    const a = std.testing.allocator;
+    const args = [_][]const u8{ "zfuzz", "--no-border", "--border", "+s", "-1", "--no-preview-border", "--preview-border", "+1" };
+    var options = try parseOptions(a, &args);
+    defer options.deinit(a);
+    try std.testing.expect(options.border);
+    try std.testing.expectEqual(BorderStyle.rounded, options.border_style);
+    try std.testing.expectEqual(BorderStyle.rounded, options.preview.border_style);
+    try std.testing.expect(options.no_sort);
+    try std.testing.expect(!options.select_1);
 }
 
 test "prompt pointer and marker accept separate arguments" {
