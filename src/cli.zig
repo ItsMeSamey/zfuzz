@@ -126,6 +126,7 @@ const Action = union(enum) {
     clear_query,
     clear_screen,
     close,
+    bell,
     accept,
     abort,
     toggle_preview,
@@ -1773,6 +1774,7 @@ const Ui = struct {
                 self.markQueryChanged();
             },
             .clear_screen => {}, // Every action frame is already a full redraw.
+            .bell => try self.terminal.write("\x07"),
             .close => {
                 if (self.paneGeometry(self.terminal.size()).preview != null) {
                     self.options.preview.hidden = true;
@@ -4453,6 +4455,7 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "clear-query")) return .clear_query;
     if (std.mem.eql(u8, s, "clear-screen")) return .clear_screen;
     if (std.mem.eql(u8, s, "close")) return .close;
+    if (std.mem.eql(u8, s, "bell")) return .bell;
     if (std.mem.eql(u8, s, "accept")) return .accept;
     if (std.mem.eql(u8, s, "abort")) return .abort;
     if (std.mem.eql(u8, s, "toggle-preview")) return .toggle_preview;
@@ -6864,6 +6867,7 @@ test "stateful binding actions parse" {
     try std.testing.expect((try parseAction("half-page-down")) == .half_page_down);
     try std.testing.expect((try parseAction("clear-screen")) == .clear_screen);
     try std.testing.expect((try parseAction("close")) == .close);
+    try std.testing.expect((try parseAction("bell")) == .bell);
     try std.testing.expect((try parseAction("beginning-of-line")) == .beginning_of_line);
     try std.testing.expect((try parseAction("end-of-line")) == .end_of_line);
     try std.testing.expect((try parseAction("backward-char")) == .backward_char);

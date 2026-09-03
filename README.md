@@ -90,7 +90,7 @@ Kill/yank editing follows the same query buffer: `kill-line`, `kill-word`,
 removed text; Ctrl-U/Ctrl-W/Ctrl-Y use those same paths. `put(...)`, `replace-query`,
 `print-query`, `accept-non-empty`, and `accept-or-print-query` are also
 available with fzf-compatible query/output behavior. List bindings also include
-`top`, `half-page-up`, `half-page-down`, `clear-screen`, and `close`; `close`
+`top`, `half-page-up`, `half-page-down`, `clear-screen`, `close`, and `bell`; `close`
 hides a visible preview before falling back to an interrupt exit.
 
 ## Complexity
