@@ -87,6 +87,9 @@ const Action = union(enum) {
     page_down,
     half_page_up,
     half_page_down,
+    offset_up,
+    offset_down,
+    offset_middle,
     beginning_of_line,
     end_of_line,
     backward_char,
@@ -1775,6 +1778,9 @@ const Ui = struct {
             .page_down => self.page(1),
             .half_page_up => self.halfPage(-1),
             .half_page_down => self.halfPage(1),
+            .offset_up => self.offsetViewport(.up),
+            .offset_down => self.offsetViewport(.down),
+            .offset_middle => self.offsetViewportMiddle(),
             .beginning_of_line => self.cursor = 0,
             .end_of_line => self.cursor = self.query.items.len,
             .backward_char => self.cursor = prevUtf8Boundary(self.query.items, self.cursor),
@@ -2689,6 +2695,60 @@ const Ui = struct {
     fn halfPage(self: *Ui, delta: isize) void {
         const rows = @max(@as(usize, 1), self.visibleListRows() / 2);
         self.move(delta * @as(isize, @intCast(rows)));
+    }
+
+    const OffsetDirection = enum { up, down };
+
+    fn offsetViewport(self: *Ui, direction: OffsetDirection) void {
+        if (self.result_len == 0) return;
+        const rows = @max(@as(usize, 1), self.visibleListRows());
+
+        // fzf's offset direction is visual. Its logical offset advances in the
+        // default (bottom-up) layout and retreats in reverse (top-down) layout.
+        const logical_delta: isize = switch (direction) {
+            .up => if (self.options.layout == .default) 1 else -1,
+            .down => if (self.options.layout == .default) -1 else 1,
+        };
+        self.shiftViewport(logical_delta, rows);
+    }
+
+    fn shiftViewport(self: *Ui, delta: isize, rows: usize) void {
+        if (delta == 0 or self.result_len == 0) return;
+        const old_focus = self.focus;
+        var max_scroll = self.result_len -| @min(rows, self.result_len);
+
+        if (delta > 0) {
+            const amount: usize = @intCast(delta);
+            if (self.scroll +| amount > max_scroll and self.result_len == self.result_cap and self.result_cap < self.candidates.display.len) {
+                self.growResults() catch {};
+                max_scroll = self.result_len -| @min(rows, self.result_len);
+            }
+            const target_scroll = @min(max_scroll, self.scroll +| amount);
+            if (target_scroll == self.scroll) return;
+            self.scroll = target_scroll;
+            if (self.focus < self.scroll) self.focus = self.scroll;
+        } else {
+            const amount: usize = @intCast(-delta);
+            const target_scroll = self.scroll -| amount;
+            if (target_scroll == self.scroll) return;
+            self.scroll = target_scroll;
+            const last_visible = @min(self.result_len - 1, self.scroll + rows - 1);
+            if (self.focus > last_visible) self.focus = last_visible;
+        }
+
+        if (self.focus != old_focus) {
+            self.focus_event_pending = true;
+            self.cancelOneShotTracking();
+            self.preview_cache_key = null;
+        }
+    }
+
+    fn offsetViewportMiddle(self: *Ui) void {
+        if (self.result_len == 0) return;
+        const rows = @max(@as(usize, 1), self.visibleListRows());
+        const max_scroll = self.result_len -| @min(rows, self.result_len);
+        const half = rows / 2;
+        self.scroll = @min(max_scroll, self.focus -| half);
     }
 
     fn moveSelected(self: *Ui, direction: isize) void {
@@ -4525,6 +4585,9 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "page-down")) return .page_down;
     if (std.mem.eql(u8, s, "half-page-up")) return .half_page_up;
     if (std.mem.eql(u8, s, "half-page-down")) return .half_page_down;
+    if (std.mem.eql(u8, s, "offset-up")) return .offset_up;
+    if (std.mem.eql(u8, s, "offset-down")) return .offset_down;
+    if (std.mem.eql(u8, s, "offset-middle")) return .offset_middle;
     if (std.mem.eql(u8, s, "beginning-of-line")) return .beginning_of_line;
     if (std.mem.eql(u8, s, "end-of-line")) return .end_of_line;
     if (std.mem.eql(u8, s, "backward-char")) return .backward_char;
@@ -6978,6 +7041,9 @@ test "stateful binding actions parse" {
     try std.testing.expect((try parseAction("top")) == .first);
     try std.testing.expect((try parseAction("half-page-up")) == .half_page_up);
     try std.testing.expect((try parseAction("half-page-down")) == .half_page_down);
+    try std.testing.expect((try parseAction("offset-up")) == .offset_up);
+    try std.testing.expect((try parseAction("offset-down")) == .offset_down);
+    try std.testing.expect((try parseAction("offset-middle")) == .offset_middle);
     try std.testing.expect((try parseAction("clear-screen")) == .clear_screen);
     try std.testing.expect((try parseAction("close")) == .close);
     try std.testing.expect((try parseAction("bell")) == .bell);
