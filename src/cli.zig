@@ -4010,6 +4010,11 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.multi = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "+m") or std.mem.eql(u8, a, "--no-multi")) {
+            o.*.multi = false;
+            o.*.multi_max = null;
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--multi=")) {
             const mode = parseMultiMode(a[8..]) orelse return error.InvalidMultiLimit;
             o.*.multi = mode.enabled;
@@ -4028,8 +4033,16 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.ansi = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "--no-ansi")) {
+            o.*.ansi = false;
+            continue;
+        }
         if (std.mem.eql(u8, a, "--cycle")) {
             o.*.cycle = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-cycle")) {
+            o.*.cycle = false;
             continue;
         }
         if (std.mem.eql(u8, a, "--no-input")) {
@@ -4052,6 +4065,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
         }
         if (std.mem.eql(u8, a, "--wrap")) {
             o.*.wrap = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-wrap")) {
+            o.*.wrap = false;
             continue;
         }
         if (std.mem.eql(u8, a, "--raw")) {
@@ -4291,6 +4308,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
         }
         if (std.mem.eql(u8, a, "--reverse") or std.mem.eql(u8, a, "--layout=reverse")) {
             o.*.layout = .reverse;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-reverse")) {
+            o.*.layout = .default;
             continue;
         }
         if (std.mem.eql(u8, a, "--layout=default")) {
@@ -6675,22 +6696,24 @@ const usage =
     \\
     \\Selection and I/O
     \\  -m, --multi[=MAX]        multi-select; Tab / Shift-Tab toggle
+    \\  +m, --no-multi          disable multi-select
     \\      --read0              NUL-delimited input
     \\      --print0             NUL-delimited output
     \\      --print-query        print query before selection
     \\      --expect=KEYS        print accepted key field
     \\      --bind=SPEC          key/event actions: reload/execute/become/toggle...
     \\                           includes dynamic multi/field, raw/match, and exclusion actions
-    \\      --ansi               ignore ANSI CSI sequences while matching
+    \\      --ansi / --no-ansi   enable / disable ANSI processing
     \\      --tac                reverse input order
     \\
     \\UI
-    \\      --reverse            top-down layout
+    \\      --reverse / --no-reverse
+    \\                           top-down / default layout
     \\      --height=N%          constrain rendered height
-    \\      --cycle              cycle list navigation
+    \\      --cycle / --no-cycle enable / disable cyclic navigation
     \\      --filepath-word      word actions respect path separators
     \\      --scroll-off=N       keep N rows around the current item (source default: 3)
-    \\      --wrap               wrap long item display
+    \\      --wrap / --no-wrap    enable / disable long-item wrapping
     \\      --no-input           start with the input section hidden
     \\      --prompt=STR         prompt string
     \\      --pointer=STR        current-item pointer
@@ -7179,6 +7202,42 @@ test "scroll-off option uses fzf source default and accepts overrides" {
     var separate_options = try parseOptions(a, &separate_args);
     defer separate_options.deinit(a);
     try std.testing.expectEqual(@as(usize, 7), separate_options.scroll_off);
+}
+
+test "inverse option aliases reset existing state with last-one-wins semantics" {
+    const a = std.testing.allocator;
+
+    const multi_args = [_][]const u8{ "zfuzz", "--multi=3", "--no-multi" };
+    var multi = try parseOptions(a, &multi_args);
+    defer multi.deinit(a);
+    try std.testing.expect(!multi.multi);
+    try std.testing.expect(multi.multi_max == null);
+
+    const plus_multi_args = [_][]const u8{ "zfuzz", "--multi=2", "+m", "--multi" };
+    var plus_multi = try parseOptions(a, &plus_multi_args);
+    defer plus_multi.deinit(a);
+    try std.testing.expect(plus_multi.multi);
+    try std.testing.expect(plus_multi.multi_max == null);
+
+    const ansi_args = [_][]const u8{ "zfuzz", "--ansi", "--no-ansi" };
+    var ansi = try parseOptions(a, &ansi_args);
+    defer ansi.deinit(a);
+    try std.testing.expect(!ansi.ansi);
+
+    const cycle_args = [_][]const u8{ "zfuzz", "--cycle", "--no-cycle" };
+    var cycle = try parseOptions(a, &cycle_args);
+    defer cycle.deinit(a);
+    try std.testing.expect(!cycle.cycle);
+
+    const wrap_args = [_][]const u8{ "zfuzz", "--wrap", "--no-wrap" };
+    var wrap = try parseOptions(a, &wrap_args);
+    defer wrap.deinit(a);
+    try std.testing.expect(!wrap.wrap);
+
+    const reverse_args = [_][]const u8{ "zfuzz", "--reverse", "--no-reverse" };
+    var reverse = try parseOptions(a, &reverse_args);
+    defer reverse.deinit(a);
+    try std.testing.expectEqual(Layout.default, reverse.layout);
 }
 
 test "search enable and phony aliases are last-one-wins" {
