@@ -3853,9 +3853,9 @@ pub fn main(init: std.process.Init) !void {
     if (init.environ_map.get("NO_COLOR") != null) options.theme.enabled = false;
     if (init.environ_map.get("FZF_DEFAULT_OPTS")) |defaults_text| {
         const default_args = try shellSplitArgs(allocator, defaults_text);
-        try parseOptionsInto(allocator, &options, default_args, 0);
+        try parseOptionsInto(allocator, init.io, &options, default_args, 0);
     }
-    try parseOptionsInto(allocator, &options, args, 1);
+    try parseOptionsInto(allocator, init.io, &options, args, 1);
     defer options.deinit(allocator);
 
     if (hasArg(args, "--help") or hasArg(args, "-h")) {
@@ -4006,11 +4006,29 @@ fn validateListenAddress(address: []const u8) !void {
 
 fn parseOptions(allocator: Allocator, args: []const []const u8) !Options {
     var o: Options = .{};
-    try parseOptionsInto(allocator, &o, args, 1);
+    try parseOptionsInto(allocator, std.testing.io, &o, args, 1);
     return o;
 }
 
-fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8, start_index: usize) !void {
+fn walkerPathIsDir(io: Io, path: []const u8) bool {
+    const dir = Io.Dir.cwd().openDir(io, path, .{}) catch return false;
+    dir.close(io);
+    return true;
+}
+
+fn parseWalkerRoots(allocator: Allocator, io: Io, options: *Options, args: []const []const u8, index: *usize, inline_root: ?[]const u8) !void {
+    const begin = index.* + 1;
+    var end = begin;
+    while (end < args.len and walkerPathIsDir(io, args[end])) : (end += 1) {}
+    if (inline_root == null and end == begin) return error.NoDirectorySpecified;
+
+    options.walker_roots.clearRetainingCapacity();
+    if (inline_root) |root| try options.walker_roots.append(allocator, root);
+    try options.walker_roots.appendSlice(allocator, args[begin..end]);
+    if (end != begin) index.* = end - 1;
+}
+
+fn parseOptionsInto(allocator: Allocator, io: Io, o: *Options, args: []const []const u8, start_index: usize) !void {
     var i: usize = start_index;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -4064,13 +4082,11 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             continue;
         }
         if (std.mem.startsWith(u8, a, "--walker-root=")) {
-            try o.*.walker_roots.append(allocator, a[14..]);
+            try parseWalkerRoots(allocator, io, o, args, &i, a[14..]);
             continue;
         }
         if (std.mem.eql(u8, a, "--walker-root")) {
-            i += 1;
-            if (i >= args.len) return error.MissingArgument;
-            try o.*.walker_roots.append(allocator, args[i]);
+            try parseWalkerRoots(allocator, io, o, args, &i, null);
             continue;
         }
         if (std.mem.startsWith(u8, a, "--walker-skip=")) {
@@ -7494,6 +7510,20 @@ test "walker options match fzf defaults and parse explicit modes" {
     try std.testing.expectError(error.InvalidWalkerOption, parseWalkerOptions("file,bogus"));
 }
 
+test "walker root option consumes directories and replaces prior roots" {
+    const a = std.testing.allocator;
+
+    const args = [_][]const u8{ "zfuzz", "--walker-root=not-required-to-exist", "--walker-root", "src", "experiments", "--no-sort" };
+    var options = try parseOptions(a, &args);
+    defer options.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), options.walker_roots.items.len);
+    try std.testing.expectEqualStrings("src", options.walker_roots.items[0]);
+    try std.testing.expectEqualStrings("experiments", options.walker_roots.items[1]);
+    try std.testing.expect(options.no_sort);
+
+    try std.testing.expectError(error.NoDirectorySpecified, parseOptions(a, &.{ "zfuzz", "--walker-root", "__zfuzz_missing_walker_root__" }));
+}
+
 test "stream input retains bounded tail across partial records" {
     const a = std.testing.allocator;
     var stream = StreamInput.init(a, '\n', 2, 0);
@@ -7554,12 +7584,12 @@ test "height and border option forms" {
     var options: Options = .{};
     defer options.deinit(a);
     const args = [_][]const u8{ "zfuzz", "--height", "40%", "--border", "--sync" };
-    try parseOptionsInto(a, &options, &args, 1);
+    try parseOptionsInto(a, std.testing.io, &options, &args, 1);
     try std.testing.expectEqual(@as(u8, 40), options.height_percent);
     try std.testing.expect(options.border);
     try std.testing.expect(options.sync);
     const reset = [_][]const u8{ "zfuzz", "--no-height", "--no-border" };
-    try parseOptionsInto(a, &options, &reset, 1);
+    try parseOptionsInto(a, std.testing.io, &options, &reset, 1);
     try std.testing.expectEqual(@as(u8, 100), options.height_percent);
     try std.testing.expect(!options.border);
 }
