@@ -117,6 +117,7 @@ const Action = union(enum) {
     put: []const u8,
     first,
     last,
+    position: []const u8,
     toggle,
     toggle_up,
     toggle_down,
@@ -1866,25 +1867,12 @@ const Ui = struct {
                     self.markQueryChanged();
                 }
             },
-            .first => if (self.result_len != 0) {
-                if (self.focus != 0) {
-                    self.focus_event_pending = true;
-                    self.cancelOneShotTracking();
-                }
-                self.focus = 0;
-                self.ensureVisible();
-                self.preview_cache_key = null;
-            },
+            .first => if (self.result_len != 0) self.setFocus(0),
             .last => if (self.result_len != 0) {
-                const target = self.result_len - 1;
-                if (self.focus != target) {
-                    self.focus_event_pending = true;
-                    self.cancelOneShotTracking();
-                }
-                self.focus = target;
-                self.ensureVisible();
-                self.preview_cache_key = null;
+                try self.ensureAllResults();
+                self.setFocus(self.result_len - 1);
             },
+            .position => |value| try self.setFocusPosition(value),
             .toggle => _ = try self.toggleCurrent(),
             .select => try self.selectCurrent(),
             .deselect => self.deselectCurrent(),
@@ -2629,6 +2617,29 @@ const Ui = struct {
             self.ensureVisible();
             self.preview_cache_key = null;
         }
+    }
+
+    fn setFocus(self: *Ui, target: usize) void {
+        if (self.focus != target) {
+            self.focus_event_pending = true;
+            self.cancelOneShotTracking();
+        }
+        self.focus = target;
+        self.ensureVisible();
+        self.preview_cache_key = null;
+    }
+
+    fn setFocusPosition(self: *Ui, value: []const u8) !void {
+        var target = std.fmt.parseInt(isize, value, 10) catch return;
+        if (self.result_len == 0) return;
+        try self.ensureAllResults();
+        if (target > 0) {
+            target -= 1;
+        } else if (target < 0) {
+            target += @as(isize, @intCast(self.result_len));
+        }
+        target = std.math.clamp(target, 0, @as(isize, @intCast(self.result_len - 1)));
+        self.setFocus(@intCast(target));
     }
 
     fn move(self: *Ui, delta: isize) void {
@@ -4877,6 +4888,7 @@ fn parseAction(s: []const u8) !Action {
     if (commandAction(s, "put")) |value| return .{ .put = value };
     if (std.mem.eql(u8, s, "first") or std.mem.eql(u8, s, "top")) return .first;
     if (std.mem.eql(u8, s, "last")) return .last;
+    if (commandAction(s, "pos")) |value| return .{ .position = value };
     if (std.mem.eql(u8, s, "toggle")) return .toggle;
     if (std.mem.eql(u8, s, "select")) return .select;
     if (std.mem.eql(u8, s, "deselect")) return .deselect;
@@ -7620,6 +7632,10 @@ test "stateful binding actions parse" {
     try std.testing.expect((try parseAction("toggle-out")) == .toggle_out);
     try std.testing.expect((try parseAction("toggle-all")) == .toggle_all);
     try std.testing.expect((try parseAction("top")) == .first);
+    const pos_forward = try parseAction("pos(3)");
+    try std.testing.expectEqualStrings("3", pos_forward.position);
+    const pos_backward = try parseAction("pos:-3");
+    try std.testing.expectEqualStrings("-3", pos_backward.position);
     try std.testing.expect((try parseAction("half-page-up")) == .half_page_up);
     try std.testing.expect((try parseAction("half-page-down")) == .half_page_down);
     try std.testing.expect((try parseAction("offset-up")) == .offset_up);
