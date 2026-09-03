@@ -4336,6 +4336,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.border_label = args[i];
             continue;
         }
+        if (std.mem.eql(u8, a, "--no-border-label")) {
+            o.*.border_label = null;
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--border-label-pos=")) {
             o.*.border_label_pos = try parseLabelPosition(a[19..]);
             continue;
@@ -4465,6 +4469,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.preview.command = args[i];
             continue;
         }
+        if (std.mem.eql(u8, a, "--no-preview")) {
+            o.*.preview.command = null;
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--preview-window=")) {
             parsePreviewWindow(&o.*.preview, a[17..]);
             continue;
@@ -4489,6 +4497,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             i += 1;
             if (i >= args.len) return error.MissingArgument;
             o.*.preview.label = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-preview-label")) {
+            o.*.preview.label = null;
             continue;
         }
         if (std.mem.startsWith(u8, a, "--preview-label-pos=")) {
@@ -6799,11 +6811,16 @@ const usage =
     \\      --header-first       print header before prompt in reverse layout
     \\      --footer=STR / --no-footer
     \\                           set / clear footer text
+    \\      --border-label=STR / --no-border-label
+    \\                           set / clear outer border label
     \\      --no-border          disable border reservation
     \\      --no-mouse           disable xterm mouse tracking
     \\
     \\Preview
-    \\      --preview=COMMAND    preview focused item; fzf command placeholders
+    \\      --preview=COMMAND / --no-preview
+    \\                           set / clear focused-item preview command
+    \\      --preview-label=STR / --no-preview-label
+    \\                           set / clear preview border label
     \\      --preview-window=OPT right/left/up/down, SIZE%, hidden, wrap/nowrap
     \\                           {}, {+}, {*}, {1}, {q}, {q:2..}, {n}
     \\                           flags: r raw, s preserve-space, f temp-file
@@ -7279,6 +7296,30 @@ test "scroll-off option uses fzf source default and accepts overrides" {
     var separate_options = try parseOptions(a, &separate_args);
     defer separate_options.deinit(a);
     try std.testing.expectEqual(@as(usize, 7), separate_options.scroll_off);
+}
+
+test "preview and label reset options are last-one-wins" {
+    const a = std.testing.allocator;
+
+    const preview_args = [_][]const u8{ "zfuzz", "--preview=first", "--no-preview", "--preview", "second" };
+    var preview = try parseOptions(a, &preview_args);
+    defer preview.deinit(a);
+    try std.testing.expectEqualStrings("second", preview.preview.command.?);
+
+    const preview_clear_args = [_][]const u8{ "zfuzz", "--preview=first", "--no-preview" };
+    var preview_clear = try parseOptions(a, &preview_clear_args);
+    defer preview_clear.deinit(a);
+    try std.testing.expect(preview_clear.preview.command == null);
+
+    const border_label_args = [_][]const u8{ "zfuzz", "--border-label=first", "--no-border-label", "--border-label", "second" };
+    var border_label = try parseOptions(a, &border_label_args);
+    defer border_label.deinit(a);
+    try std.testing.expectEqualStrings("second", border_label.border_label.?);
+
+    const preview_label_args = [_][]const u8{ "zfuzz", "--preview-label=first", "--no-preview-label" };
+    var preview_label = try parseOptions(a, &preview_label_args);
+    defer preview_label.deinit(a);
+    try std.testing.expect(preview_label.preview.label == null);
 }
 
 test "header footer and color reset forms are last-one-wins" {
