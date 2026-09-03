@@ -84,6 +84,8 @@ const Action = union(enum) {
     down,
     page_up,
     page_down,
+    half_page_up,
+    half_page_down,
     beginning_of_line,
     end_of_line,
     backward_char,
@@ -118,6 +120,8 @@ const Action = union(enum) {
     select_all,
     deselect_all,
     clear_query,
+    clear_screen,
+    close,
     accept,
     abort,
     toggle_preview,
@@ -1654,6 +1658,8 @@ const Ui = struct {
             .down => self.move(1),
             .page_up => self.page(-1),
             .page_down => self.page(1),
+            .half_page_up => self.halfPage(-1),
+            .half_page_down => self.halfPage(1),
             .beginning_of_line => self.cursor = 0,
             .end_of_line => self.cursor = self.query.items.len,
             .backward_char => self.cursor = prevUtf8Boundary(self.query.items, self.cursor),
@@ -1757,6 +1763,13 @@ const Ui = struct {
                 self.query.clearRetainingCapacity();
                 self.cursor = 0;
                 self.markQueryChanged();
+            },
+            .clear_screen => {}, // Every action frame is already a full redraw.
+            .close => {
+                if (self.paneGeometry(self.terminal.size()).preview != null) {
+                    self.options.preview.hidden = true;
+                    self.preview_cache_key = null;
+                } else return 130;
             },
             .accept => {
                 if (self.result_len == 0 and self.selected_count == 0) return 1;
@@ -2548,6 +2561,11 @@ const Ui = struct {
 
     fn page(self: *Ui, delta: isize) void {
         const rows = @max(@as(usize, 1), self.visibleListRows());
+        self.move(delta * @as(isize, @intCast(rows)));
+    }
+
+    fn halfPage(self: *Ui, delta: isize) void {
+        const rows = @max(@as(usize, 1), self.visibleListRows() / 2);
         self.move(delta * @as(isize, @intCast(rows)));
     }
 
@@ -4363,6 +4381,8 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "down")) return .down;
     if (std.mem.eql(u8, s, "page-up")) return .page_up;
     if (std.mem.eql(u8, s, "page-down")) return .page_down;
+    if (std.mem.eql(u8, s, "half-page-up")) return .half_page_up;
+    if (std.mem.eql(u8, s, "half-page-down")) return .half_page_down;
     if (std.mem.eql(u8, s, "beginning-of-line")) return .beginning_of_line;
     if (std.mem.eql(u8, s, "end-of-line")) return .end_of_line;
     if (std.mem.eql(u8, s, "backward-char")) return .backward_char;
@@ -4385,7 +4405,7 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "accept-or-print-query")) return .accept_or_print_query;
     if (std.mem.eql(u8, s, "replace-query")) return .replace_query;
     if (commandAction(s, "put")) |value| return .{ .put = value };
-    if (std.mem.eql(u8, s, "first")) return .first;
+    if (std.mem.eql(u8, s, "first") or std.mem.eql(u8, s, "top")) return .first;
     if (std.mem.eql(u8, s, "last")) return .last;
     if (std.mem.eql(u8, s, "toggle")) return .toggle;
     if (std.mem.eql(u8, s, "select")) return .select;
@@ -4399,6 +4419,8 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "deselect-all")) return .deselect_all;
     if (std.mem.eql(u8, s, "clear-selection") or std.mem.eql(u8, s, "clear-multi")) return .deselect_all;
     if (std.mem.eql(u8, s, "clear-query")) return .clear_query;
+    if (std.mem.eql(u8, s, "clear-screen")) return .clear_screen;
+    if (std.mem.eql(u8, s, "close")) return .close;
     if (std.mem.eql(u8, s, "accept")) return .accept;
     if (std.mem.eql(u8, s, "abort")) return .abort;
     if (std.mem.eql(u8, s, "toggle-preview")) return .toggle_preview;
@@ -6767,6 +6789,11 @@ test "stateful binding actions parse" {
     try std.testing.expect((try parseAction("toggle-in")) == .toggle_in);
     try std.testing.expect((try parseAction("toggle-out")) == .toggle_out);
     try std.testing.expect((try parseAction("toggle-all")) == .toggle_all);
+    try std.testing.expect((try parseAction("top")) == .first);
+    try std.testing.expect((try parseAction("half-page-up")) == .half_page_up);
+    try std.testing.expect((try parseAction("half-page-down")) == .half_page_down);
+    try std.testing.expect((try parseAction("clear-screen")) == .clear_screen);
+    try std.testing.expect((try parseAction("close")) == .close);
     try std.testing.expect((try parseAction("beginning-of-line")) == .beginning_of_line);
     try std.testing.expect((try parseAction("end-of-line")) == .end_of_line);
     try std.testing.expect((try parseAction("backward-char")) == .backward_char);
