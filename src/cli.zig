@@ -121,6 +121,12 @@ const Action = union(enum) {
     change_header: []const u8,
     change_footer: []const u8,
     change_preview: []const u8,
+    transform: []const u8,
+    transform_query: []const u8,
+    transform_prompt: []const u8,
+    transform_header: []const u8,
+    transform_footer: []const u8,
+    transform_preview: []const u8,
     reload: []const u8,
     execute: []const u8,
     execute_silent: []const u8,
@@ -633,7 +639,14 @@ const Ui = struct {
     change_event_pending: bool = false,
     load_event_pending: bool = false,
     result_event_pending: bool = false,
+    result_final_event_pending: bool = false,
+    zero_event_pending: bool = false,
+    one_event_pending: bool = false,
     focus_event_pending: bool = false,
+    owned_prompt: ?[]u8 = null,
+    owned_header: ?[]u8 = null,
+    owned_footer: ?[]u8 = null,
+    owned_preview: ?[]u8 = null,
 
     fn init(
         allocator: Allocator,
@@ -685,6 +698,10 @@ const Ui = struct {
         self.allocator.free(self.selected);
         self.selection_order.deinit(self.allocator);
         if (self.preview_text.len != 0) self.allocator.free(self.preview_text);
+        if (self.owned_prompt) |value| self.allocator.free(value);
+        if (self.owned_header) |value| self.allocator.free(value);
+        if (self.owned_footer) |value| self.allocator.free(value);
+        if (self.owned_preview) |value| self.allocator.free(value);
     }
 
     fn run(self: *Ui) !u8 {
@@ -708,6 +725,7 @@ const Ui = struct {
                 if (update.changed) try self.refreshFromStream();
                 if (update.eof_became) {
                     self.load_event_pending = true;
+                    self.result_final_event_pending = true;
                     stream_finished = true;
                 }
             }
@@ -730,6 +748,18 @@ const Ui = struct {
             if (self.result_event_pending) {
                 self.result_event_pending = false;
                 if (try self.fireEvent("result")) |code| return code;
+            }
+            if (self.zero_event_pending) {
+                self.zero_event_pending = false;
+                if (try self.fireEvent("zero")) |code| return code;
+            }
+            if (self.one_event_pending) {
+                self.one_event_pending = false;
+                if (try self.fireEvent("one")) |code| return code;
+            }
+            if (self.result_final_event_pending) {
+                self.result_final_event_pending = false;
+                if (try self.fireEvent("result-final")) |code| return code;
             }
             if (self.focus_event_pending) {
                 self.focus_event_pending = false;
@@ -775,6 +805,9 @@ const Ui = struct {
         self.dirty_search = false;
         self.preview_cache_key = null;
         self.result_event_pending = true;
+        self.zero_event_pending = self.result_len == 0;
+        self.one_event_pending = self.result_len == 1;
+        self.result_final_event_pending = self.stream == null or self.stream.?.eof;
         const new_focus_idx: ?usize = if (self.result_len == 0) null else self.results[self.focus];
         if (old_focus_idx != new_focus_idx) self.focus_event_pending = true;
     }
@@ -892,7 +925,8 @@ const Ui = struct {
         for (self.options.bindings.items) |binding| {
             if (std.mem.eql(u8, binding.trigger, "start") or std.mem.eql(u8, binding.trigger, "load") or
                 std.mem.eql(u8, binding.trigger, "change") or std.mem.eql(u8, binding.trigger, "result") or
-                std.mem.eql(u8, binding.trigger, "focus")) continue;
+                std.mem.eql(u8, binding.trigger, "result-final") or std.mem.eql(u8, binding.trigger, "zero") or
+                std.mem.eql(u8, binding.trigger, "one") or std.mem.eql(u8, binding.trigger, "focus")) continue;
             if (keyMatchesName(key, binding.trigger)) return try self.runAction(binding.action);
         }
         for (self.options.expect.items) |expected| {
@@ -1124,7 +1158,7 @@ const Ui = struct {
         return null;
     }
 
-    fn runAction(self: *Ui, action: Action) !?u8 {
+    fn runAction(self: *Ui, action: Action) anyerror!?u8 {
         switch (action) {
             .up => self.move(-1),
             .down => self.move(1),
@@ -1259,12 +1293,80 @@ const Ui = struct {
                 self.preview_cache_key = null;
                 self.preview_offset = 0;
             },
+            .transform => |cmd| return try self.runTransformActions(cmd),
+            .transform_query => |cmd| {
+                const value = try self.runTransformCommand(cmd);
+                defer self.allocator.free(value);
+                self.query.clearRetainingCapacity();
+                try self.query.appendSlice(self.allocator, value);
+                self.cursor = self.query.items.len;
+                self.markQueryChanged();
+            },
+            .transform_prompt => |cmd| {
+                const value = try self.runTransformCommand(cmd);
+                self.replaceOwnedText(&self.owned_prompt, &self.options.prompt, value);
+            },
+            .transform_header => |cmd| {
+                const value = try self.runTransformCommand(cmd);
+                self.replaceOwnedOptionalText(&self.owned_header, &self.options.header, value);
+            },
+            .transform_footer => |cmd| {
+                const value = try self.runTransformCommand(cmd);
+                self.replaceOwnedOptionalText(&self.owned_footer, &self.options.footer, value);
+            },
+            .transform_preview => |cmd| {
+                const value = try self.runTransformCommand(cmd);
+                self.replaceOwnedOptionalText(&self.owned_preview, &self.options.preview.command, value);
+                self.options.preview.hidden = false;
+                self.preview_cache_key = null;
+                self.preview_offset = 0;
+            },
             .reload => |cmd| try self.reloadFromCommand(cmd),
             .execute => |cmd| try self.executeCommand(cmd, false),
             .execute_silent => |cmd| try self.executeCommand(cmd, true),
             .become => |cmd| return try self.becomeCommand(cmd),
         }
         return null;
+    }
+
+    fn runTransformCommand(self: *Ui, command: []const u8) ![]u8 {
+        const expanded = try self.expandedCommand(command);
+        defer self.allocator.free(expanded);
+        const result = try std.process.run(self.allocator, self.io, .{
+            .argv = &.{ "/bin/sh", "-c", expanded },
+            .environ_map = self.child_env,
+            .stdout_limit = .limited(1024 * 1024),
+            .stderr_limit = .limited(1024 * 1024),
+        });
+        defer self.allocator.free(result.stderr);
+        defer self.allocator.free(result.stdout);
+        const text = std.mem.trimEnd(u8, result.stdout, "\r\n");
+        return try self.allocator.dupe(u8, text);
+    }
+
+    fn runTransformActions(self: *Ui, command: []const u8) anyerror!?u8 {
+        const text = try self.runTransformCommand(command);
+        defer self.allocator.free(text);
+        if (text.len == 0) return null;
+        var actions: std.ArrayList(Binding) = .empty;
+        defer actions.deinit(self.allocator);
+        try appendBindingActions(self.allocator, &actions, "transform", text);
+        for (actions.items) |binding| {
+            if (try self.runAction(binding.action)) |code| return code;
+        }
+        return null;
+    }
+
+    fn replaceOwnedText(self: *Ui, storage: *?[]u8, target: *[]const u8, value: []u8) void {
+        if (storage.*) |old| self.allocator.free(old);
+        storage.* = value;
+        target.* = value;
+    }
+
+    fn replaceOwnedOptionalText(self: *Ui, storage: *?[]u8, target: *?[]const u8, value: []u8) void {
+        if (storage.*) |old| self.allocator.free(old);
+        storage.* = value;
+        target.* = value;
     }
 
     fn currentItem(self: *Ui) []const u8 {
@@ -3020,6 +3122,12 @@ fn parseAction(s: []const u8) !Action {
     if (commandAction(s, "change-header")) |value| return .{ .change_header = value };
     if (commandAction(s, "change-footer")) |value| return .{ .change_footer = value };
     if (commandAction(s, "change-preview")) |value| return .{ .change_preview = value };
+    if (commandAction(s, "transform-query")) |cmd| return .{ .transform_query = cmd };
+    if (commandAction(s, "transform-prompt")) |cmd| return .{ .transform_prompt = cmd };
+    if (commandAction(s, "transform-header")) |cmd| return .{ .transform_header = cmd };
+    if (commandAction(s, "transform-footer")) |cmd| return .{ .transform_footer = cmd };
+    if (commandAction(s, "transform-preview")) |cmd| return .{ .transform_preview = cmd };
+    if (commandAction(s, "transform")) |cmd| return .{ .transform = cmd };
     if (commandAction(s, "reload")) |cmd| return .{ .reload = cmd };
     if (commandAction(s, "execute-silent")) |cmd| return .{ .execute_silent = cmd };
     if (commandAction(s, "execute")) |cmd| return .{ .execute = cmd };
@@ -4481,6 +4589,10 @@ test "stateful binding actions parse" {
     try std.testing.expectEqualStrings("foo bar", q.change_query);
     const h = try parseAction("change-header:ready");
     try std.testing.expectEqualStrings("ready", h.change_header);
+    const tq = try parseAction("transform-query(printf beta)");
+    try std.testing.expectEqualStrings("printf beta", tq.transform_query);
+    const t = try parseAction("transform(printf 'down+accept')");
+    try std.testing.expectEqualStrings("printf 'down+accept'", t.transform);
 }
 
 test "binding parser" {
