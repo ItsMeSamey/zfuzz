@@ -103,6 +103,7 @@ const Action = union(enum) {
     print_query,
     accept_non_empty,
     accept_or_print_query,
+    replace_query,
     put: []const u8,
     first,
     last,
@@ -1700,6 +1701,7 @@ const Ui = struct {
                 }
                 return 0;
             },
+            .replace_query => try self.replaceQueryWithCurrentDisplay(),
             .put => |value| {
                 if (value.len != 0) {
                     try self.query.insertSlice(self.allocator, self.cursor, value);
@@ -1940,6 +1942,23 @@ const Ui = struct {
             .toggle_bind => |targets| self.setBindingsEnabled(targets, .toggle),
         }
         return null;
+    }
+
+    fn replaceQueryWithCurrentDisplay(self: *Ui) !void {
+        if (self.result_len == 0) return;
+        const idx = self.results[self.focus];
+        var source = self.candidates.display[idx];
+        var stripped: ?[]const u8 = null;
+        defer if (stripped) |owned| self.allocator.free(owned);
+        if (self.options.ansi) {
+            const owned = try stripAnsi(self.allocator, source);
+            stripped = owned;
+            source = owned;
+        }
+        self.query.clearRetainingCapacity();
+        try self.query.appendSlice(self.allocator, source);
+        self.cursor = self.query.items.len;
+        self.markQueryChanged();
     }
 
     fn applyMultiAction(self: *Ui, value: []const u8) void {
@@ -4364,6 +4383,7 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "print-query")) return .print_query;
     if (std.mem.eql(u8, s, "accept-non-empty")) return .accept_non_empty;
     if (std.mem.eql(u8, s, "accept-or-print-query")) return .accept_or_print_query;
+    if (std.mem.eql(u8, s, "replace-query")) return .replace_query;
     if (commandAction(s, "put")) |value| return .{ .put = value };
     if (std.mem.eql(u8, s, "first")) return .first;
     if (std.mem.eql(u8, s, "last")) return .last;
@@ -6768,6 +6788,7 @@ test "stateful binding actions parse" {
     try std.testing.expect((try parseAction("print-query")) == .print_query);
     try std.testing.expect((try parseAction("accept-non-empty")) == .accept_non_empty);
     try std.testing.expect((try parseAction("accept-or-print-query")) == .accept_or_print_query);
+    try std.testing.expect((try parseAction("replace-query")) == .replace_query);
     const put = try parseAction("put(λx)");
     try std.testing.expectEqualStrings("λx", put.put);
     const printed = try parseAction("print(ctrl-y)");
