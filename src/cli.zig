@@ -4764,15 +4764,13 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             continue;
         }
         if (std.mem.startsWith(u8, a, "--expect=")) {
-            var it = std.mem.splitScalar(u8, a[9..], ',');
-            while (it.next()) |k| if (k.len != 0) try o.*.expect.append(allocator, k);
+            try appendExpectedKeys(allocator, &o.*.expect, a[9..]);
             continue;
         }
         if (std.mem.eql(u8, a, "--expect")) {
             i += 1;
             if (i >= args.len) return error.MissingArgument;
-            var it = std.mem.splitScalar(u8, args[i], ',');
-            while (it.next()) |k| if (k.len != 0) try o.*.expect.append(allocator, k);
+            try appendExpectedKeys(allocator, &o.*.expect, args[i]);
             continue;
         }
         if (std.mem.eql(u8, a, "--no-expect")) {
@@ -4792,6 +4790,31 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
         return error.UnknownOption;
     }
     return;
+}
+
+fn appendExpectedKeys(allocator: Allocator, out: *std.ArrayList([]const u8), spec: []const u8) !void {
+    const masked = try allocator.dupe(u8, spec);
+    defer allocator.free(masked);
+
+    var i: usize = 0;
+    while (i + 5 <= masked.len) {
+        if (std.ascii.eqlIgnoreCase(masked[i .. i + 4], "alt-") and masked[i + 4] == ',') {
+            masked[i + 4] = 1;
+            i += 5;
+        } else i += 1;
+    }
+
+    var start: usize = 0;
+    i = 0;
+    while (i <= masked.len) : (i += 1) {
+        if (i != masked.len and masked[i] != ',') continue;
+        if (i != start) try out.append(allocator, spec[start..i]);
+        start = i + 1;
+    }
+
+    const literal_comma = std.mem.eql(u8, masked, ",") or std.mem.startsWith(u8, masked, ",,") or
+        std.mem.endsWith(u8, masked, ",,") or std.mem.indexOf(u8, masked, ",,,") != null;
+    if (literal_comma) try out.append(allocator, ",");
 }
 
 fn parseScheme(spec: []const u8) !Scheme {
@@ -8825,6 +8848,30 @@ test "legacy inline info aliases match fzf ordering" {
     defer disabled.deinit(a);
     try std.testing.expectEqual(InfoStyle.default, disabled.info_style);
     try std.testing.expectEqualStrings("custom", disabled.info_prefix);
+}
+
+test "expect preserves fzf comma key chords" {
+    const a = std.testing.allocator;
+
+    const comma_args = [_][]const u8{ "zfuzz", "--expect=," };
+    var comma = try parseOptions(a, &comma_args);
+    defer comma.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), comma.expect.items.len);
+    try std.testing.expectEqualStrings(",", comma.expect.items[0]);
+
+    const alt_args = [_][]const u8{ "zfuzz", "--expect", "AlT-," };
+    var alt = try parseOptions(a, &alt_args);
+    defer alt.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), alt.expect.items.len);
+    try std.testing.expectEqualStrings("AlT-,", alt.expect.items[0]);
+
+    const list_args = [_][]const u8{ "zfuzz", "--expect=a,,,b" };
+    var list = try parseOptions(a, &list_args);
+    defer list.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), list.expect.items.len);
+    try std.testing.expectEqualStrings("a", list.expect.items[0]);
+    try std.testing.expectEqualStrings("b", list.expect.items[1]);
+    try std.testing.expectEqualStrings(",", list.expect.items[2]);
 }
 
 test "fzf parser reset options are last-one-wins" {
