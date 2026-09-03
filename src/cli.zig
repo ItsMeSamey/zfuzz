@@ -4217,7 +4217,7 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.tac = false;
             continue;
         }
-        if (std.mem.eql(u8, a, "--no-color")) {
+        if (std.mem.eql(u8, a, "+c") or std.mem.eql(u8, a, "--no-color")) {
             o.*.theme.enabled = false;
             continue;
         }
@@ -4395,6 +4395,16 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.header = a[9..];
             continue;
         }
+        if (std.mem.eql(u8, a, "--header")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.header = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-header")) {
+            o.*.header = null;
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--header-lines=")) {
             o.*.header_lines = try std.fmt.parseInt(usize, a[15..], 10);
             continue;
@@ -4403,6 +4413,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             i += 1;
             if (i >= args.len) return error.MissingArgument;
             o.*.header_lines = try std.fmt.parseInt(usize, args[i], 10);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-header-lines")) {
+            o.*.header_lines = 0;
             continue;
         }
         if (std.mem.eql(u8, a, "--header-first")) {
@@ -4415,6 +4429,16 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
         }
         if (std.mem.startsWith(u8, a, "--footer=")) {
             o.*.footer = a[9..];
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--footer")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.footer = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-footer")) {
+            o.*.footer = null;
             continue;
         }
         if (std.mem.startsWith(u8, a, "--height=")) {
@@ -6756,6 +6780,7 @@ const usage =
     \\      --tac / --no-tac     enable / disable reversed input order
     \\
     \\UI
+    \\  +c, --no-color          disable color styling
     \\      --reverse / --no-reverse
     \\                           top-down / default layout
     \\      --height=N%          constrain rendered height
@@ -6767,10 +6792,13 @@ const usage =
     \\      --prompt=STR         prompt string
     \\      --pointer=STR        current-item pointer
     \\      --marker=STR         selected-item marker
-    \\      --header=STR         header text
-    \\      --header-lines=N     treat first N input lines as non-selectable header
+    \\      --header=STR / --no-header
+    \\                           set / clear header text
+    \\      --header-lines=N / --no-header-lines
+    \\                           set / clear non-selectable input header lines
     \\      --header-first       print header before prompt in reverse layout
-    \\      --footer=STR         footer text
+    \\      --footer=STR / --no-footer
+    \\                           set / clear footer text
     \\      --no-border          disable border reservation
     \\      --no-mouse           disable xterm mouse tracking
     \\
@@ -7251,6 +7279,30 @@ test "scroll-off option uses fzf source default and accepts overrides" {
     var separate_options = try parseOptions(a, &separate_args);
     defer separate_options.deinit(a);
     try std.testing.expectEqual(@as(usize, 7), separate_options.scroll_off);
+}
+
+test "header footer and color reset forms are last-one-wins" {
+    const a = std.testing.allocator;
+
+    const header_args = [_][]const u8{ "zfuzz", "--header", "first", "--no-header", "--header=second" };
+    var header = try parseOptions(a, &header_args);
+    defer header.deinit(a);
+    try std.testing.expectEqualStrings("second", header.header.?);
+
+    const header_lines_args = [_][]const u8{ "zfuzz", "--header-lines=2", "--no-header-lines" };
+    var header_lines = try parseOptions(a, &header_lines_args);
+    defer header_lines.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), header_lines.header_lines);
+
+    const footer_args = [_][]const u8{ "zfuzz", "--footer=first", "--no-footer", "--footer", "second" };
+    var footer = try parseOptions(a, &footer_args);
+    defer footer.deinit(a);
+    try std.testing.expectEqualStrings("second", footer.footer.?);
+
+    const color_args = [_][]const u8{ "zfuzz", "--color=dark", "+c" };
+    var color = try parseOptions(a, &color_args);
+    defer color.deinit(a);
+    try std.testing.expect(!color.theme.enabled);
 }
 
 test "search and io reset aliases are last-one-wins" {
