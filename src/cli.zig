@@ -91,7 +91,20 @@ const Action = union(enum) {
     accept,
     abort,
     toggle_preview,
+    show_preview,
+    hide_preview,
     refresh_preview,
+    toggle_preview_wrap,
+    preview_top,
+    preview_bottom,
+    preview_up,
+    preview_down,
+    preview_page_up,
+    preview_page_down,
+    preview_half_page_up,
+    preview_half_page_down,
+    prev_selected,
+    next_selected,
     toggle_sort,
     enable_search,
     disable_search,
@@ -589,6 +602,7 @@ const Ui = struct {
     preview_cache_key: ?usize = null,
     preview_cache_query_hash: u64 = 0,
     preview_text: []u8 = &.{},
+    preview_offset: usize = 0,
     accepted_key: ?[]const u8 = null,
     change_event_pending: bool = false,
     load_event_pending: bool = false,
@@ -1028,7 +1042,26 @@ const Ui = struct {
                 self.options.preview.hidden = !self.options.preview.hidden;
                 self.preview_cache_key = null;
             },
-            .refresh_preview => self.preview_cache_key = null,
+            .show_preview => {
+                self.options.preview.hidden = false;
+                self.preview_cache_key = null;
+            },
+            .hide_preview => self.options.preview.hidden = true,
+            .refresh_preview => {
+                self.preview_cache_key = null;
+                self.preview_offset = 0;
+            },
+            .toggle_preview_wrap => self.options.preview.wrap = !self.options.preview.wrap,
+            .preview_top => self.preview_offset = 0,
+            .preview_bottom => self.preview_offset = self.previewMaxOffset(),
+            .preview_up => self.scrollPreview(-1),
+            .preview_down => self.scrollPreview(1),
+            .preview_page_up => self.scrollPreview(-@as(isize, @intCast(self.previewContentRows()))),
+            .preview_page_down => self.scrollPreview(@intCast(self.previewContentRows())),
+            .preview_half_page_up => self.scrollPreview(-@as(isize, @intCast(@max(@as(usize, 1), self.previewContentRows() / 2)))),
+            .preview_half_page_down => self.scrollPreview(@intCast(@max(@as(usize, 1), self.previewContentRows() / 2))),
+            .prev_selected => self.moveSelected(-1),
+            .next_selected => self.moveSelected(1),
             .toggle_sort => {
                 self.options.no_sort = !self.options.no_sort;
                 self.dirty_search = true;
@@ -1081,6 +1114,7 @@ const Ui = struct {
                 self.options.preview.command = value;
                 self.options.preview.hidden = false;
                 self.preview_cache_key = null;
+                self.preview_offset = 0;
             },
             .reload => |cmd| try self.reloadFromCommand(cmd),
             .execute => |cmd| try self.executeCommand(cmd, false),
@@ -1310,6 +1344,65 @@ const Ui = struct {
     fn page(self: *Ui, delta: isize) void {
         const rows = @max(@as(usize, 1), self.visibleListRows());
         self.move(delta * @as(isize, @intCast(rows)));
+    }
+
+    fn moveSelected(self: *Ui, direction: isize) void {
+        if (self.result_len == 0 or self.selected_count == 0) return;
+        var pos = self.focus;
+        var scanned: usize = 0;
+        while (scanned < self.result_len) : (scanned += 1) {
+            if (direction < 0) {
+                pos = if (pos == 0) self.result_len - 1 else pos - 1;
+            } else {
+                pos = if (pos + 1 == self.result_len) 0 else pos + 1;
+            }
+            if (!self.selected[self.results[pos]]) continue;
+            if (pos != self.focus) {
+                self.focus = pos;
+                self.ensureVisible();
+                self.preview_cache_key = null;
+                self.focus_event_pending = true;
+                self.cancelOneShotTracking();
+            }
+            return;
+        }
+    }
+
+    fn previewContentRows(self: *Ui) usize {
+        const preview = self.paneGeometry(self.terminal.size()).preview orelse return 1;
+        var rows = preview.rows;
+        if (self.options.preview.border_style != .none) {
+            const sides = borderSides(self.options.preview.border_style);
+            rows -|= @intFromBool(sides.top);
+            rows -|= @intFromBool(sides.bottom);
+        }
+        return @max(@as(usize, 1), rows);
+    }
+
+    fn previewLineCount(self: *Ui) usize {
+        if (self.preview_text.len == 0) return 0;
+        var count: usize = 1;
+        for (self.preview_text) |byte| if (byte == '\n') {
+            count += 1;
+        };
+        return count;
+    }
+
+    fn previewMaxOffset(self: *Ui) usize {
+        const count = self.previewLineCount();
+        const rows = self.previewContentRows();
+        return if (count > rows) count - rows else 0;
+    }
+
+    fn scrollPreview(self: *Ui, delta: isize) void {
+        const max_offset = self.previewMaxOffset();
+        if (delta < 0) {
+            const amount: usize = @intCast(-delta);
+            self.preview_offset -|= amount;
+        } else {
+            const amount: usize = @intCast(delta);
+            self.preview_offset = @min(max_offset, self.preview_offset +| amount);
+        }
     }
 
     fn toggleCurrent(self: *Ui) !void {
@@ -1564,6 +1657,7 @@ const Ui = struct {
         @memcpy(self.preview_text[result.stdout.len..], result.stderr);
         self.preview_cache_key = idx;
         self.preview_cache_query_hash = qhash;
+        self.preview_offset = 0;
     }
 
     fn renderPreviewOverlay(self: *Ui, frame: *Io.Writer.Allocating, size: anytype, geom: PaneGeometry, preview: Pane) !void {
@@ -1584,6 +1678,8 @@ const Ui = struct {
         }
 
         var lines = std.mem.splitScalar(u8, self.preview_text, '\n');
+        var skipped: usize = 0;
+        while (skipped < self.preview_offset and lines.next() != null) : (skipped += 1) {}
         var row: usize = 0;
         while (row < content.rows) : (row += 1) {
             const line = lines.next() orelse break;
@@ -2668,7 +2764,20 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "accept")) return .accept;
     if (std.mem.eql(u8, s, "abort")) return .abort;
     if (std.mem.eql(u8, s, "toggle-preview")) return .toggle_preview;
+    if (std.mem.eql(u8, s, "show-preview")) return .show_preview;
+    if (std.mem.eql(u8, s, "hide-preview")) return .hide_preview;
     if (std.mem.eql(u8, s, "refresh-preview")) return .refresh_preview;
+    if (std.mem.eql(u8, s, "toggle-preview-wrap")) return .toggle_preview_wrap;
+    if (std.mem.eql(u8, s, "preview-top")) return .preview_top;
+    if (std.mem.eql(u8, s, "preview-bottom")) return .preview_bottom;
+    if (std.mem.eql(u8, s, "preview-up")) return .preview_up;
+    if (std.mem.eql(u8, s, "preview-down")) return .preview_down;
+    if (std.mem.eql(u8, s, "preview-page-up")) return .preview_page_up;
+    if (std.mem.eql(u8, s, "preview-page-down")) return .preview_page_down;
+    if (std.mem.eql(u8, s, "preview-half-page-up")) return .preview_half_page_up;
+    if (std.mem.eql(u8, s, "preview-half-page-down")) return .preview_half_page_down;
+    if (std.mem.eql(u8, s, "up-selected") or std.mem.eql(u8, s, "prev-selected")) return .prev_selected;
+    if (std.mem.eql(u8, s, "down-selected") or std.mem.eql(u8, s, "next-selected")) return .next_selected;
     if (std.mem.eql(u8, s, "toggle-sort")) return .toggle_sort;
     if (std.mem.eql(u8, s, "enable-search")) return .enable_search;
     if (std.mem.eql(u8, s, "disable-search")) return .disable_search;
