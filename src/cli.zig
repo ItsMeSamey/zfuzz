@@ -4258,6 +4258,16 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.no_sort = true;
             continue;
         }
+        if (std.mem.startsWith(u8, a, "--toggle-sort=")) {
+            try setToggleSortBinding(allocator, o, a[14..]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--toggle-sort")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            try setToggleSortBinding(allocator, o, args[i]);
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--sort=")) {
             const value = try std.fmt.parseInt(isize, a[7..], 10);
             o.*.no_sort = value <= 0;
@@ -4838,6 +4848,15 @@ fn appendExpectedKey(allocator: Allocator, out: *std.ArrayList([]const u8), key:
         } else i += 1;
     }
     try out.append(allocator, key);
+}
+
+fn setToggleSortBinding(allocator: Allocator, options: *Options, key_spec: []const u8) !void {
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer keys.deinit(allocator);
+    try appendExpectedKeys(allocator, &keys, key_spec);
+    if (keys.items.len == 0) return error.InvalidBinding;
+    if (keys.items.len != 1) return error.MultipleKeysSpecified;
+    try applyBindingSpec(allocator, &options.bindings, keys.items[0], "toggle-sort");
 }
 
 fn parseScheme(spec: []const u8) !Scheme {
@@ -7931,6 +7950,27 @@ test "multi modes match fzf zero and unlimited semantics" {
     defer negative_compact.deinit(a);
     try std.testing.expect(!negative_compact.multi);
     try std.testing.expect(negative_compact.multi_max == null);
+}
+
+test "legacy toggle-sort option installs one fzf key binding" {
+    const a = std.testing.allocator;
+
+    const args = [_][]const u8{ "zfuzz", "--bind=a:up", "--toggle-sort", "a" };
+    var options = try parseOptions(a, &args);
+    defer options.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), options.bindings.items.len);
+    try std.testing.expectEqualStrings("a", options.bindings.items[0].trigger);
+    try std.testing.expect(options.bindings.items[0].action == .toggle_sort);
+
+    const equals_args = [_][]const u8{ "zfuzz", "--toggle-sort=return" };
+    var equals = try parseOptions(a, &equals_args);
+    defer equals.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), equals.bindings.items.len);
+    try std.testing.expectEqualStrings("return", equals.bindings.items[0].trigger);
+    try std.testing.expect(equals.bindings.items[0].action == .toggle_sort);
+
+    try std.testing.expectError(error.MultipleKeysSpecified, parseOptions(a, &.{ "zfuzz", "--toggle-sort=a,b" }));
+    try std.testing.expectError(error.InvalidBinding, parseOptions(a, &.{ "zfuzz", "--toggle-sort=" }));
 }
 
 test "sort option forms match fzf numeric semantics" {
