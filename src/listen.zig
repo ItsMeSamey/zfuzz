@@ -202,7 +202,10 @@ pub const Server = struct {
             },
             .ip6 => {},
         }
-        const stream = addr.connect(self.io, .{ .mode = .stream, .protocol = .tcp, .timeout = .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } } }) catch return;
+        // The threaded Zig 0.16 network backend does not implement connect
+        // timeouts yet. This is a loopback wake-up against our own still-open
+        // listener, so an untimed connect is local and immediate.
+        const stream = addr.connect(self.io, .{ .mode = .stream, .protocol = .tcp }) catch return;
         stream.close(self.io);
     }
 

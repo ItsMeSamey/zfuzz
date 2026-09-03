@@ -104,6 +104,14 @@ const Action = union(enum) {
     refresh_preview,
     toggle_preview_wrap,
     toggle_wrap,
+    toggle_raw,
+    enable_raw,
+    disable_raw,
+    down_match,
+    up_match,
+    best,
+    exclude,
+    exclude_multi,
     toggle_input,
     show_input,
     hide_input,
@@ -191,6 +199,7 @@ const Options = struct {
     ansi: bool = false,
     cycle: bool = false,
     wrap: bool = false,
+    raw: bool = false,
     select_1: bool = false,
     exit_0: bool = false,
     print_query: bool = false,
@@ -414,6 +423,11 @@ const Terminal = struct {
         var file = try Io.Dir.openFileAbsolute(io, "/dev/tty", .{ .mode = .read_write });
         errdefer file.close(io);
         const original = try std.posix.tcgetattr(file.handle);
+        // Opening /dev/tty can succeed even when this process is in an orphaned
+        // background process group. In that state tcsetattr fails with EIO, so
+        // probe the operation before committing to interactive mode and let the
+        // caller fall back to non-interactive filtering instead.
+        try std.posix.tcsetattr(file.handle, .NOW, original);
         return .{ .file = file, .original = original, .mouse = mouse, .inline_mode = height_percent < 100, .height_percent = height_percent };
     }
 
@@ -767,8 +781,12 @@ const Ui = struct {
     query: std.ArrayList(u8) = .empty,
     cursor: usize = 0,
     results: []usize,
+    match_results: []usize,
     extended_ranks: []ExtendedRank,
     result_len: usize = 0,
+    match_len: usize = 0,
+    match_flags: []bool,
+    best_match_idx: ?usize = null,
     result_cap: usize = 0,
     focus: usize = 0,
     scroll: usize = 0,
@@ -816,10 +834,15 @@ const Ui = struct {
         try query.appendSlice(allocator, options.query);
         const results = try allocator.alloc(usize, candidates.display.len);
         errdefer allocator.free(results);
+        const match_results = try allocator.alloc(usize, candidates.display.len);
+        errdefer allocator.free(match_results);
         const extended_ranks = try allocator.alloc(ExtendedRank, candidates.display.len);
         errdefer allocator.free(extended_ranks);
         const selected = try allocator.alloc(bool, candidates.display.len);
         @memset(selected, false);
+        const match_flags = try allocator.alloc(bool, candidates.display.len);
+        errdefer allocator.free(match_flags);
+        @memset(match_flags, false);
         var history: ?QueryHistory = null;
         if (options.history_file) |path| history = try QueryHistory.init(allocator, io, path, options.history_size, options.query);
         errdefer if (history) |*value| value.deinit();
@@ -844,8 +867,10 @@ const Ui = struct {
             .query = query,
             .cursor = options.query.len,
             .results = results,
+            .match_results = match_results,
             .extended_ranks = extended_ranks,
             .selected = selected,
+            .match_flags = match_flags,
             .timer_last_ms = timer_last_ms,
             .last_activity_ms = now_ms,
         };
@@ -857,8 +882,10 @@ const Ui = struct {
         if (self.pending_track_key) |key| self.allocator.free(key);
         self.query.deinit(self.allocator);
         self.allocator.free(self.results);
+        self.allocator.free(self.match_results);
         self.allocator.free(self.extended_ranks);
         self.allocator.free(self.selected);
+        self.allocator.free(self.match_flags);
         self.selection_order.deinit(self.allocator);
         if (self.preview_text.len != 0) self.allocator.free(self.preview_text);
         if (self.owned_prompt) |value| self.allocator.free(value);
@@ -873,11 +900,12 @@ const Ui = struct {
     fn run(self: *Ui) !u8 {
         try self.refreshSearch(true);
         const input_complete = self.stream == null or self.stream.?.eof;
-        if (input_complete and self.options.select_1 and self.result_len == 1) {
+        if (input_complete and self.options.select_1 and self.match_len == 1) {
+            self.focusCandidate(self.match_results[0]);
             try self.emitSelection(null);
             return 0;
         }
-        if (input_complete and self.options.exit_0 and self.result_len == 0) return 1;
+        if (input_complete and self.options.exit_0 and self.match_len == 0) return 1;
 
         try self.terminal.enter();
         defer self.terminal.leave();
@@ -905,11 +933,12 @@ const Ui = struct {
             }
             if (self.dirty_search) try self.refreshSearch(false);
             if (stream_finished) {
-                if (self.options.select_1 and self.result_len == 1) {
+                if (self.options.select_1 and self.match_len == 1) {
+                    self.focusCandidate(self.match_results[0]);
                     try self.emitSelection(null);
                     return 0;
                 }
-                if (self.options.exit_0 and self.result_len == 0) return 1;
+                if (self.options.exit_0 and self.match_len == 0) return 1;
             }
             if (self.result_event_pending) {
                 self.result_event_pending = false;
@@ -952,13 +981,25 @@ const Ui = struct {
         const base_cap = @min(n, @max(@as(usize, 256), size.rows * 8));
         if (self.result_cap == 0) self.result_cap = base_cap;
         if (force_all_for_auto and (self.options.select_1 or self.options.exit_0)) self.result_cap = n;
-        if (self.options.no_sort or track_key != null) self.result_cap = n;
+        if (self.options.no_sort or track_key != null or self.options.raw) self.result_cap = n;
 
         const effective_query: []const u8 = if (self.options.disabled) "" else self.query.items;
         const old_focus_idx: ?usize = if (self.result_len == 0) null else self.results[self.focus];
-        const found = try searchCandidates(self.index, self.candidates, self.options, effective_query, self.results, self.extended_ranks, self.result_cap);
-        self.result_len = found.len;
-        if (self.options.no_sort) std.mem.sort(usize, self.results[0..self.result_len], {}, comptime std.sort.asc(usize));
+        const found = try searchCandidates(self.index, self.candidates, self.options, effective_query, self.match_results, self.extended_ranks, self.result_cap);
+        self.match_len = found.len;
+        self.best_match_idx = if (found.len == 0) null else found[0];
+        @memset(self.match_flags, false);
+        for (found) |idx| self.match_flags[idx] = true;
+
+        if (self.options.raw) {
+            for (self.results[0..n], 0..) |*slot, idx| slot.* = idx;
+            self.result_len = n;
+        } else {
+            @memcpy(self.results[0..found.len], found);
+            self.result_len = found.len;
+            if (self.options.no_sort) std.mem.sort(usize, self.results[0..self.result_len], {}, comptime std.sort.asc(usize));
+        }
+
         const tracked_pos = if (track_key) |key| try self.findTrackedResult(key) else null;
         if (self.result_len == 0) {
             self.focus = 0;
@@ -974,8 +1015,8 @@ const Ui = struct {
         self.dirty_search = false;
         self.preview_cache_key = null;
         self.result_event_pending = true;
-        self.zero_event_pending = self.result_len == 0;
-        self.one_event_pending = self.result_len == 1;
+        self.zero_event_pending = self.match_len == 0;
+        self.one_event_pending = self.match_len == 1;
         self.result_final_event_pending = self.stream == null or self.stream.?.eof;
         const new_focus_idx: ?usize = if (self.result_len == 0) null else self.results[self.focus];
         if (old_focus_idx != new_focus_idx) self.focus_event_pending = true;
@@ -1389,12 +1430,12 @@ const Ui = struct {
             index: usize,
             text: []const u8,
         };
-        const start = @min(params.offset, self.result_len);
-        const match_count = @min(params.limit, self.result_len - start);
+        const start = @min(params.offset, self.match_len);
+        const match_count = @min(params.limit, self.match_len - start);
         const matches = try self.allocator.alloc(StatusItem, match_count);
         defer self.allocator.free(matches);
         for (matches, 0..) |*item, i| {
-            const idx = self.results[start + i];
+            const idx = self.match_results[start + i];
             item.* = .{ .index = idx, .text = self.candidates.output[idx] };
         }
 
@@ -1435,7 +1476,7 @@ const Ui = struct {
             .position = self.focus,
             .sort = !self.options.no_sort,
             .totalCount = self.candidates.display.len,
-            .matchCount = self.result_len,
+            .matchCount = self.match_len,
             .current = current,
             .matches = matches,
             .selected = selected,
@@ -1474,6 +1515,9 @@ const Ui = struct {
             .down => self.move(1),
             .page_up => self.page(-1),
             .page_down => self.page(1),
+            .up_match => self.moveMatch(-1),
+            .down_match => self.moveMatch(1),
+            .best => self.focusBestMatch(),
             .backward_word => self.cursor = wordBoundaryBackward(self.query.items, self.cursor),
             .forward_word => self.cursor = wordBoundaryForward(self.query.items, self.cursor),
             .backward_kill_word => {
@@ -1576,6 +1620,11 @@ const Ui = struct {
                 self.options.no_sort = !self.options.no_sort;
                 self.dirty_search = true;
             },
+            .toggle_raw => self.setRaw(!self.options.raw),
+            .enable_raw => self.setRaw(true),
+            .disable_raw => self.setRaw(false),
+            .exclude => try self.excludeCurrent(),
+            .exclude_multi => try self.excludeMulti(),
             .enable_search => {
                 if (self.options.disabled) {
                     self.options.disabled = false;
@@ -1705,7 +1754,7 @@ const Ui = struct {
         var select_buf: [32]u8 = undefined;
         var pos_buf: [32]u8 = undefined;
         try env.put("FZF_TOTAL_COUNT", try std.fmt.bufPrint(&total_buf, "{d}", .{self.candidates.display.len}));
-        try env.put("FZF_MATCH_COUNT", try std.fmt.bufPrint(&match_buf, "{d}", .{self.result_len}));
+        try env.put("FZF_MATCH_COUNT", try std.fmt.bufPrint(&match_buf, "{d}", .{self.match_len}));
         try env.put("FZF_SELECT_COUNT", try std.fmt.bufPrint(&select_buf, "{d}", .{self.selected_count}));
         try env.put("FZF_POS", try std.fmt.bufPrint(&pos_buf, "{d}", .{if (self.result_len == 0) @as(usize, 0) else self.focus + 1}));
         const item = self.currentItem();
@@ -1831,11 +1880,16 @@ const Ui = struct {
 
         const new_results = try self.allocator.alloc(usize, new_candidates.display.len);
         errdefer self.allocator.free(new_results);
+        const new_match_results = try self.allocator.alloc(usize, new_candidates.display.len);
+        errdefer self.allocator.free(new_match_results);
         const new_extended_ranks = try self.allocator.alloc(ExtendedRank, new_candidates.display.len);
         errdefer self.allocator.free(new_extended_ranks);
         const new_selected = try self.allocator.alloc(bool, new_candidates.display.len);
         errdefer self.allocator.free(new_selected);
         @memset(new_selected, false);
+        const new_match_flags = try self.allocator.alloc(bool, new_candidates.display.len);
+        errdefer self.allocator.free(new_match_flags);
+        @memset(new_match_flags, false);
 
         var new_order: std.ArrayList(usize) = .empty;
         errdefer new_order.deinit(self.allocator);
@@ -1871,18 +1925,24 @@ const Ui = struct {
         self.index.deinit();
         self.candidates.deinit(self.allocator);
         self.allocator.free(self.results);
+        self.allocator.free(self.match_results);
         self.allocator.free(self.extended_ranks);
         self.allocator.free(self.selected);
+        self.allocator.free(self.match_flags);
         self.selection_order.deinit(self.allocator);
 
         self.candidates.* = new_candidates;
         self.index.* = new_index;
         self.results = new_results;
+        self.match_results = new_match_results;
         self.extended_ranks = new_extended_ranks;
         self.selected = new_selected;
+        self.match_flags = new_match_flags;
         self.selection_order = new_order;
         self.selected_count = self.selection_order.items.len;
         self.result_len = 0;
+        self.match_len = 0;
+        self.best_match_idx = null;
         self.result_cap = 0;
         self.pending_track_key = track_key;
         track_key = null;
@@ -2031,6 +2091,63 @@ const Ui = struct {
         }
     }
 
+    fn focusCandidate(self: *Ui, candidate_idx: usize) void {
+        for (self.results[0..self.result_len], 0..) |idx, pos| {
+            if (idx != candidate_idx) continue;
+            if (self.focus != pos) {
+                self.focus = pos;
+                self.ensureVisible();
+                self.preview_cache_key = null;
+                self.focus_event_pending = true;
+                self.cancelOneShotTracking();
+            }
+            return;
+        }
+    }
+
+    fn moveMatch(self: *Ui, direction: isize) void {
+        if (!self.options.raw) {
+            self.move(direction);
+            return;
+        }
+        if (self.result_len == 0 or self.match_len == 0) return;
+        var pos = self.focus;
+        var scanned: usize = 0;
+        while (scanned < self.result_len) : (scanned += 1) {
+            if (direction < 0) {
+                if (pos == 0) {
+                    if (!self.options.cycle) return;
+                    pos = self.result_len - 1;
+                } else pos -= 1;
+            } else {
+                if (pos + 1 >= self.result_len) {
+                    if (!self.options.cycle) return;
+                    pos = 0;
+                } else pos += 1;
+            }
+            const idx = self.results[pos];
+            if (!self.match_flags[idx]) continue;
+            self.focusCandidate(idx);
+            return;
+        }
+    }
+
+    fn setRaw(self: *Ui, enabled: bool) void {
+        if (self.options.raw == enabled) return;
+        if (!self.options.track) self.track_once = true;
+        self.options.raw = enabled;
+        self.result_cap = 0;
+        self.dirty_search = true;
+    }
+
+    fn focusBestMatch(self: *Ui) void {
+        if (!self.options.raw) {
+            if (self.result_len != 0) self.focusCandidate(self.results[0]);
+            return;
+        }
+        if (self.best_match_idx) |idx| self.focusCandidate(idx);
+    }
+
     fn page(self: *Ui, delta: isize) void {
         const rows = @max(@as(usize, 1), self.visibleListRows());
         self.move(delta * @as(isize, @intCast(rows)));
@@ -2150,6 +2267,101 @@ const Ui = struct {
         }
     }
 
+    fn excludeCandidates(self: *Ui, remove: []const bool) !void {
+        if (remove.len != self.candidates.output.len) return;
+
+        // Keep the live stream alive by removing the corresponding source records.
+        // StreamInput has already applied --tail; --tac only changes the CandidateSet view.
+        if (self.stream) |stream| {
+            const active_len = stream.activeRecords().len;
+            var positions: std.ArrayList(usize) = .empty;
+            defer positions.deinit(self.allocator);
+            for (remove, 0..) |flag, idx| {
+                if (!flag or idx >= active_len) continue;
+                const source_pos = if (self.options.tac) active_len - 1 - idx else idx;
+                try positions.append(self.allocator, source_pos);
+            }
+            std.mem.sort(usize, positions.items, {}, comptime std.sort.desc(usize));
+            for (positions.items) |source_pos| {
+                const absolute = stream.head + source_pos;
+                if (absolute >= stream.records.items.len) continue;
+                const record = stream.records.orderedRemove(absolute);
+                self.allocator.free(record);
+            }
+            try self.refreshFromStream();
+            if (self.dirty_search) try self.refreshSearch(false);
+            return;
+        }
+
+        const delim: u8 = if (self.options.read0) 0 else '\n';
+        var len: usize = 0;
+        for (self.candidates.header) |line| len += line.len + 1;
+        for (self.candidates.output, 0..) |line, idx| {
+            if (!remove[idx]) len += line.len + 1;
+        }
+        const blob = try self.allocator.alloc(u8, len);
+        errdefer self.allocator.free(blob);
+        var at: usize = 0;
+        for (self.candidates.header) |line| {
+            @memcpy(blob[at .. at + line.len], line);
+            at += line.len;
+            blob[at] = delim;
+            at += 1;
+        }
+        for (self.candidates.output, 0..) |line, idx| {
+            if (remove[idx]) continue;
+            @memcpy(blob[at .. at + line.len], line);
+            at += line.len;
+            blob[at] = delim;
+            at += 1;
+        }
+
+        // output[] is already in the current visible input order, so do not apply
+        // --tac or --tail a second time when rebuilding the active revision.
+        var parse_options = self.options.*;
+        parse_options.tac = false;
+        parse_options.tail = null;
+        parse_options.header_lines = self.candidates.header.len;
+        var new_candidates = try candidatesFromOwnedBlob(self.allocator, blob, &parse_options);
+        errdefer new_candidates.deinit(self.allocator);
+        var new_index = try fuzzy.init(self.allocator, new_candidates.search);
+        errdefer new_index.deinit();
+        try self.replaceCandidates(new_candidates, new_index, false);
+        if (self.dirty_search) try self.refreshSearch(false);
+    }
+
+    fn excludeCurrent(self: *Ui) !void {
+        if (self.result_len == 0) return;
+        const idx = self.results[self.focus];
+        var remove = try self.allocator.alloc(bool, self.candidates.output.len);
+        defer self.allocator.free(remove);
+        @memset(remove, false);
+        remove[idx] = true;
+        if (self.selected[idx]) {
+            self.selected[idx] = false;
+            self.selected_count -|= 1;
+        }
+        try self.excludeCandidates(remove);
+    }
+
+    fn excludeMulti(self: *Ui) !void {
+        if (self.result_len == 0 and self.selected_count == 0) return;
+        var remove = try self.allocator.alloc(bool, self.candidates.output.len);
+        defer self.allocator.free(remove);
+        @memset(remove, false);
+        if (self.selected_count != 0) {
+            for (self.selection_order.items) |idx| {
+                if (idx < self.selected.len and self.selected[idx]) remove[idx] = true;
+            }
+            @memset(self.selected, false);
+            self.selection_order.clearRetainingCapacity();
+            self.selected_count = 0;
+        } else if (self.result_len != 0) {
+            remove[self.results[self.focus]] = true;
+        }
+        try self.excludeCandidates(remove);
+    }
+
     fn deleteWordBackward(self: *Ui) void {
         if (self.cursor == 0) return;
         var p = self.cursor;
@@ -2259,12 +2471,12 @@ const Ui = struct {
     }
 
     fn statusText(self: *Ui) ![]u8 {
-        if (self.result_len == self.result_cap and self.result_cap < self.candidates.display.len) {
-            if (self.options.multi) return try std.fmt.allocPrint(self.allocator, "{d}+/{d} ({d})", .{ self.result_len, self.candidates.display.len, self.selected_count });
-            return try std.fmt.allocPrint(self.allocator, "{d}+/{d}", .{ self.result_len, self.candidates.display.len });
+        if (self.match_len == self.result_cap and self.result_cap < self.candidates.display.len) {
+            if (self.options.multi) return try std.fmt.allocPrint(self.allocator, "{d}+/{d} ({d})", .{ self.match_len, self.candidates.display.len, self.selected_count });
+            return try std.fmt.allocPrint(self.allocator, "{d}+/{d}", .{ self.match_len, self.candidates.display.len });
         }
-        if (self.options.multi) return try std.fmt.allocPrint(self.allocator, "{d}/{d} ({d})", .{ self.result_len, self.candidates.display.len, self.selected_count });
-        return try std.fmt.allocPrint(self.allocator, "{d}/{d}", .{ self.result_len, self.candidates.display.len });
+        if (self.options.multi) return try std.fmt.allocPrint(self.allocator, "{d}/{d} ({d})", .{ self.match_len, self.candidates.display.len, self.selected_count });
+        return try std.fmt.allocPrint(self.allocator, "{d}/{d}", .{ self.match_len, self.candidates.display.len });
     }
 
     fn renderInfo(self: *Ui, w: anytype, row: usize, col: usize, cols: usize) !void {
@@ -2348,7 +2560,9 @@ const Ui = struct {
             const idx = self.results[logical];
             const focused = logical == self.focus;
             const marked = self.selected[idx];
+            const dimmed = self.options.raw and !self.match_flags[idx];
             try writeRoleStyle(w, if (focused) self.options.theme.current else self.options.theme.normal, self.options.theme.enabled, self.options.bold);
+            if (dimmed and self.options.theme.enabled) try w.writeAll("\x1b[2m");
             if (focused) {
                 try writeRoleStyleOverlay(w, self.options.theme.pointer, self.options.theme.enabled, self.options.bold);
                 try w.writeAll(self.options.pointer);
@@ -2361,7 +2575,8 @@ const Ui = struct {
                 try writeRoleStyle(w, if (focused) self.options.theme.current else self.options.theme.normal, self.options.theme.enabled, self.options.bold);
             } else try w.writeAll(" ");
             try w.writeAll(" ");
-            try writeHighlighted(w, self.candidates.display[idx], self.query.items, if (content.cols > 4) content.cols - 4 else content.cols, self.options.wrap, self.options.ansi, &self.options.theme, focused, self.options.bold);
+            if (dimmed and self.options.theme.enabled) try w.writeAll("\x1b[2m");
+            try writeHighlighted(w, self.candidates.display[idx], if (dimmed) "" else self.query.items, if (content.cols > 4) content.cols - 4 else content.cols, self.options.wrap, self.options.ansi, &self.options.theme, focused, self.options.bold);
             try writeReset(w);
         }
         return start_row + rows;
@@ -3058,6 +3273,14 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.wrap = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "--raw")) {
+            o.*.raw = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-raw")) {
+            o.*.raw = false;
+            continue;
+        }
         if (std.mem.eql(u8, a, "--select-1") or std.mem.eql(u8, a, "-1")) {
             o.*.select_1 = true;
             continue;
@@ -3648,6 +3871,14 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "refresh-preview")) return .refresh_preview;
     if (std.mem.eql(u8, s, "toggle-preview-wrap")) return .toggle_preview_wrap;
     if (std.mem.eql(u8, s, "toggle-wrap")) return .toggle_wrap;
+    if (std.mem.eql(u8, s, "toggle-raw")) return .toggle_raw;
+    if (std.mem.eql(u8, s, "enable-raw")) return .enable_raw;
+    if (std.mem.eql(u8, s, "disable-raw")) return .disable_raw;
+    if (std.mem.eql(u8, s, "down-match")) return .down_match;
+    if (std.mem.eql(u8, s, "up-match")) return .up_match;
+    if (std.mem.eql(u8, s, "best")) return .best;
+    if (std.mem.eql(u8, s, "exclude")) return .exclude;
+    if (std.mem.eql(u8, s, "exclude-multi")) return .exclude_multi;
     if (std.mem.eql(u8, s, "toggle-input")) return .toggle_input;
     if (std.mem.eql(u8, s, "show-input")) return .show_input;
     if (std.mem.eql(u8, s, "hide-input")) return .hide_input;
@@ -4966,6 +5197,7 @@ const usage =
     \\  -1, --select-1           accept when there is exactly one match
     \\  -0, --exit-0             exit immediately when there is no match
     \\      --no-sort            preserve input order after filtering
+    \\      --raw                show non-matching items dimmed alongside matches
     \\      --tiebreak=CRI       score tie-breaks: length/chunk/pathname/begin/end/index
     \\      --scheme=SCHEME      ranking scheme: default/path/history
     \\      --tail=N             keep only the last N input items in memory
@@ -4986,6 +5218,7 @@ const usage =
     \\      --print-query        print query before selection
     \\      --expect=KEYS        print accepted key field
     \\      --bind=SPEC          key/event actions: reload/execute/become/toggle...
+    \\                           includes raw/match navigation and exclusion actions
     \\      --ansi               ignore ANSI CSI sequences while matching
     \\      --tac                reverse input order
     \\
@@ -5237,6 +5470,17 @@ test "reload actions distinguish async and sync variants" {
     try std.testing.expect(std.mem.eql(u8, asynchronous.reload, "echo async"));
     const synchronous = try parseAction("reload-sync(echo sync)");
     try std.testing.expect(std.mem.eql(u8, synchronous.reload_sync, "echo sync"));
+}
+
+test "raw and exclusion actions parse" {
+    try std.testing.expect((try parseAction("toggle-raw")) == .toggle_raw);
+    try std.testing.expect((try parseAction("enable-raw")) == .enable_raw);
+    try std.testing.expect((try parseAction("disable-raw")) == .disable_raw);
+    try std.testing.expect((try parseAction("down-match")) == .down_match);
+    try std.testing.expect((try parseAction("up-match")) == .up_match);
+    try std.testing.expect((try parseAction("best")) == .best);
+    try std.testing.expect((try parseAction("exclude")) == .exclude);
+    try std.testing.expect((try parseAction("exclude-multi")) == .exclude_multi);
 }
 
 test "background transform actions parse command payloads" {
