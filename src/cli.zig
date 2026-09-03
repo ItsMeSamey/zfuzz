@@ -4834,6 +4834,17 @@ fn actionNameEnd(text: []const u8, start: usize) usize {
     return i;
 }
 
+fn replaceSameLength(bytes: []u8, needle: []const u8, replacement: []const u8) void {
+    std.debug.assert(needle.len == replacement.len and needle.len != 0);
+    var i: usize = 0;
+    while (i + needle.len <= bytes.len) {
+        if (std.mem.eql(u8, bytes[i .. i + needle.len], needle)) {
+            @memcpy(bytes[i .. i + replacement.len], replacement);
+            i += needle.len;
+        } else i += 1;
+    }
+}
+
 fn maskActionContents(allocator: Allocator, text: []const u8) ![]u8 {
     const masked = try allocator.dupe(u8, text);
     var search: usize = 0;
@@ -4876,6 +4887,11 @@ fn maskActionContents(allocator: Allocator, text: []const u8) ![]u8 {
         @memset(masked[name_end .. finish + 1], ' ');
         search = finish + 1;
     }
+    replaceSameLength(masked, ",,,", &.{ ',', 1, ',' });
+    replaceSameLength(masked, ",:,", &.{ ',', 0, ',' });
+    replaceSameLength(masked, "::", &.{ 0, ':' });
+    replaceSameLength(masked, ",:", &.{ 1, ':' });
+    replaceSameLength(masked, "+:", &.{ 2, ':' });
     return masked;
 }
 
@@ -7993,6 +8009,29 @@ test "colon action argument consumes remaining binding text" {
     try parseBindings(a, &bindings, "x:execute:printf a+b,y:accept");
     try std.testing.expectEqual(@as(usize, 1), bindings.items.len);
     try std.testing.expectEqualStrings("printf a+b,y:accept", bindings.items[0].action.execute);
+}
+
+test "binding parser accepts comma colon and plus keys" {
+    const a = std.testing.allocator;
+    var bindings: std.ArrayList(Binding) = .empty;
+    defer bindings.deinit(a);
+
+    try parseBindings(a, &bindings, "a:up,,:abort,::accept,+:clear-query");
+    try std.testing.expectEqual(@as(usize, 4), bindings.items.len);
+    try std.testing.expectEqualStrings("a", bindings.items[0].trigger);
+    try std.testing.expectEqualStrings(",", bindings.items[1].trigger);
+    try std.testing.expect(bindings.items[1].action == .abort);
+    try std.testing.expectEqualStrings(":", bindings.items[2].trigger);
+    try std.testing.expect(bindings.items[2].action == .accept);
+    try std.testing.expectEqualStrings("+", bindings.items[3].trigger);
+    try std.testing.expect(bindings.items[3].action == .clear_query);
+
+    var leading_comma: std.ArrayList(Binding) = .empty;
+    defer leading_comma.deinit(a);
+    try parseBindings(a, &leading_comma, ",:last");
+    try std.testing.expectEqual(@as(usize, 1), leading_comma.items.len);
+    try std.testing.expectEqualStrings(",", leading_comma.items[0].trigger);
+    try std.testing.expect(leading_comma.items[0].action == .last);
 }
 
 test "reload actions distinguish async and sync variants" {
