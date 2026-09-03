@@ -79,6 +79,7 @@ const PreviewOptions = struct {
 };
 
 const Action = union(enum) {
+    ignore,
     up,
     down,
     page_up,
@@ -95,6 +96,10 @@ const Action = union(enum) {
     forward_word,
     backward_kill_word,
     kill_word,
+    kill_line,
+    unix_line_discard,
+    yank,
+    cancel,
     first,
     last,
     toggle,
@@ -866,6 +871,7 @@ const Ui = struct {
     track_once: bool = false,
     pending_track_key: ?[]u8 = null,
     query: std.ArrayList(u8) = .empty,
+    yanked: std.ArrayList(u8) = .empty,
     cursor: usize = 0,
     results: []usize,
     match_results: []usize,
@@ -981,6 +987,7 @@ const Ui = struct {
         if (self.history) |*history| history.deinit();
         if (self.pending_track_key) |key| self.allocator.free(key);
         self.query.deinit(self.allocator);
+        self.yanked.deinit(self.allocator);
         self.allocator.free(self.results);
         self.allocator.free(self.match_results);
         self.allocator.free(self.extended_ranks);
@@ -1309,15 +1316,9 @@ const Ui = struct {
                 11 => self.move(-1),
                 16 => if (self.history != null) try self.navigateHistory(-1) else self.move(-1),
                 14 => if (self.history != null) try self.navigateHistory(1) else self.move(1),
-                21 => {
-                    self.query.clearRetainingCapacity();
-                    self.cursor = 0;
-                    self.markQueryChanged();
-                },
-                23 => {
-                    self.deleteWordBackward();
-                    self.markQueryChanged();
-                },
+                21 => _ = try self.unixLineDiscard(),
+                23 => _ = try self.killWordBackward(),
+                25 => _ = try self.yankQuery(),
                 12 => {},
                 else => {
                     if (b >= 32) {
@@ -1643,6 +1644,7 @@ const Ui = struct {
 
     fn runAction(self: *Ui, action: Action, binding_slot: ?usize) anyerror!?u8 {
         switch (action) {
+            .ignore => {},
             .up => self.move(-1),
             .down => self.move(1),
             .page_up => self.page(-1),
@@ -1663,16 +1665,17 @@ const Ui = struct {
             .best => self.focusBestMatch(),
             .backward_word => self.cursor = wordBoundaryBackward(self.query.items, self.cursor),
             .forward_word => self.cursor = wordBoundaryForward(self.query.items, self.cursor),
-            .backward_kill_word => {
-                self.deleteWordBackward();
+            .backward_kill_word => _ = try self.killWordBackward(),
+            .kill_word => _ = try self.killWordForward(),
+            .kill_line => _ = try self.killLine(),
+            .unix_line_discard => _ = try self.unixLineDiscard(),
+            .yank => _ = try self.yankQuery(),
+            .cancel => {
+                if (self.query.items.len == 0) return 130;
+                try self.setYanked(self.query.items);
+                self.query.clearRetainingCapacity();
+                self.cursor = 0;
                 self.markQueryChanged();
-            },
-            .kill_word => {
-                const end = wordBoundaryForward(self.query.items, self.cursor);
-                if (end != self.cursor) {
-                    try self.query.replaceRange(self.allocator, self.cursor, end - self.cursor, &.{});
-                    self.markQueryChanged();
-                }
             },
             .first => if (self.result_len != 0) {
                 if (self.focus != 0) {
@@ -2761,13 +2764,54 @@ const Ui = struct {
         return true;
     }
 
-    fn deleteWordBackward(self: *Ui) void {
-        if (self.cursor == 0) return;
-        var p = self.cursor;
-        while (p > 0 and std.ascii.isWhitespace(self.query.items[p - 1])) p -= 1;
-        while (p > 0 and !std.ascii.isWhitespace(self.query.items[p - 1])) p -= 1;
-        self.query.replaceRange(self.allocator, p, self.cursor - p, &.{}) catch return;
-        self.cursor = p;
+    fn setYanked(self: *Ui, text: []const u8) !void {
+        self.yanked.clearRetainingCapacity();
+        try self.yanked.appendSlice(self.allocator, text);
+    }
+
+    fn killWordBackward(self: *Ui) !bool {
+        if (self.cursor == 0) return false;
+        const begin = wordBoundaryBackward(self.query.items, self.cursor);
+        if (begin == self.cursor) return false;
+        try self.setYanked(self.query.items[begin..self.cursor]);
+        try self.query.replaceRange(self.allocator, begin, self.cursor - begin, &.{});
+        self.cursor = begin;
+        self.markQueryChanged();
+        return true;
+    }
+
+    fn killWordForward(self: *Ui) !bool {
+        const end = wordBoundaryForward(self.query.items, self.cursor);
+        if (end == self.cursor) return false;
+        try self.setYanked(self.query.items[self.cursor..end]);
+        try self.query.replaceRange(self.allocator, self.cursor, end - self.cursor, &.{});
+        self.markQueryChanged();
+        return true;
+    }
+
+    fn killLine(self: *Ui) !bool {
+        if (self.cursor >= self.query.items.len) return false;
+        try self.setYanked(self.query.items[self.cursor..]);
+        self.query.shrinkRetainingCapacity(self.cursor);
+        self.markQueryChanged();
+        return true;
+    }
+
+    fn unixLineDiscard(self: *Ui) !bool {
+        if (self.cursor == 0) return false;
+        try self.setYanked(self.query.items[0..self.cursor]);
+        try self.query.replaceRange(self.allocator, 0, self.cursor, &.{});
+        self.cursor = 0;
+        self.markQueryChanged();
+        return true;
+    }
+
+    fn yankQuery(self: *Ui) !bool {
+        if (self.yanked.items.len == 0) return false;
+        try self.query.insertSlice(self.allocator, self.cursor, self.yanked.items);
+        self.cursor += self.yanked.items.len;
+        self.markQueryChanged();
+        return true;
     }
 
     fn emitSelection(self: *Ui, expect_key: ?[]const u8) !void {
@@ -4256,6 +4300,7 @@ fn validateActionSequence(text: []const u8) bool {
 }
 
 fn parseAction(s: []const u8) !Action {
+    if (std.mem.eql(u8, s, "ignore")) return .ignore;
     if (std.mem.eql(u8, s, "up")) return .up;
     if (std.mem.eql(u8, s, "down")) return .down;
     if (std.mem.eql(u8, s, "page-up")) return .page_up;
@@ -4272,6 +4317,11 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "forward-word")) return .forward_word;
     if (std.mem.eql(u8, s, "backward-kill-word")) return .backward_kill_word;
     if (std.mem.eql(u8, s, "kill-word")) return .kill_word;
+    if (std.mem.eql(u8, s, "kill-line")) return .kill_line;
+    if (std.mem.eql(u8, s, "unix-line-discard") or std.mem.eql(u8, s, "line-discard")) return .unix_line_discard;
+    if (std.mem.eql(u8, s, "unix-word-rubout") or std.mem.eql(u8, s, "word-rubout")) return .backward_kill_word;
+    if (std.mem.eql(u8, s, "yank")) return .yank;
+    if (std.mem.eql(u8, s, "cancel")) return .cancel;
     if (std.mem.eql(u8, s, "first")) return .first;
     if (std.mem.eql(u8, s, "last")) return .last;
     if (std.mem.eql(u8, s, "toggle")) return .toggle;
@@ -4284,6 +4334,7 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "toggle-all")) return .toggle_all;
     if (std.mem.eql(u8, s, "select-all")) return .select_all;
     if (std.mem.eql(u8, s, "deselect-all")) return .deselect_all;
+    if (std.mem.eql(u8, s, "clear-selection") or std.mem.eql(u8, s, "clear-multi")) return .deselect_all;
     if (std.mem.eql(u8, s, "clear-query")) return .clear_query;
     if (std.mem.eql(u8, s, "accept")) return .accept;
     if (std.mem.eql(u8, s, "abort")) return .abort;
@@ -6661,6 +6712,16 @@ test "stateful binding actions parse" {
     try std.testing.expect((try parseAction("backward-delete-char/eof")) == .backward_delete_char_eof);
     try std.testing.expect((try parseAction("delete-char")) == .delete_char);
     try std.testing.expect((try parseAction("delete-char/eof")) == .delete_char_eof);
+    try std.testing.expect((try parseAction("ignore")) == .ignore);
+    try std.testing.expect((try parseAction("kill-line")) == .kill_line);
+    try std.testing.expect((try parseAction("unix-line-discard")) == .unix_line_discard);
+    try std.testing.expect((try parseAction("line-discard")) == .unix_line_discard);
+    try std.testing.expect((try parseAction("unix-word-rubout")) == .backward_kill_word);
+    try std.testing.expect((try parseAction("word-rubout")) == .backward_kill_word);
+    try std.testing.expect((try parseAction("yank")) == .yank);
+    try std.testing.expect((try parseAction("cancel")) == .cancel);
+    try std.testing.expect((try parseAction("clear-selection")) == .deselect_all);
+    try std.testing.expect((try parseAction("clear-multi")) == .deselect_all);
     const printed = try parseAction("print(ctrl-y)");
     try std.testing.expectEqualStrings("ctrl-y", printed.print);
 
