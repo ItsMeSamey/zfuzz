@@ -4387,12 +4387,30 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.prompt = a[9..];
             continue;
         }
+        if (std.mem.eql(u8, a, "--prompt")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.prompt = args[i];
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--pointer=")) {
             o.*.pointer = a[10..];
             continue;
         }
+        if (std.mem.eql(u8, a, "--pointer")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.pointer = args[i];
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--marker=")) {
             o.*.marker = a[9..];
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--marker")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.marker = args[i];
             continue;
         }
         if (std.mem.startsWith(u8, a, "--header=")) {
@@ -7296,6 +7314,16 @@ test "scroll-off option uses fzf source default and accepts overrides" {
     var separate_options = try parseOptions(a, &separate_args);
     defer separate_options.deinit(a);
     try std.testing.expectEqual(@as(usize, 7), separate_options.scroll_off);
+}
+
+test "prompt pointer and marker accept separate arguments" {
+    const a = std.testing.allocator;
+    const args = [_][]const u8{ "zfuzz", "--prompt", "pick> ", "--pointer", ">>", "--marker", "**" };
+    var options = try parseOptions(a, &args);
+    defer options.deinit(a);
+    try std.testing.expectEqualStrings("pick> ", options.prompt);
+    try std.testing.expectEqualStrings(">>", options.pointer);
+    try std.testing.expectEqualStrings("**", options.marker);
 }
 
 test "preview and label reset options are last-one-wins" {
