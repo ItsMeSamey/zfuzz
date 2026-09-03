@@ -1895,6 +1895,9 @@ const Ui = struct {
             current_idx,
             self.selection_order.items,
             self.selected,
+            self.results[0..self.result_len],
+            self.last_action,
+            self.options.prompt,
             self.io,
             &temp_files,
         );
@@ -5221,8 +5224,146 @@ fn expandCommand(
     current_idx: ?usize,
     selection_order: []const usize,
     selected: []const bool,
+    matched: []const usize,
 ) ![]u8 {
-    return expandCommandImpl(allocator, template, query, candidates, options, current_idx, selection_order, selected, null, null);
+    return expandCommandImpl(allocator, template, query, candidates, options, current_idx, selection_order, selected, matched, "", options.prompt, null, null);
+}
+
+const PlaceholderFlags = struct {
+    plus: bool = false,
+    asterisk: bool = false,
+    preserve_space: bool = false,
+    file: bool = false,
+    raw: bool = false,
+    number: bool = false,
+};
+
+const PlaceholderKind = enum {
+    item,
+    fields,
+    query,
+    query_fields,
+    fzf_query,
+    fzf_action,
+    fzf_prompt,
+};
+
+const PlaceholderSpec = struct {
+    kind: PlaceholderKind,
+    flags: PlaceholderFlags = .{},
+    fields: []const u8 = "",
+};
+
+fn parsePlaceholderExpr(expr: []const u8) ?PlaceholderSpec {
+    if (std.mem.eql(u8, expr, "q")) return .{ .kind = .query };
+    if (std.mem.startsWith(u8, expr, "q:")) {
+        var body = expr[2..];
+        var preserve_space = false;
+        if (body.len != 0 and body[0] == 's') {
+            preserve_space = true;
+            body = body[1..];
+        }
+        if (body.len == 0 or !isPlaceholderFieldSyntax(body) or !placeholderRangesValid(body)) return null;
+        return .{ .kind = .query_fields, .flags = .{ .preserve_space = preserve_space }, .fields = body };
+    }
+    if (std.mem.eql(u8, expr, "fzf:query")) return .{ .kind = .fzf_query };
+    if (std.mem.eql(u8, expr, "fzf:action")) return .{ .kind = .fzf_action };
+    if (std.mem.eql(u8, expr, "fzf:prompt")) return .{ .kind = .fzf_prompt };
+
+    // Item-number placeholders are the one form that allows `f` on either
+    // side of `n`: {n}, {fn}, {nf}, {+nf}, {*fn}, ...
+    var number_flags: PlaceholderFlags = .{};
+    var number_pos: usize = 0;
+    if (number_pos < expr.len and (expr[number_pos] == '+' or expr[number_pos] == '*')) {
+        if (expr[number_pos] == '+') number_flags.plus = true else number_flags.asterisk = true;
+        number_pos += 1;
+    }
+    if (number_pos < expr.len and expr[number_pos] == 'f') {
+        number_flags.file = true;
+        number_pos += 1;
+    }
+    if (number_pos < expr.len and expr[number_pos] == 'n') {
+        number_flags.number = true;
+        number_pos += 1;
+        if (number_pos < expr.len and expr[number_pos] == 'f') {
+            number_flags.file = true;
+            number_pos += 1;
+        }
+        if (number_pos == expr.len) return .{ .kind = .item, .flags = number_flags };
+    }
+
+    // fzf's token-placeholder regexp accepts an arbitrary sequence of the
+    // +, *, s, f, r flags followed by a (possibly empty) field expression.
+    var flags: PlaceholderFlags = .{};
+    var pos: usize = 0;
+    while (pos < expr.len) : (pos += 1) {
+        switch (expr[pos]) {
+            '+' => flags.plus = true,
+            '*' => flags.asterisk = true,
+            's' => flags.preserve_space = true,
+            'f' => flags.file = true,
+            'r' => flags.raw = true,
+            else => break,
+        }
+    }
+    const fields = expr[pos..];
+    if (!isPlaceholderFieldSyntax(fields) or (fields.len != 0 and !placeholderRangesValid(fields))) return null;
+    return .{ .kind = if (fields.len == 0) .item else .fields, .flags = flags, .fields = fields };
+}
+
+fn isPlaceholderFieldSyntax(expr: []const u8) bool {
+    for (expr) |c| switch (c) {
+        '0'...'9', '-', '.', ',' => {},
+        else => return false,
+    };
+    return true;
+}
+
+const PlaceholderRange = struct {
+    begin: isize,
+    end: isize,
+};
+
+fn placeholderRange(begin_value: isize, end_value: isize) PlaceholderRange {
+    var begin = begin_value;
+    var end = end_value;
+    if (begin == 1 and end != 1) begin = 0;
+    if (end == -1) end = 0;
+    return .{ .begin = begin, .end = end };
+}
+
+fn parsePlaceholderRange(text: []const u8) ?PlaceholderRange {
+    if (std.mem.eql(u8, text, "..")) return placeholderRange(0, 0);
+    if (std.mem.startsWith(u8, text, "..")) {
+        const end = std.fmt.parseInt(isize, text[2..], 10) catch return null;
+        if (end == 0) return null;
+        return placeholderRange(0, end);
+    }
+    if (std.mem.endsWith(u8, text, "..")) {
+        const begin = std.fmt.parseInt(isize, text[0 .. text.len - 2], 10) catch return null;
+        if (begin == 0) return null;
+        return placeholderRange(begin, 0);
+    }
+    if (std.mem.indexOf(u8, text, "..")) |dots| {
+        if (std.mem.indexOfPos(u8, text, dots + 2, "..") != null) return null;
+        const begin = std.fmt.parseInt(isize, text[0..dots], 10) catch return null;
+        const end = std.fmt.parseInt(isize, text[dots + 2 ..], 10) catch return null;
+        if (begin == 0 or end == 0 or (begin < 0 and end > 0)) return null;
+        return placeholderRange(begin, end);
+    }
+    const one = std.fmt.parseInt(isize, text, 10) catch return null;
+    if (one == 0) return null;
+    return placeholderRange(one, one);
+}
+
+fn placeholderRangesValid(spec: []const u8) bool {
+    var terms = std.mem.splitScalar(u8, spec, ',');
+    var count: usize = 0;
+    while (terms.next()) |term| {
+        if (term.len == 0 or parsePlaceholderRange(term) == null) return false;
+        count += 1;
+    }
+    return count != 0;
 }
 
 fn expandCommandImpl(
@@ -5234,6 +5375,9 @@ fn expandCommandImpl(
     current_idx: ?usize,
     selection_order: []const usize,
     selected: []const bool,
+    matched: []const usize,
+    action: []const u8,
+    prompt: []const u8,
     io: ?Io,
     temp_files: ?*std.ArrayList([]u8),
 ) ![]u8 {
@@ -5241,6 +5385,16 @@ fn expandCommandImpl(
     errdefer out.deinit(allocator);
     var i: usize = 0;
     while (i < template.len) {
+        if (template[i] == '\\' and i + 1 < template.len and template[i + 1] == '{') {
+            if (std.mem.indexOfScalarPos(u8, template, i + 2, '}')) |close| {
+                const expr = template[i + 2 .. close];
+                if (parsePlaceholderExpr(expr) != null) {
+                    try out.appendSlice(allocator, template[i + 1 .. close + 1]);
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
         if (template[i] != '{') {
             try out.append(allocator, template[i]);
             i += 1;
@@ -5252,29 +5406,29 @@ fn expandCommandImpl(
             continue;
         };
         const expr = template[i + 1 .. close];
-        if (std.mem.eql(u8, expr, "q")) {
-            try appendShellQuoted(allocator, &out, query);
-        } else {
-            const plus = expr.len != 0 and expr[0] == '+';
-            var body = if (plus) expr[1..] else expr;
-            const file = body.len != 0 and body[0] == 'f';
-            if (file) body = body[1..];
-
-            if (file) {
-                const actual_io = io orelse return error.FilePlaceholderUnavailable;
-                const files = temp_files orelse return error.FilePlaceholderUnavailable;
-                try appendFilePlaceholder(allocator, &out, actual_io, files, body, plus, candidates, options, current_idx, selection_order, selected);
-            } else if (plus) {
-                try appendSelectedPlaceholder(allocator, &out, body, candidates, options, current_idx, selection_order, selected);
-            } else if (body.len == 0) {
-                if (current_idx) |idx| try appendShellQuoted(allocator, &out, candidates.output[idx]);
-            } else if (std.mem.eql(u8, body, "n")) {
-                if (current_idx) |idx| try appendDecimal(allocator, &out, idx);
-            } else if (current_idx) |idx| {
-                const transformed = try transformFields(allocator, candidates.output[idx], options.delimiter, body, idx);
+        const spec = parsePlaceholderExpr(expr) orelse {
+            try out.appendSlice(allocator, template[i .. close + 1]);
+            i = close + 1;
+            continue;
+        };
+        switch (spec.kind) {
+            .query, .fzf_query => try appendShellQuoted(allocator, &out, query),
+            .fzf_action => try appendShellQuoted(allocator, &out, action),
+            .fzf_prompt => try appendShellQuoted(allocator, &out, prompt),
+            .query_fields => {
+                const transformed = try transformPlaceholderFields(allocator, query, null, spec.fields, spec.flags.preserve_space);
                 defer allocator.free(transformed);
                 try appendShellQuoted(allocator, &out, transformed);
-            }
+            },
+            .item, .fields => {
+                if (spec.flags.file) {
+                    const actual_io = io orelse return error.FilePlaceholderUnavailable;
+                    const files = temp_files orelse return error.FilePlaceholderUnavailable;
+                    try appendFilePlaceholder(allocator, &out, actual_io, files, spec, candidates, options, current_idx, selection_order, selected, matched);
+                } else {
+                    try appendItemPlaceholder(allocator, &out, spec, candidates, options, current_idx, selection_order, selected, matched);
+                }
+            },
         }
         i = close + 1;
     }
@@ -5288,13 +5442,13 @@ fn appendFilePlaceholder(
     out: *std.ArrayList(u8),
     io: Io,
     temp_files: *std.ArrayList([]u8),
-    expr: []const u8,
-    plus: bool,
+    spec: PlaceholderSpec,
     candidates: *const CandidateSet,
     options: *const Options,
     current_idx: ?usize,
     selection_order: []const usize,
     selected: []const bool,
+    matched: []const usize,
 ) !void {
     var path: ?[]u8 = null;
     var file: ?Io.File = null;
@@ -5329,16 +5483,23 @@ fn appendFilePlaceholder(
     const sep: []const u8 = if (options.print0) "\x00" else "\n";
     var wrote = false;
 
-    if (plus) {
+    if (spec.flags.asterisk) {
+        for (matched) |idx_value| {
+            if (idx_value >= candidates.output.len) continue;
+            try writePlaceholderValue(allocator, &writer.interface, spec, candidates, options, idx_value);
+            try writer.interface.writeAll(sep);
+            wrote = true;
+        }
+    } else if (spec.flags.plus) {
         for (selection_order) |idx_value| {
             if (idx_value >= selected.len or !selected[idx_value]) continue;
-            try writePlaceholderValue(allocator, &writer.interface, expr, candidates, options, idx_value);
+            try writePlaceholderValue(allocator, &writer.interface, spec, candidates, options, idx_value);
             try writer.interface.writeAll(sep);
             wrote = true;
         }
     }
-    if (!wrote) if (current_idx) |idx_value| {
-        try writePlaceholderValue(allocator, &writer.interface, expr, candidates, options, idx_value);
+    if (!wrote and !spec.flags.asterisk) if (current_idx) |idx_value| {
+        try writePlaceholderValue(allocator, &writer.interface, spec, candidates, options, idx_value);
         try writer.interface.writeAll(sep);
     };
     try writer.flush();
@@ -5353,56 +5514,198 @@ fn appendFilePlaceholder(
 fn writePlaceholderValue(
     allocator: Allocator,
     writer: *Io.Writer,
-    expr: []const u8,
+    spec: PlaceholderSpec,
     candidates: *const CandidateSet,
     options: *const Options,
     idx: usize,
 ) !void {
-    if (expr.len == 0) return writer.writeAll(candidates.output[idx]);
-    if (std.mem.eql(u8, expr, "n")) {
+    if (spec.flags.number) {
         var buf: [32]u8 = undefined;
         return writer.writeAll(try std.fmt.bufPrint(&buf, "{d}", .{idx}));
     }
-    const transformed = try transformFields(allocator, candidates.output[idx], options.delimiter, expr, idx);
+    var source = candidates.output[idx];
+    var stripped: ?[]const u8 = null;
+    defer if (stripped) |owned| allocator.free(owned);
+    if (options.ansi) {
+        const owned = try stripAnsi(allocator, source);
+        stripped = owned;
+        source = owned;
+    }
+    if (spec.kind == .item) return writer.writeAll(source);
+    const transformed = try transformPlaceholderFields(allocator, source, options.delimiter, spec.fields, spec.flags.preserve_space);
     defer allocator.free(transformed);
     try writer.writeAll(transformed);
 }
 
-fn appendSelectedPlaceholder(
+fn appendItemPlaceholder(
     allocator: Allocator,
     out: *std.ArrayList(u8),
-    expr: []const u8,
+    spec: PlaceholderSpec,
     candidates: *const CandidateSet,
     options: *const Options,
     current_idx: ?usize,
     selection_order: []const usize,
     selected: []const bool,
+    matched: []const usize,
 ) !void {
     var wrote = false;
-    for (selection_order) |idx| {
-        if (idx >= selected.len or !selected[idx]) continue;
-        if (wrote) try out.append(allocator, ' ');
-        if (expr.len == 0) {
-            try appendShellQuoted(allocator, out, candidates.output[idx]);
-        } else if (std.mem.eql(u8, expr, "n")) {
-            try appendDecimal(allocator, out, idx);
-        } else {
-            const transformed = try transformFields(allocator, candidates.output[idx], options.delimiter, expr, idx);
-            defer allocator.free(transformed);
-            try appendShellQuoted(allocator, out, transformed);
+    if (spec.flags.asterisk) {
+        for (matched) |idx| {
+            if (idx >= candidates.output.len) continue;
+            if (wrote) try out.append(allocator, ' ');
+            try appendPlaceholderValue(allocator, out, spec, candidates, options, idx);
+            wrote = true;
         }
-        wrote = true;
+        return;
+    }
+    if (spec.flags.plus) {
+        for (selection_order) |idx| {
+            if (idx >= selected.len or !selected[idx]) continue;
+            if (wrote) try out.append(allocator, ' ');
+            try appendPlaceholderValue(allocator, out, spec, candidates, options, idx);
+            wrote = true;
+        }
     }
     if (wrote) return;
-    if (current_idx) |idx| {
-        if (expr.len == 0) try appendShellQuoted(allocator, out, candidates.output[idx]) else if (std.mem.eql(u8, expr, "n")) {
-            try appendDecimal(allocator, out, idx);
-        } else {
-            const transformed = try transformFields(allocator, candidates.output[idx], options.delimiter, expr, idx);
-            defer allocator.free(transformed);
-            try appendShellQuoted(allocator, out, transformed);
+    if (current_idx) |idx| try appendPlaceholderValue(allocator, out, spec, candidates, options, idx);
+}
+
+fn appendPlaceholderValue(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    spec: PlaceholderSpec,
+    candidates: *const CandidateSet,
+    options: *const Options,
+    idx: usize,
+) !void {
+    if (spec.flags.number) return appendDecimal(allocator, out, idx);
+    var source = candidates.output[idx];
+    var stripped: ?[]const u8 = null;
+    defer if (stripped) |owned| allocator.free(owned);
+    if (options.ansi) {
+        const owned = try stripAnsi(allocator, source);
+        stripped = owned;
+        source = owned;
+    }
+    if (spec.kind == .item) {
+        if (spec.flags.raw) return out.appendSlice(allocator, source);
+        return appendShellQuoted(allocator, out, source);
+    }
+    const transformed = try transformPlaceholderFields(allocator, source, options.delimiter, spec.fields, spec.flags.preserve_space);
+    defer allocator.free(transformed);
+    if (spec.flags.raw) return out.appendSlice(allocator, transformed);
+    try appendShellQuoted(allocator, out, transformed);
+}
+
+fn transformPlaceholderFields(
+    allocator: Allocator,
+    line: []const u8,
+    delimiter: ?[]const u8,
+    spec: []const u8,
+    preserve_space: bool,
+) ![]u8 {
+    var tokens: std.ArrayList([]const u8) = .empty;
+    defer tokens.deinit(allocator);
+    try tokenizePlaceholderFields(allocator, &tokens, line, delimiter);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var terms = std.mem.splitScalar(u8, spec, ',');
+    while (terms.next()) |term| {
+        const range = parsePlaceholderRange(term) orelse return error.InvalidPlaceholderRange;
+        try appendPlaceholderRange(allocator, &out, tokens.items, range);
+    }
+    if (delimiter) |d| {
+        if (d.len != 0 and std.mem.endsWith(u8, out.items, d)) out.shrinkRetainingCapacity(out.items.len - d.len);
+    }
+    const transformed = try out.toOwnedSlice(allocator);
+    if (preserve_space) return transformed;
+    const trimmed = trimUnicodeWhitespaceSlice(transformed);
+    if (trimmed.len == transformed.len) return transformed;
+    const result = try allocator.dupe(u8, trimmed);
+    allocator.free(transformed);
+    return result;
+}
+
+fn tokenizePlaceholderFields(allocator: Allocator, out: *std.ArrayList([]const u8), line: []const u8, delimiter: ?[]const u8) !void {
+    if (delimiter) |d| {
+        if (d.len == 0) return out.append(allocator, line);
+        var start: usize = 0;
+        while (std.mem.indexOfPos(u8, line, start, d)) |pos| {
+            const end = pos + d.len;
+            try out.append(allocator, line[start..end]);
+            start = end;
+        }
+        if (start < line.len or line.len == 0 or std.mem.endsWith(u8, line, d)) try out.append(allocator, line[start..]);
+        return;
+    }
+
+    var i: usize = 0;
+    while (i < line.len and isAwkPlaceholderWhitespace(line[i])) i += 1;
+    while (i < line.len) {
+        const start = i;
+        while (i < line.len and !isAwkPlaceholderWhitespace(line[i])) i += 1;
+        while (i < line.len and isAwkPlaceholderWhitespace(line[i])) i += 1;
+        try out.append(allocator, line[start..i]);
+    }
+}
+
+fn isAwkPlaceholderWhitespace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n';
+}
+
+fn appendPlaceholderRange(allocator: Allocator, out: *std.ArrayList(u8), tokens: []const []const u8, range: PlaceholderRange) !void {
+    const count: isize = @intCast(tokens.len);
+    if (range.begin == range.end) {
+        if (range.begin == 0) {
+            for (tokens) |token| try out.appendSlice(allocator, token);
+            return;
+        }
+        var idx = range.begin;
+        if (idx < 0) idx += count + 1;
+        if (idx >= 1 and idx <= count) try out.appendSlice(allocator, tokens[@intCast(idx - 1)]);
+        return;
+    }
+
+    var begin: isize = undefined;
+    var end: isize = undefined;
+    if (range.begin == 0) {
+        begin = 1;
+        end = range.end;
+        if (end < 0) end += count + 1;
+    } else if (range.end == 0) {
+        begin = range.begin;
+        if (begin < 0) begin += count + 1;
+        end = count;
+    } else {
+        begin = range.begin;
+        end = range.end;
+        if (begin < 0) begin += count + 1;
+        if (end < 0) end += count + 1;
+    }
+    if (begin > end) return;
+    var idx = begin;
+    while (idx <= end) : (idx += 1) {
+        if (idx >= 1 and idx <= count) try out.appendSlice(allocator, tokens[@intCast(idx - 1)]);
+        if (idx == std.math.maxInt(isize)) break;
+    }
+}
+
+fn trimUnicodeWhitespaceSlice(s: []const u8) []const u8 {
+    if (!std.unicode.utf8ValidateSlice(s)) return std.mem.trim(u8, s, " \t\r\n\x0b\x0c");
+    var it = std.unicode.Utf8Iterator{ .bytes = s, .i = 0 };
+    var first_non_white: ?usize = null;
+    var last_non_white_end: usize = 0;
+    while (it.i < s.len) {
+        const start = it.i;
+        const cp = it.nextCodepoint() orelse break;
+        if (!fuzzy_engine.cliRuneIsWhitespace(cp)) {
+            if (first_non_white == null) first_non_white = start;
+            last_non_white_end = it.i;
         }
     }
+    const start = first_non_white orelse return s[s.len..];
+    return s[start..last_non_white_end];
 }
 
 fn appendShellQuoted(allocator: Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
@@ -5486,8 +5789,11 @@ const usage =
     \\      --no-mouse           disable xterm mouse tracking
     \\
     \\Preview
-    \\      --preview=COMMAND    preview focused item; {} and {q} placeholders
+    \\      --preview=COMMAND    preview focused item; fzf command placeholders
     \\      --preview-window=OPT right/left/up/down, SIZE%, hidden, wrap/nowrap
+    \\                           {}, {+}, {*}, {1}, {q}, {q:2..}, {n}
+    \\                           flags: r raw, s preserve-space, f temp-file
+    \\                           prefix a valid placeholder with a backslash to escape it
     \\
     \\Keys
     \\  Enter accept, Esc/Ctrl-C abort, arrows/Ctrl-J/Ctrl-K move,
@@ -5616,7 +5922,8 @@ test "selected and field command placeholders" {
     defer candidates.deinit(a);
     const selected = [_]bool{ true, true };
     const order = [_]usize{ 1, 0 };
-    const got = try expandCommand(a, "echo {n} {1} {+} {+2} {q}", "x y", &candidates, &options, 0, &order, &selected);
+    const matched = [_]usize{ 0, 1 };
+    const got = try expandCommand(a, "echo {n} {1} {+} {+2} {q}", "x y", &candidates, &options, 0, &order, &selected, &matched);
     defer a.free(got);
     try std.testing.expectEqualStrings("echo 0 'one' 'three,four' 'one,two' 'four' 'two' 'x y'", got);
 }
@@ -5639,7 +5946,8 @@ test "file placeholders materialize selected fields" {
         temp_files.deinit(a);
     }
 
-    const got = try expandCommandImpl(a, "cat {+f1}", "", &candidates, &options, 0, &order, &selected, std.testing.io, &temp_files);
+    const matched = [_]usize{ 0, 1 };
+    const got = try expandCommandImpl(a, "cat {+f1}", "", &candidates, &options, 0, &order, &selected, &matched, "", options.prompt, std.testing.io, &temp_files);
     defer a.free(got);
     try std.testing.expectEqual(@as(usize, 1), temp_files.items.len);
     try std.testing.expect(std.mem.startsWith(u8, got, "cat '/tmp/zfuzz-"));
@@ -5651,6 +5959,161 @@ test "file placeholders materialize selected fields" {
     const contents = try reader.interface.allocRemaining(a, .unlimited);
     defer a.free(contents);
     try std.testing.expectEqualStrings("three\none\n", contents);
+}
+
+test "fzf placeholder flags matched items and escaping" {
+    const a = std.testing.allocator;
+    const blob = try a.dupe(u8, "  one ,two  \nthree , four\n");
+    var options: Options = .{ .delimiter = ",", .prompt = "pick> " };
+    defer options.deinit(a);
+    var candidates = try candidatesFromOwnedBlob(a, blob, &options);
+    defer candidates.deinit(a);
+
+    const selected = [_]bool{ true, false };
+    const order = [_]usize{0};
+    const matched = [_]usize{ 1, 0 };
+    const got = try expandCommandImpl(
+        a,
+        "echo {1}|{s1}|{r1}|{r}|{*1}|{*n}|{q:2..}|{fzf:query}|{fzf:action}|{fzf:prompt}|\\{}|{n.t}",
+        "alpha   beta gamma",
+        &candidates,
+        &options,
+        0,
+        &order,
+        &selected,
+        &matched,
+        "execute-silent",
+        options.prompt,
+        null,
+        null,
+    );
+    defer a.free(got);
+    try std.testing.expectEqualStrings(
+        "echo 'one'|'  one '|one|  one ,two  |'three' 'one'|1 0|'beta gamma'|'alpha   beta gamma'|'execute-silent'|'pick> '|{}|{n.t}",
+        got,
+    );
+}
+
+test "matched file placeholder materializes transformed values" {
+    const a = std.testing.allocator;
+    const blob = try a.dupe(u8, "  one ,two  \nthree , four\n");
+    var options: Options = .{ .delimiter = "," };
+    defer options.deinit(a);
+    var candidates = try candidatesFromOwnedBlob(a, blob, &options);
+    defer candidates.deinit(a);
+    const selected = [_]bool{ false, false };
+    const matched = [_]usize{ 1, 0 };
+    var temp_files: std.ArrayList([]u8) = .empty;
+    defer {
+        for (temp_files.items) |path| {
+            Io.Dir.deleteFileAbsolute(std.testing.io, path) catch {};
+            a.free(path);
+        }
+        temp_files.deinit(a);
+    }
+
+    const got = try expandCommandImpl(a, "cat {*f1}", "", &candidates, &options, 0, &.{}, &selected, &matched, "", options.prompt, std.testing.io, &temp_files);
+    defer a.free(got);
+    try std.testing.expectEqual(@as(usize, 1), temp_files.items.len);
+    try std.testing.expect(std.mem.startsWith(u8, got, "cat '/tmp/zfuzz-"));
+
+    const file = try Io.Dir.openFileAbsolute(std.testing.io, temp_files.items[0], .{});
+    defer file.close(std.testing.io);
+    var buffer: [256]u8 = undefined;
+    var reader = file.reader(std.testing.io, &buffer);
+    const contents = try reader.interface.allocRemaining(a, .unlimited);
+    defer a.free(contents);
+    try std.testing.expectEqualStrings("three\none\n", contents);
+}
+
+test "placeholder field transforms follow fzf token ranges" {
+    const a = std.testing.allocator;
+
+    const one = try transformPlaceholderFields(a, "  foo'bar baz", null, "1", false);
+    defer a.free(one);
+    try std.testing.expectEqualStrings("foo'bar", one);
+
+    const reversed = try transformPlaceholderFields(a, "  foo'bar baz", null, "2,1", false);
+    defer a.free(reversed);
+    try std.testing.expectEqualStrings("bazfoo'bar", reversed);
+
+    const all = try transformPlaceholderFields(a, "  foo'bar baz", null, "..", false);
+    defer a.free(all);
+    try std.testing.expectEqualStrings("foo'bar baz", all);
+
+    const preserve = try transformPlaceholderFields(a, "1a 1b 1c 1d 1e 1f", null, "1", true);
+    defer a.free(preserve);
+    try std.testing.expectEqualStrings("1a ", preserve);
+
+    const multiple = try transformPlaceholderFields(a, "1a 1b 1c 1d 1e 1f", null, "1,2,4", false);
+    defer a.free(multiple);
+    try std.testing.expectEqualStrings("1a 1b 1d", multiple);
+
+    const overlapping = try transformPlaceholderFields(a, "1a 1b 1c 1d 1e 1f", null, "1..2,-4..-3", false);
+    defer a.free(overlapping);
+    try std.testing.expectEqualStrings("1a 1b 1c 1d", overlapping);
+
+    const descending = try transformPlaceholderFields(a, "1a 1b 1c", null, "3..1", false);
+    defer a.free(descending);
+    try std.testing.expectEqualStrings("", descending);
+
+    const string_delim = try transformPlaceholderFields(a, "  foo'bar baz", "'", "1", false);
+    defer a.free(string_delim);
+    try std.testing.expectEqualStrings("foo", string_delim);
+
+    const string_delim_preserve = try transformPlaceholderFields(a, "  foo'bar baz", "'", "1", true);
+    defer a.free(string_delim_preserve);
+    try std.testing.expectEqualStrings("  foo", string_delim_preserve);
+}
+
+test "placeholder validation and ansi stripping match fzf" {
+    const a = std.testing.allocator;
+    const blob = try a.dupe(u8, "\x1b[31mred\x1b[0m blue\n");
+    var options: Options = .{ .ansi = true };
+    defer options.deinit(a);
+    var candidates = try candidatesFromOwnedBlob(a, blob, &options);
+    defer candidates.deinit(a);
+    const selected = [_]bool{false};
+    const matched = [_]usize{0};
+
+    const got = try expandCommand(a, "echo {} {r1} {0} {1...2}", "", &candidates, &options, 0, &.{}, &selected, &matched);
+    defer a.free(got);
+    try std.testing.expectEqualStrings("echo 'red blue' red {0} {1...2}", got);
+}
+
+test "query field placeholders preserve token spacing with s flag" {
+    const a = std.testing.allocator;
+    const plain = try transformPlaceholderFields(a, "alpha beta   gamma", null, "2", false);
+    defer a.free(plain);
+    try std.testing.expectEqualStrings("beta", plain);
+    const preserved = try transformPlaceholderFields(a, "alpha beta   gamma", null, "2", true);
+    defer a.free(preserved);
+    try std.testing.expectEqualStrings("beta   ", preserved);
+}
+
+test "placeholder grammar accepts fzf 0.74 forms and rejects invalid ranges" {
+    const valid = [_][]const u8{
+        "",       "+",       "*",        "n",         "+n",         "*n",
+        "f",      "fn",      "nf",       "+f",        "+fn",        "+nf",
+        "*f",     "*fn",     "*nf",      "1",         "1..",        "..2",
+        "-1",     "1,2",     "+1",       "+-1",       "s1",         "f1",
+        "+s1..2", "r",       "r..",      "q",         "q:1",        "q:2..",
+        "q:..",   "q:2..-1", "q:s2..-1", "fzf:query", "fzf:action", "fzf:prompt",
+    };
+    for (valid) |expr| try std.testing.expect(parsePlaceholderExpr(expr) != null);
+
+    const invalid = [_][]const u8{
+        "n.t",
+        "0",
+        "1..0",
+        "-1..2",
+        "q:",
+        "q:s",
+        "abc",
+        "1,,2",
+        "1...2",
+    };
+    for (invalid) |expr| try std.testing.expect(parsePlaceholderExpr(expr) == null);
 }
 
 test "field transforms" {

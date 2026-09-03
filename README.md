@@ -61,8 +61,19 @@ reuses the previous exact subsequence-survivor bitset and scores the previous
 top-K first to establish a strong cutoff early. Backspace or an unrelated query
 resets that cache automatically.
 
-Matching is bytewise ASCII case-insensitive. Unicode normalization is not part
-of this version.
+The public `Index.search` core remains bytewise ASCII case-insensitive. The
+`zfuzz` command-line frontend additionally follows fzf's Unicode simple-case
+and Latin/fullwidth normalization behavior when a query or candidate contains
+non-ASCII text; `--literal` disables that normalization. This Unicode frontend
+path does not add any public library API or change the ordinary ASCII indexed
+search path.
+
+The frontend also supports fzf-style command placeholders for preview,
+execute, reload, and transform actions. This includes current (`{}`), selected
+(`{+}`), matched (`{*}`), field/range (`{1}`, `{2..}`, `{+1}`), ordinal
+(`{n}`), query (`{q}`, `{q:2..}`), raw (`r`), whitespace-preserving (`s`), and
+temporary-file (`f`) forms. Prefix a valid placeholder with a backslash (for
+example `\{}`) to keep it literal.
 
 ## Complexity
 
