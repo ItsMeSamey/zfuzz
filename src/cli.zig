@@ -1424,10 +1424,10 @@ const Ui = struct {
         var binding_handled = false;
         for (self.options.bindings.items, 0..) |binding, binding_slot| {
             if (!binding.enabled) continue;
-            if (std.mem.eql(u8, binding.trigger, "start") or std.mem.eql(u8, binding.trigger, "load") or
-                std.mem.eql(u8, binding.trigger, "change") or std.mem.eql(u8, binding.trigger, "result") or
-                std.mem.eql(u8, binding.trigger, "result-final") or std.mem.eql(u8, binding.trigger, "zero") or
-                std.mem.eql(u8, binding.trigger, "one") or std.mem.eql(u8, binding.trigger, "focus")) continue;
+            if (std.ascii.eqlIgnoreCase(binding.trigger, "start") or std.ascii.eqlIgnoreCase(binding.trigger, "load") or
+                std.ascii.eqlIgnoreCase(binding.trigger, "change") or std.ascii.eqlIgnoreCase(binding.trigger, "result") or
+                std.ascii.eqlIgnoreCase(binding.trigger, "result-final") or std.ascii.eqlIgnoreCase(binding.trigger, "zero") or
+                std.ascii.eqlIgnoreCase(binding.trigger, "one") or std.ascii.eqlIgnoreCase(binding.trigger, "focus")) continue;
             if (!keyMatchesName(key, binding.trigger)) continue;
             binding_handled = true;
             self.setLastAction(binding.name);
@@ -1785,7 +1785,7 @@ const Ui = struct {
     fn fireEvent(self: *Ui, event: []const u8) !?u8 {
         for (self.options.bindings.items, 0..) |binding, binding_slot| {
             if (!binding.enabled) continue;
-            if (!std.mem.eql(u8, binding.trigger, event)) continue;
+            if (!std.ascii.eqlIgnoreCase(binding.trigger, event)) continue;
             self.setLastAction(binding.name);
             self.last_key = "";
             if (try self.runAction(binding.action, binding_slot)) |code| return code;
@@ -2281,7 +2281,7 @@ const Ui = struct {
             const target = std.mem.trim(u8, raw_target, " \t");
             if (target.len == 0) continue;
             for (self.options.bindings.items) |*binding| {
-                if (!std.mem.eql(u8, binding.trigger, target)) continue;
+                if (!triggerNamesEquivalent(binding.trigger, target)) continue;
                 binding.enabled = switch (change) {
                     .disable => false,
                     .enable => true,
@@ -4869,7 +4869,7 @@ fn monotonicMilliseconds(io: Io) u64 {
 }
 
 fn everyIntervalMilliseconds(trigger: []const u8) ?u64 {
-    if (!std.mem.startsWith(u8, trigger, "every(") or trigger.len < 8 or trigger[trigger.len - 1] != ')') return null;
+    if (!asciiStartsWithIgnoreCase(trigger, "every(") or trigger.len < 8 or trigger[trigger.len - 1] != ')') return null;
     const secs = std.fmt.parseFloat(f64, trigger[6 .. trigger.len - 1]) catch return null;
     if (!std.math.isFinite(secs) or secs <= 0) return null;
     const ms_f = secs * 1000.0;
@@ -4879,6 +4879,14 @@ fn everyIntervalMilliseconds(trigger: []const u8) ?u64 {
 
 fn asciiStartsWithIgnoreCase(text: []const u8, prefix: []const u8) bool {
     return text.len >= prefix.len and std.ascii.eqlIgnoreCase(text[0..prefix.len], prefix);
+}
+
+fn triggerNamesEquivalent(a: []const u8, b: []const u8) bool {
+    if (a.len == 1 or b.len == 1) return std.mem.eql(u8, a, b);
+    const a_alt = a.len == 5 and asciiStartsWithIgnoreCase(a, "alt-");
+    const b_alt = b.len == 5 and asciiStartsWithIgnoreCase(b, "alt-");
+    if (a_alt or b_alt) return a_alt and b_alt and a[4] == b[4];
+    return std.ascii.eqlIgnoreCase(a, b);
 }
 
 fn isArgumentActionName(name: []const u8) bool {
@@ -5011,7 +5019,7 @@ fn parseBindings(allocator: Allocator, out: *std.ArrayList(Binding), spec: []con
         const colon = std.mem.indexOfScalar(u8, masked_part, ':') orelse return error.InvalidBinding;
         const trigger = std.mem.trim(u8, part[0..colon], " \t");
         if (trigger.len == 0) return error.InvalidBinding;
-        if (std.mem.startsWith(u8, trigger, "every(") and everyIntervalMilliseconds(trigger) == null) return error.InvalidEveryEvent;
+        if (asciiStartsWithIgnoreCase(trigger, "every(") and everyIntervalMilliseconds(trigger) == null) return error.InvalidEveryEvent;
         const action_text = std.mem.trim(u8, part[colon + 1 ..], " \t");
         try appendBindingActions(allocator, out, trigger, action_text);
     }
@@ -6539,25 +6547,25 @@ fn writeHighlighted(w: anytype, text: []const u8, query: []const u8, cols: usize
 
 fn keyMatchesName(key: Key, name: []const u8) bool {
     return switch (key) {
-        .up => std.mem.eql(u8, name, "up"),
-        .down => std.mem.eql(u8, name, "down"),
-        .left => std.mem.eql(u8, name, "left"),
-        .right => std.mem.eql(u8, name, "right"),
-        .home => std.mem.eql(u8, name, "home"),
-        .end => std.mem.eql(u8, name, "end"),
-        .page_up => std.mem.eql(u8, name, "page-up") or std.mem.eql(u8, name, "pgup"),
-        .page_down => std.mem.eql(u8, name, "page-down") or std.mem.eql(u8, name, "pgdn"),
-        .delete => std.mem.eql(u8, name, "delete"),
-        .shift_tab => std.mem.eql(u8, name, "shift-tab") or std.mem.eql(u8, name, "btab"),
-        .alt_byte => |b| name.len == 5 and std.mem.startsWith(u8, name, "alt-") and std.ascii.toLower(name[4]) == std.ascii.toLower(b),
+        .up => std.ascii.eqlIgnoreCase(name, "up"),
+        .down => std.ascii.eqlIgnoreCase(name, "down"),
+        .left => std.ascii.eqlIgnoreCase(name, "left"),
+        .right => std.ascii.eqlIgnoreCase(name, "right"),
+        .home => std.ascii.eqlIgnoreCase(name, "home"),
+        .end => std.ascii.eqlIgnoreCase(name, "end"),
+        .page_up => std.ascii.eqlIgnoreCase(name, "page-up") or std.ascii.eqlIgnoreCase(name, "pgup"),
+        .page_down => std.ascii.eqlIgnoreCase(name, "page-down") or std.ascii.eqlIgnoreCase(name, "pgdn"),
+        .delete => std.ascii.eqlIgnoreCase(name, "delete"),
+        .shift_tab => std.ascii.eqlIgnoreCase(name, "shift-tab") or std.ascii.eqlIgnoreCase(name, "btab"),
+        .alt_byte => |b| name.len == 5 and asciiStartsWithIgnoreCase(name, "alt-") and name[4] == b,
         .byte => |b| blk: {
-            if ((b == 13 or b == 10) and std.mem.eql(u8, name, "enter")) break :blk true;
-            if (b == 9 and std.mem.eql(u8, name, "tab")) break :blk true;
-            if (b == 27 and std.mem.eql(u8, name, "esc")) break :blk true;
-            if ((b == 127 or b == 8) and std.mem.eql(u8, name, "backspace")) break :blk true;
-            if (b >= 1 and b <= 26 and name.len == 6 and std.mem.startsWith(u8, name, "ctrl-"))
+            if ((b == 13 or b == 10) and std.ascii.eqlIgnoreCase(name, "enter")) break :blk true;
+            if (b == 9 and std.ascii.eqlIgnoreCase(name, "tab")) break :blk true;
+            if (b == 27 and std.ascii.eqlIgnoreCase(name, "esc")) break :blk true;
+            if ((b == 127 or b == 8) and std.ascii.eqlIgnoreCase(name, "backspace")) break :blk true;
+            if (b >= 1 and b <= 26 and name.len == 6 and asciiStartsWithIgnoreCase(name, "ctrl-"))
                 break :blk std.ascii.toLower(name[5]) == ('a' + b - 1);
-            break :blk name.len == 1 and std.ascii.toLower(name[0]) == std.ascii.toLower(b);
+            break :blk name.len == 1 and name[0] == b;
         },
         else => false,
     };
@@ -8428,11 +8436,29 @@ test "word boundaries match fzf letter number and unix semantics" {
 
 test "every event interval parsing" {
     try std.testing.expectEqual(@as(?u64, 200), everyIntervalMilliseconds("every(0.2)"));
+    try std.testing.expectEqual(@as(?u64, 200), everyIntervalMilliseconds("EvErY(0.2)"));
     try std.testing.expectEqual(@as(?u64, 2000), everyIntervalMilliseconds("every(2)"));
     try std.testing.expect(everyIntervalMilliseconds("every(0)") == null);
     try std.testing.expect(everyIntervalMilliseconds("every(-1)") == null);
     try std.testing.expect(everyIntervalMilliseconds("every(abc)") == null);
     try std.testing.expect(everyIntervalMilliseconds("every(2147484)") == null);
+}
+
+test "key names follow fzf case semantics" {
+    try std.testing.expect(keyMatchesName(.up, "UP"));
+    try std.testing.expect(keyMatchesName(.page_up, "PgUp"));
+    try std.testing.expect(keyMatchesName(.{ .byte = 18 }, "CTRL-R"));
+    try std.testing.expect(keyMatchesName(.{ .byte = 'A' }, "A"));
+    try std.testing.expect(!keyMatchesName(.{ .byte = 'A' }, "a"));
+    try std.testing.expect(keyMatchesName(.{ .byte = 'a' }, "a"));
+    try std.testing.expect(!keyMatchesName(.{ .byte = 'a' }, "A"));
+    try std.testing.expect(keyMatchesName(.{ .alt_byte = 'A' }, "AlT-A"));
+    try std.testing.expect(!keyMatchesName(.{ .alt_byte = 'A' }, "alt-a"));
+    try std.testing.expect(triggerNamesEquivalent("CTRL-R", "ctrl-r"));
+    try std.testing.expect(triggerNamesEquivalent("LoAd", "load"));
+    try std.testing.expect(!triggerNamesEquivalent("A", "a"));
+    try std.testing.expect(triggerNamesEquivalent("AlT-A", "alt-A"));
+    try std.testing.expect(!triggerNamesEquivalent("alt-A", "alt-a"));
 }
 
 test "fzf parser equal inverse fuzzy and boundary exact" {
