@@ -5107,7 +5107,17 @@ fn parseBindings(allocator: Allocator, out: *std.ArrayList(Binding), spec: []con
         if (trigger.len == 0) return error.InvalidBinding;
         if (asciiStartsWithIgnoreCase(trigger, "every(") and everyIntervalMilliseconds(trigger) == null) return error.InvalidEveryEvent;
         const action_text = std.mem.trim(u8, part[colon + 1 ..], " \t");
+        if (action_text.len != 0 and action_text[0] != '+') removeBindingsForTrigger(out, trigger);
         try appendBindingActions(allocator, out, trigger, action_text);
+    }
+}
+
+fn removeBindingsForTrigger(out: *std.ArrayList(Binding), trigger: []const u8) void {
+    var i: usize = 0;
+    while (i < out.items.len) {
+        if (triggerNamesEquivalent(out.items[i].trigger, trigger)) {
+            _ = out.orderedRemove(i);
+        } else i += 1;
     }
 }
 
@@ -8429,6 +8439,31 @@ test "binding parser" {
     try std.testing.expectEqualStrings("printf 'a,b'", bindings.items[0].action.reload);
     try std.testing.expectEqualStrings("ready", bindings.items[1].action.change_header);
     try std.testing.expect(bindings.items[2].action == .accept);
+}
+
+test "repeated fzf bindings replace unless action list starts with plus" {
+    const a = std.testing.allocator;
+    var bindings: std.ArrayList(Binding) = .empty;
+    defer bindings.deinit(a);
+
+    try parseBindings(a, &bindings, "a:up,a:down");
+    try std.testing.expectEqual(@as(usize, 1), bindings.items.len);
+    try std.testing.expect(bindings.items[0].action == .down);
+
+    try parseBindings(a, &bindings, "a:+accept");
+    try std.testing.expectEqual(@as(usize, 2), bindings.items.len);
+    try std.testing.expect(bindings.items[0].action == .down);
+    try std.testing.expect(bindings.items[1].action == .accept);
+
+    try parseBindings(a, &bindings, "a:");
+    try std.testing.expectEqual(@as(usize, 2), bindings.items.len);
+
+    var aliases: std.ArrayList(Binding) = .empty;
+    defer aliases.deinit(a);
+    try parseBindings(a, &aliases, "return:up,enter:down");
+    try std.testing.expectEqual(@as(usize, 1), aliases.items.len);
+    try std.testing.expectEqualStrings("enter", aliases.items[0].trigger);
+    try std.testing.expect(aliases.items[0].action == .down);
 }
 
 test "binding parser accepts fzf action argument delimiters" {
