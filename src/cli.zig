@@ -4078,8 +4078,12 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.no_sort = true;
             continue;
         }
-        if (std.mem.eql(u8, a, "--disabled")) {
+        if (std.mem.eql(u8, a, "--disabled") or std.mem.eql(u8, a, "--phony")) {
             o.*.disabled = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--enabled") or std.mem.eql(u8, a, "--no-phony")) {
+            o.*.disabled = false;
             continue;
         }
         if (std.mem.eql(u8, a, "-x") or std.mem.eql(u8, a, "--extended")) {
@@ -6665,7 +6669,9 @@ const usage =
     \\  -n, --nth=EXPR           limit searchable fields
     \\      --with-nth=EXPR      transform displayed fields
     \\      --accept-nth=EXPR    transform accepted output
-    \\      --disabled           do not filter; useful with reload bindings
+    \\      --disabled, --phony  do not filter; useful with reload bindings
+    \\      --enabled, --no-phony
+    \\                           re-enable filtering (last option wins)
     \\
     \\Selection and I/O
     \\  -m, --multi[=MAX]        multi-select; Tab / Shift-Tab toggle
@@ -7173,6 +7179,30 @@ test "scroll-off option uses fzf source default and accepts overrides" {
     var separate_options = try parseOptions(a, &separate_args);
     defer separate_options.deinit(a);
     try std.testing.expectEqual(@as(usize, 7), separate_options.scroll_off);
+}
+
+test "search enable and phony aliases are last-one-wins" {
+    const a = std.testing.allocator;
+
+    const phony_args = [_][]const u8{ "zfuzz", "--phony" };
+    var phony = try parseOptions(a, &phony_args);
+    defer phony.deinit(a);
+    try std.testing.expect(phony.disabled);
+
+    const enabled_args = [_][]const u8{ "zfuzz", "--disabled", "--enabled" };
+    var enabled = try parseOptions(a, &enabled_args);
+    defer enabled.deinit(a);
+    try std.testing.expect(!enabled.disabled);
+
+    const disabled_last_args = [_][]const u8{ "zfuzz", "--enabled", "--phony" };
+    var disabled_last = try parseOptions(a, &disabled_last_args);
+    defer disabled_last.deinit(a);
+    try std.testing.expect(disabled_last.disabled);
+
+    const no_phony_args = [_][]const u8{ "zfuzz", "--phony", "--no-phony" };
+    var no_phony = try parseOptions(a, &no_phony_args);
+    defer no_phony.deinit(a);
+    try std.testing.expect(!no_phony.disabled);
 }
 
 test "stateful binding actions parse" {
