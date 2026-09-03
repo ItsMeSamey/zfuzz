@@ -10,6 +10,7 @@ const esc = "\x1b[";
 
 const Layout = enum { default, reverse };
 const CaseMode = enum { smart, ignore, respect };
+const Scheme = enum { default, path, history };
 const PreviewPosition = enum { right, left, up, down };
 const TieBreak = enum { length, chunk, pathname, begin, end };
 const StylePreset = enum { default, minimal, full };
@@ -200,6 +201,7 @@ const Options = struct {
     extended: bool = true,
     exact: bool = false,
     case_mode: CaseMode = .smart,
+    scheme: Scheme = .default,
     tac: bool = false,
     tail: ?usize = null,
     sync: bool = false,
@@ -3100,6 +3102,16 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.case_mode = .smart;
             continue;
         }
+        if (std.mem.startsWith(u8, a, "--scheme=")) {
+            try applyScheme(o, a[9..]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--scheme")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            try applyScheme(o, args[i]);
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--tiebreak=")) {
             try parseTiebreaks(o, a[11..]);
             continue;
@@ -3457,6 +3469,29 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
         return error.UnknownOption;
     }
     return;
+}
+
+fn parseScheme(spec: []const u8) !Scheme {
+    if (std.ascii.eqlIgnoreCase(spec, "default")) return .default;
+    if (std.ascii.eqlIgnoreCase(spec, "path")) return .path;
+    if (std.ascii.eqlIgnoreCase(spec, "history")) return .history;
+    return error.InvalidScheme;
+}
+
+fn applyScheme(options: *Options, spec: []const u8) !void {
+    options.scheme = try parseScheme(spec);
+    switch (options.scheme) {
+        .default => {
+            options.tiebreaks[0] = .length;
+            options.tiebreak_count = 1;
+        },
+        .path => {
+            options.tiebreaks[0] = .pathname;
+            options.tiebreaks[1] = .length;
+            options.tiebreak_count = 2;
+        },
+        .history => options.tiebreak_count = 0,
+    }
 }
 
 fn parseTiebreaks(options: *Options, spec: []const u8) !void {
@@ -4106,7 +4141,7 @@ fn searchCandidates(
     const parsed = try parseQuery(query, options, &term_buf);
 
     if (parsed.direct) |direct| {
-        if (!termCaseSensitive(options.case_mode, direct) and options.tiebreak_count == 1 and options.tiebreaks[0] == .length) {
+        if (options.scheme == .default and !termCaseSensitive(options.case_mode, direct) and options.tiebreak_count == 1 and options.tiebreaks[0] == .length) {
             return try index.search(direct, out[0..cap]);
         }
     }
@@ -4116,7 +4151,7 @@ fn searchCandidates(
     if (options.no_sort or !parsed.sortable) {
         var write: usize = 0;
         for (candidates.search, 0..) |line, idx| {
-            if (scoreParsedCandidate(index, parsed, line, idx, options.case_mode) == null) continue;
+            if (scoreParsedCandidate(index, parsed, line, idx, options.case_mode, options.scheme) == null) continue;
             out[write] = idx;
             write += 1;
             if (write == cap) break;
@@ -4135,7 +4170,7 @@ fn searchCandidates(
 
     var rank_len: usize = 0;
     for (source) |idx| {
-        const score = scoreParsedCandidate(index, parsed, candidates.search[idx], idx, options.case_mode) orelse continue;
+        const score = scoreParsedCandidate(index, parsed, candidates.search[idx], idx, options.case_mode, options.scheme) orelse continue;
         rank_scratch[rank_len] = .{ .entry = idx, .score = score };
         rank_len += 1;
     }
@@ -4146,7 +4181,7 @@ fn searchCandidates(
     return out[0..take];
 }
 
-fn scoreParsedCandidate(index: *fuzzy.Index, parsed: ParsedQuery, line: []const u8, entry_index: usize, mode: CaseMode) ?CandidateScore {
+fn scoreParsedCandidate(index: *fuzzy.Index, parsed: ParsedQuery, line: []const u8, entry_index: usize, mode: CaseMode, scheme: Scheme) ?CandidateScore {
     if (parsed.terms.len == 0) return .{};
     var total: CandidateScore = .{};
     var clause: usize = 0;
@@ -4155,7 +4190,7 @@ fn scoreParsedCandidate(index: *fuzzy.Index, parsed: ParsedQuery, line: []const 
         var contribution: ?fuzzy_engine.CliMatch = null;
         for (parsed.terms) |term| {
             if (term.clause != clause) continue;
-            const term_match = scoreTerm(index, term, line, entry_index, mode);
+            const term_match = scoreTerm(index, term, line, entry_index, mode, scheme);
             if (term_match) |value| {
                 if (term.inverse) continue;
                 contribution = value;
@@ -4175,15 +4210,20 @@ fn scoreParsedCandidate(index: *fuzzy.Index, parsed: ParsedQuery, line: []const 
     return total;
 }
 
-fn scoreTerm(index: *fuzzy.Index, term: QueryTerm, line: []const u8, entry_index: usize, mode: CaseMode) ?fuzzy_engine.CliMatch {
+fn scoreTerm(index: *fuzzy.Index, term: QueryTerm, line: []const u8, entry_index: usize, mode: CaseMode, scheme: Scheme) ?fuzzy_engine.CliMatch {
     const sensitive = termCaseSensitive(mode, term.text);
+    const cli_scheme: fuzzy_engine.CliScheme = switch (scheme) {
+        .default => .default,
+        .path => .path,
+        .history => .history,
+    };
     return switch (term.kind) {
-        .fuzzy => fuzzy_engine.matchFuzzyForCli(index, term.text, line, entry_index, sensitive),
-        .exact => fuzzy_engine.scoreExactForCli(index, term.text, line, entry_index, sensitive, false),
-        .boundary_exact => fuzzy_engine.scoreExactForCli(index, term.text, line, entry_index, sensitive, true),
-        .prefix => fuzzy_engine.scorePrefixForCli(index, term.text, line, entry_index, sensitive),
-        .suffix => fuzzy_engine.scoreSuffixForCli(index, term.text, line, entry_index, sensitive),
-        .equal => fuzzy_engine.scoreEqualForCli(index, term.text, line, entry_index, sensitive),
+        .fuzzy => fuzzy_engine.matchFuzzyForCliScheme(index, term.text, line, entry_index, sensitive, cli_scheme),
+        .exact => fuzzy_engine.scoreExactForCliScheme(index, term.text, line, entry_index, sensitive, false, cli_scheme),
+        .boundary_exact => fuzzy_engine.scoreExactForCliScheme(index, term.text, line, entry_index, sensitive, true, cli_scheme),
+        .prefix => fuzzy_engine.scorePrefixForCliScheme(index, term.text, line, entry_index, sensitive, cli_scheme),
+        .suffix => fuzzy_engine.scoreSuffixForCliScheme(index, term.text, line, entry_index, sensitive, cli_scheme),
+        .equal => fuzzy_engine.scoreEqualForCliScheme(index, term.text, line, entry_index, sensitive, cli_scheme),
     };
 }
 
@@ -4927,6 +4967,7 @@ const usage =
     \\  -0, --exit-0             exit immediately when there is no match
     \\      --no-sort            preserve input order after filtering
     \\      --tiebreak=CRI       score tie-breaks: length/chunk/pathname/begin/end/index
+    \\      --scheme=SCHEME      ranking scheme: default/path/history
     \\      --tail=N             keep only the last N input items in memory
     \\      --track              keep current item focused across result updates
     \\      --id-nth=EXPR        identity fields for tracking/reload selection
@@ -5257,6 +5298,51 @@ test "fzf parser equal inverse fuzzy and boundary exact" {
     try std.testing.expectEqual(TermKind.boundary_exact, parsed.terms[0].kind);
     try std.testing.expect(queryMatches(parsed, "x foo y", .smart));
     try std.testing.expect(!queryMatches(parsed, "x foobar y", .smart));
+}
+
+test "scheme rankings match upstream fzf boundary fixture" {
+    const a = std.testing.allocator;
+    const input = "xxyzx\n-xxyz\nxyzx-\n_xyz_\n_xyz-\n-xyz_\n[xyz]\n-xyz-\n xyz \n/xyz/\n";
+    const expected = [_][]const []const u8{
+        &.{ " xyz ", "/xyz/", "[xyz]", "-xyz-", "-xyz_", "_xyz-", "_xyz_" },
+        &.{ "/xyz/", " xyz ", "[xyz]", "-xyz-", "-xyz_", "_xyz-", "_xyz_" },
+        &.{ "[xyz]", "-xyz-", " xyz ", "/xyz/", "-xyz_", "_xyz-", "_xyz_" },
+    };
+    const schemes = [_]Scheme{ .default, .path, .history };
+
+    for (schemes, expected) |scheme, want| {
+        var options: Options = .{};
+        defer options.deinit(a);
+        try applyScheme(&options, @tagName(scheme));
+        const blob = try a.dupe(u8, input);
+        var candidates = try candidatesFromOwnedBlob(a, blob, &options);
+        defer candidates.deinit(a);
+        var index = try fuzzy.init(a, candidates.search);
+        defer index.deinit();
+        const out = try a.alloc(usize, candidates.search.len);
+        defer a.free(out);
+        const ranks = try a.alloc(ExtendedRank, candidates.search.len);
+        defer a.free(ranks);
+        const found = try searchCandidates(&index, &candidates, &options, "'xyz'", out, ranks, out.len);
+        try std.testing.expectEqual(want.len, found.len);
+        for (want, found) |line, idx| try std.testing.expectEqualStrings(line, candidates.output[idx]);
+    }
+}
+
+test "scheme parser accepts fzf schemes" {
+    try std.testing.expectEqual(Scheme.default, try parseScheme("default"));
+    try std.testing.expectEqual(Scheme.path, try parseScheme("PATH"));
+    try std.testing.expectEqual(Scheme.history, try parseScheme("history"));
+    try std.testing.expectError(error.InvalidScheme, parseScheme("bogus"));
+
+    var options: Options = .{};
+    defer options.deinit(std.testing.allocator);
+    try applyScheme(&options, "path");
+    try std.testing.expectEqual(@as(u2, 2), options.tiebreak_count);
+    try std.testing.expectEqual(TieBreak.pathname, options.tiebreaks[0]);
+    try std.testing.expectEqual(TieBreak.length, options.tiebreaks[1]);
+    try applyScheme(&options, "history");
+    try std.testing.expectEqual(@as(u2, 0), options.tiebreak_count);
 }
 
 test "tiebreak parser matches fzf constraints" {

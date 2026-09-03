@@ -3110,6 +3110,8 @@ pub const CliMatch = struct {
     end: usize,
 };
 
+pub const CliScheme = enum { default, path, history };
+
 fn cliByteEq(candidate: u8, pattern: u8, case_sensitive: bool) bool {
     return if (case_sensitive) candidate == pattern else lower_lut[candidate] == lower_lut[pattern];
 }
@@ -3126,8 +3128,52 @@ fn cliSubsequence(candidate: []const u8, pattern: []const u8, case_sensitive: bo
     return false;
 }
 
-fn cliCalculateScore(index: *const Index, entry: Entry, candidate: []const u8, pattern: []const u8, start: usize, end: usize, case_sensitive: bool) i32 {
-    const bonus = index.candidateBonuses(entry);
+fn cliSchemeCharClass(c: u8, scheme: CliScheme) CharClass {
+    if (c >= 'a' and c <= 'z') return .lower;
+    if (c >= 'A' and c <= 'Z') return .upper;
+    if (c >= '0' and c <= '9') return .number;
+    return switch (c) {
+        ' ', '\t', '\n', '\r', 0x0b, 0x0c => .white,
+        '/' => .delimiter,
+        ',', ':', ';', '|' => if (scheme == .path) .non_word else .delimiter,
+        else => .non_word,
+    };
+}
+
+fn cliSchemeBonusFor(previous: CharClass, current: CharClass, scheme: CliScheme) i32 {
+    const boundary_white: i32 = if (scheme == .default) bonus_boundary_white else bonus_boundary;
+    const boundary_delimiter: i32 = if (scheme == .history) bonus_boundary else bonus_boundary_delimiter;
+    if (current != .white) {
+        switch (previous) {
+            .white => return boundary_white,
+            .delimiter => return boundary_delimiter,
+            .non_word => return bonus_boundary,
+            else => {},
+        }
+    }
+    if ((previous == .lower and current == .upper) or
+        (previous != .number and current == .number))
+    {
+        return bonus_camel_number;
+    }
+    return switch (current) {
+        .non_word, .delimiter => bonus_non_word,
+        .white => boundary_white,
+        else => 0,
+    };
+}
+
+fn cliSchemeBonusAt(index: *const Index, entry: Entry, candidate: []const u8, pos: usize, scheme: CliScheme) i32 {
+    if (scheme == .default) return @intCast(index.candidateBonuses(entry)[pos]);
+    const current = cliSchemeCharClass(candidate[pos], scheme);
+    const previous: CharClass = if (pos == 0)
+        (if (scheme == .path) .delimiter else .white)
+    else
+        cliSchemeCharClass(candidate[pos - 1], scheme);
+    return cliSchemeBonusFor(previous, current, scheme);
+}
+
+fn cliCalculateScoreScheme(index: *const Index, entry: Entry, candidate: []const u8, pattern: []const u8, start: usize, end: usize, case_sensitive: bool, scheme: CliScheme) i32 {
     var p: usize = 0;
     var score: i32 = 0;
     var in_gap = false;
@@ -3137,7 +3183,7 @@ fn cliCalculateScore(index: *const Index, entry: Entry, candidate: []const u8, p
     while (j < end and p < pattern.len) : (j += 1) {
         if (cliByteEq(candidate[j], pattern[p], case_sensitive)) {
             score += score_match;
-            var b: i32 = @intCast(bonus[j]);
+            var b: i32 = cliSchemeBonusAt(index, entry, candidate, j, scheme);
             if (consecutive == 0) {
                 first_bonus = b;
             } else {
@@ -3158,7 +3204,7 @@ fn cliCalculateScore(index: *const Index, entry: Entry, candidate: []const u8, p
     return score;
 }
 
-fn cliScoreV1(index: *const Index, entry: Entry, candidate: []const u8, pattern: []const u8, case_sensitive: bool) ?CliMatch {
+fn cliScoreV1(index: *const Index, entry: Entry, candidate: []const u8, pattern: []const u8, case_sensitive: bool, scheme: CliScheme) ?CliMatch {
     if (pattern.len == 0) return .{ .score = 0, .start = 0, .end = 0 };
     var p: usize = 0;
     var start: ?usize = null;
@@ -3189,7 +3235,7 @@ fn cliScoreV1(index: *const Index, entry: Entry, candidate: []const u8, pattern:
         }
     }
     return .{
-        .score = cliCalculateScore(index, entry, candidate, pattern, compact_start, end, case_sensitive),
+        .score = cliCalculateScoreScheme(index, entry, candidate, pattern, compact_start, end, case_sensitive, scheme),
         .start = compact_start,
         .end = end,
     };
@@ -3213,20 +3259,19 @@ fn cliSubsequenceStart(candidate: []const u8, pattern: []const u8, case_sensitiv
 /// case sensitivity. This intentionally uses a compact two-row DP because the
 /// extended-query path values exact semantics and small code over the highly
 /// specialized top-K kernels used by Index.search.
-pub fn matchFuzzyForCli(index: *Index, query: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool) ?CliMatch {
+pub fn matchFuzzyForCliScheme(index: *Index, query: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool, scheme: CliScheme) ?CliMatch {
     if (entry_index >= index.entries.len) return null;
     const entry = index.entries[entry_index];
     if (candidate.len != entry.len or query.len > candidate.len) return null;
     if (query.len == 0) return .{ .score = 0, .start = 0, .end = 0 };
     const first_start = cliSubsequenceStart(candidate, query, case_sensitive) orelse return null;
-    if (query.len > 1000) return cliScoreV1(index, entry, candidate, query, case_sensitive);
+    if (query.len > 1000) return cliScoreV1(index, entry, candidate, query, case_sensitive, scheme);
 
-    const bonus = index.candidateBonuses(entry);
     if (query.len == 1) {
         var best: ?CliMatch = null;
-        for (candidate, bonus, 0..) |c, b, i| {
+        for (candidate, 0..) |c, i| {
             if (!cliByteEq(c, query[0], case_sensitive)) continue;
-            const raw_bonus: i32 = @intCast(b);
+            const raw_bonus = cliSchemeBonusAt(index, entry, candidate, i, scheme);
             const score = score_match + raw_bonus * bonus_first_char_multiplier;
             if (best == null or score > best.?.score) best = .{ .score = score, .start = i, .end = i + 1 };
             if (raw_bonus >= bonus_boundary) return best;
@@ -3244,7 +3289,7 @@ pub fn matchFuzzyForCli(index: *Index, query: []const u8, candidate: []const u8,
     var in_gap = false;
     for (candidate, 0..) |c, j| {
         if (cliByteEq(c, query[0], case_sensitive)) {
-            prev_h[j] = @intCast(score_match + @as(i32, @intCast(bonus[j])) * bonus_first_char_multiplier);
+            prev_h[j] = @intCast(score_match + cliSchemeBonusAt(index, entry, candidate, j, scheme) * bonus_first_char_multiplier);
             prev_c[j] = 1;
             in_gap = false;
         } else {
@@ -3269,11 +3314,11 @@ pub fn matchFuzzyForCli(index: *Index, query: []const u8, candidate: []const u8,
             var consecutive: i16 = 0;
             if (j > 0 and cliByteEq(c, query[row], case_sensitive)) {
                 match_score_value = prev_h[j - 1] + @as(i16, score_match);
-                var b: i16 = @intCast(bonus[j]);
+                var b: i16 = @intCast(cliSchemeBonusAt(index, entry, candidate, j, scheme));
                 consecutive = prev_c[j - 1] + 1;
                 if (consecutive > 1) {
                     const first_index = j - @as(usize, @intCast(consecutive)) + 1;
-                    const first_bonus: i16 = @intCast(bonus[first_index]);
+                    const first_bonus: i16 = @intCast(cliSchemeBonusAt(index, entry, candidate, first_index, scheme));
                     if (b >= bonus_boundary and b > first_bonus) {
                         consecutive = 1;
                     } else {
@@ -3281,7 +3326,7 @@ pub fn matchFuzzyForCli(index: *Index, query: []const u8, candidate: []const u8,
                     }
                 }
                 if (match_score_value + b < gap_score) {
-                    match_score_value += @intCast(bonus[j]);
+                    match_score_value += @intCast(cliSchemeBonusAt(index, entry, candidate, j, scheme));
                     consecutive = 0;
                 } else {
                     match_score_value += b;
@@ -3303,18 +3348,21 @@ pub fn matchFuzzyForCli(index: *Index, query: []const u8, candidate: []const u8,
     return .{ .score = @intCast(max_score), .start = first_start, .end = max_score_pos + 1 };
 }
 
+pub fn matchFuzzyForCli(index: *Index, query: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool) ?CliMatch {
+    return matchFuzzyForCliScheme(index, query, candidate, entry_index, case_sensitive, .default);
+}
+
 pub fn scoreFuzzyForCli(index: *Index, query: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool) ?i32 {
     const matched = matchFuzzyForCli(index, query, candidate, entry_index, case_sensitive) orelse return null;
     return matched.score;
 }
 
-fn cliContiguousScore(index: *const Index, entry: Entry, start: usize, len: usize) i32 {
-    const bonus = index.candidateBonuses(entry);
+fn cliContiguousScoreScheme(index: *const Index, entry: Entry, candidate: []const u8, start: usize, len: usize, scheme: CliScheme) i32 {
     var total: i32 = 0;
     var consecutive: usize = 0;
     var first_bonus: i32 = 0;
     for (0..len) |k| {
-        var b: i32 = @intCast(bonus[start + k]);
+        var b: i32 = cliSchemeBonusAt(index, entry, candidate, start + k, scheme);
         total += score_match;
         if (consecutive == 0) {
             first_bonus = b;
@@ -3334,27 +3382,26 @@ fn cliExactAt(candidate: []const u8, needle: []const u8, start: usize, case_sens
     return true;
 }
 
-fn cliBoundarySide(c: u8) bool {
-    return @intFromEnum(char_class_lut[c]) <= @intFromEnum(CharClass.delimiter);
+fn cliBoundarySide(c: u8, scheme: CliScheme) bool {
+    return @intFromEnum(cliSchemeCharClass(c, scheme)) <= @intFromEnum(CharClass.delimiter);
 }
 
-pub fn scoreExactForCli(index: *const Index, needle: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool, boundary: bool) ?CliMatch {
+pub fn scoreExactForCliScheme(index: *const Index, needle: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool, boundary: bool, scheme: CliScheme) ?CliMatch {
     if (entry_index >= index.entries.len) return null;
     const entry = index.entries[entry_index];
     if (candidate.len != entry.len or needle.len > candidate.len) return null;
     if (needle.len == 0) return .{ .score = 0, .start = 0, .end = 0 };
-    const bonus = index.candidateBonuses(entry);
     var best_start: ?usize = null;
     var best_bonus: i32 = -1;
     var start: usize = 0;
     while (start + needle.len <= candidate.len) : (start += 1) {
         if (!cliExactAt(candidate, needle, start, case_sensitive)) continue;
-        const b: i32 = @intCast(bonus[start]);
+        const b = cliSchemeBonusAt(index, entry, candidate, start, scheme);
         if (boundary) {
             if (b < bonus_boundary) continue;
-            if (start > 0 and !cliBoundarySide(candidate[start - 1])) continue;
+            if (start > 0 and !cliBoundarySide(candidate[start - 1], scheme)) continue;
             const end = start + needle.len;
-            if (end < candidate.len and !cliBoundarySide(candidate[end])) continue;
+            if (end < candidate.len and !cliBoundarySide(candidate[end], scheme)) continue;
         }
         if (b > best_bonus) {
             best_bonus = b;
@@ -3364,7 +3411,7 @@ pub fn scoreExactForCli(index: *const Index, needle: []const u8, candidate: []co
     }
     const s = best_start orelse return null;
     const e = s + needle.len;
-    if (!boundary) return .{ .score = cliContiguousScore(index, entry, s, needle.len), .start = s, .end = e };
+    if (!boundary) return .{ .score = cliContiguousScoreScheme(index, entry, candidate, s, needle.len, scheme), .start = s, .end = e };
 
     var score = best_bonus;
     var deduct = best_bonus - bonus_boundary + 1;
@@ -3373,11 +3420,12 @@ pub fn scoreExactForCli(index: *const Index, needle: []const u8, candidate: []co
         deduct = 1;
     }
     if (e < candidate.len and candidate[e] == '_') score -= deduct;
-    score += score_match * @as(i32, @intCast(needle.len)) + bonus_boundary_white * @as(i32, @intCast(needle.len + 1));
+    const boundary_white: i32 = if (scheme == .default) bonus_boundary_white else bonus_boundary;
+    score += score_match * @as(i32, @intCast(needle.len)) + boundary_white * @as(i32, @intCast(needle.len + 1));
     return .{ .score = score, .start = s, .end = e };
 }
 
-pub fn scorePrefixForCli(index: *const Index, needle: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool) ?CliMatch {
+pub fn scorePrefixForCliScheme(index: *const Index, needle: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool, scheme: CliScheme) ?CliMatch {
     if (entry_index >= index.entries.len) return null;
     const entry = index.entries[entry_index];
     if (candidate.len != entry.len) return null;
@@ -3386,10 +3434,10 @@ pub fn scorePrefixForCli(index: *const Index, needle: []const u8, candidate: []c
         while (start < candidate.len and std.ascii.isWhitespace(candidate[start])) start += 1;
     }
     if (!cliExactAt(candidate, needle, start, case_sensitive)) return null;
-    return .{ .score = cliContiguousScore(index, entry, start, needle.len), .start = start, .end = start + needle.len };
+    return .{ .score = cliContiguousScoreScheme(index, entry, candidate, start, needle.len, scheme), .start = start, .end = start + needle.len };
 }
 
-pub fn scoreSuffixForCli(index: *const Index, needle: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool) ?CliMatch {
+pub fn scoreSuffixForCliScheme(index: *const Index, needle: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool, scheme: CliScheme) ?CliMatch {
     if (entry_index >= index.entries.len) return null;
     const entry = index.entries[entry_index];
     if (candidate.len != entry.len) return null;
@@ -3400,10 +3448,10 @@ pub fn scoreSuffixForCli(index: *const Index, needle: []const u8, candidate: []c
     if (needle.len > end) return null;
     const start = end - needle.len;
     if (!cliExactAt(candidate, needle, start, case_sensitive)) return null;
-    return .{ .score = cliContiguousScore(index, entry, start, needle.len), .start = start, .end = end };
+    return .{ .score = cliContiguousScoreScheme(index, entry, candidate, start, needle.len, scheme), .start = start, .end = end };
 }
 
-pub fn scoreEqualForCli(index: *const Index, needle: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool) ?CliMatch {
+pub fn scoreEqualForCliScheme(index: *const Index, needle: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool, scheme: CliScheme) ?CliMatch {
     if (entry_index >= index.entries.len or needle.len == 0) return null;
     const entry = index.entries[entry_index];
     if (candidate.len != entry.len) return null;
@@ -3416,8 +3464,25 @@ pub fn scoreEqualForCli(index: *const Index, needle: []const u8, candidate: []co
         while (end > start and std.ascii.isWhitespace(candidate[end - 1])) end -= 1;
     }
     if (end - start != needle.len or !cliExactAt(candidate, needle, start, case_sensitive)) return null;
-    const score = (score_match + bonus_boundary_white) * @as(i32, @intCast(needle.len)) + (bonus_first_char_multiplier - 1) * bonus_boundary_white;
+    const boundary_white: i32 = if (scheme == .default) bonus_boundary_white else bonus_boundary;
+    const score = (score_match + boundary_white) * @as(i32, @intCast(needle.len)) + (bonus_first_char_multiplier - 1) * boundary_white;
     return .{ .score = score, .start = start, .end = end };
+}
+
+pub fn scoreExactForCli(index: *const Index, needle: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool, boundary: bool) ?CliMatch {
+    return scoreExactForCliScheme(index, needle, candidate, entry_index, case_sensitive, boundary, .default);
+}
+
+pub fn scorePrefixForCli(index: *const Index, needle: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool) ?CliMatch {
+    return scorePrefixForCliScheme(index, needle, candidate, entry_index, case_sensitive, .default);
+}
+
+pub fn scoreSuffixForCli(index: *const Index, needle: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool) ?CliMatch {
+    return scoreSuffixForCliScheme(index, needle, candidate, entry_index, case_sensitive, .default);
+}
+
+pub fn scoreEqualForCli(index: *const Index, needle: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool) ?CliMatch {
+    return scoreEqualForCliScheme(index, needle, candidate, entry_index, case_sensitive, .default);
 }
 
 fn lower(c: u8) u8 {
@@ -3964,6 +4029,25 @@ test "indexed final occurrence bound preserves subsequence search" {
             }
             const bounded = index.subsequenceIndexed(&q, entry, entry_index, first_slot, end);
             try std.testing.expectEqual(full, bounded);
+        }
+    }
+}
+
+test "CLI schemes use fzf boundary bonuses" {
+    const values = [_][]const u8{ "foo", " foo", "/foo", ":foo", "-foo" };
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+
+    const expected = [_][5]i32{
+        .{ 36, 36, 34, 34, 32 },
+        .{ 34, 32, 34, 32, 32 },
+        .{ 32, 32, 32, 32, 32 },
+    };
+    const schemes = [_]CliScheme{ .default, .path, .history };
+    for (schemes, expected) |scheme, scores| {
+        for (values, scores, 0..) |value, score, i| {
+            const matched = matchFuzzyForCliScheme(&index, "f", value, i, false, scheme).?;
+            try std.testing.expectEqual(score, matched.score);
         }
     }
 }
