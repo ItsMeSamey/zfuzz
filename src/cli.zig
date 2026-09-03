@@ -143,6 +143,7 @@ const Action = union(enum) {
     search: []const u8,
     change_nth: []const u8,
     change_with_nth: []const u8,
+    change_multi: []const u8,
     change_prompt: []const u8,
     change_ghost: []const u8,
     change_pointer: []const u8,
@@ -276,6 +277,17 @@ const Options = struct {
         self.walker_roots.deinit(allocator);
     }
 };
+
+const MultiMode = struct {
+    enabled: bool,
+    max: ?usize,
+};
+
+fn parseMultiMode(value: []const u8) ?MultiMode {
+    if (value.len == 0) return .{ .enabled = true, .max = null };
+    const max = std.fmt.parseInt(usize, value, 10) catch return null;
+    return .{ .enabled = max != 0, .max = if (max == 0) null else max };
+}
 
 const CandidateSet = struct {
     blob: []u8,
@@ -1272,8 +1284,7 @@ const Ui = struct {
                 }
             },
             .shift_tab => if (self.options.multi) {
-                try self.toggleCurrent();
-                self.move(-1);
+                if (try self.toggleCurrent()) self.move(-1);
             },
             .mouse => |m| try self.handleMouse(m),
             .byte => |b| switch (b) {
@@ -1285,8 +1296,7 @@ const Ui = struct {
                 },
                 10 => self.move(1),
                 9 => if (self.options.multi) {
-                    try self.toggleCurrent();
-                    self.move(1);
+                    if (try self.toggleCurrent()) self.move(1);
                 },
                 127, 8 => {
                     if (self.cursor != 0) {
@@ -1674,13 +1684,10 @@ const Ui = struct {
                 self.ensureVisible();
                 self.preview_cache_key = null;
             },
-            .toggle => try self.toggleCurrent(),
+            .toggle => _ = try self.toggleCurrent(),
             .select => try self.selectCurrent(),
             .deselect => self.deselectCurrent(),
-            .toggle_up => {
-                try self.toggleCurrent();
-                self.move(-1);
-            },
+            .toggle_up => if (try self.toggleCurrent()) self.move(-1),
             .select_all => {
                 if (self.options.multi) {
                     for (self.results[0..self.result_len]) |idx| {
@@ -1793,6 +1800,7 @@ const Ui = struct {
             .search => |value| try self.setSearchOverride(value),
             .change_nth => |value| try self.applyNthAction(self.bindingPayload(binding_slot, value), binding_slot),
             .change_with_nth => |value| if (self.with_nth_enabled) try self.applyWithNthAction(self.bindingPayload(binding_slot, value), binding_slot),
+            .change_multi => |value| self.applyMultiAction(value),
             .change_prompt => |value| self.options.prompt = value,
             .change_ghost => |value| self.options.ghost = value,
             .change_pointer => |value| self.options.pointer = value,
@@ -1885,6 +1893,26 @@ const Ui = struct {
             .toggle_bind => |targets| self.setBindingsEnabled(targets, .toggle),
         }
         return null;
+    }
+
+    fn applyMultiAction(self: *Ui, value: []const u8) void {
+        const mode = parseMultiMode(value) orelse return;
+        const max_changed = if (mode.max) |max|
+            self.options.multi_max == null or self.options.multi_max.? != max
+        else
+            self.options.multi_max != null;
+        if (mode.enabled == self.options.multi and !max_changed) return;
+
+        // fzf clears the whole selection set whenever an already-enabled
+        // multi mode changes, even when the new limit could retain entries.
+        if (self.options.multi) {
+            @memset(self.selected, false);
+            self.selection_order.clearRetainingCapacity();
+            self.selected_count = 0;
+        }
+
+        self.options.multi = mode.enabled;
+        self.options.multi_max = mode.max;
     }
 
     fn bindingPayload(self: *Ui, binding_slot: ?usize, fallback: []const u8) []const u8 {
@@ -2556,11 +2584,11 @@ const Ui = struct {
         }
     }
 
-    fn toggleCurrent(self: *Ui) !void {
-        if (self.result_len == 0) return;
+    fn toggleCurrent(self: *Ui) !bool {
+        if (!self.options.multi or self.result_len == 0) return false;
         const idx = self.results[self.focus];
         if (!self.selected[idx]) {
-            if (self.options.multi_max) |max| if (self.selected_count >= max) return;
+            if (self.options.multi_max) |max| if (self.selected_count >= max) return false;
             self.selected[idx] = true;
             try self.selection_order.append(self.allocator, idx);
             self.selected_count += 1;
@@ -2569,6 +2597,7 @@ const Ui = struct {
             self.selected_count -= 1;
             if (std.mem.indexOfScalar(usize, self.selection_order.items, idx)) |pos| _ = self.selection_order.orderedRemove(pos);
         }
+        return true;
     }
 
     fn excludeCandidates(self: *Ui, remove: []const bool) !void {
@@ -3555,8 +3584,9 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             continue;
         }
         if (std.mem.startsWith(u8, a, "--multi=")) {
-            o.*.multi = true;
-            o.*.multi_max = try std.fmt.parseInt(usize, a[8..], 10);
+            const mode = parseMultiMode(a[8..]) orelse return error.InvalidMultiLimit;
+            o.*.multi = mode.enabled;
+            o.*.multi_max = mode.max;
             continue;
         }
         if (std.mem.eql(u8, a, "--read0")) {
@@ -4224,6 +4254,8 @@ fn parseAction(s: []const u8) !Action {
     if (commandAction(s, "search")) |value| return .{ .search = value };
     if (commandAction(s, "change-nth")) |value| return .{ .change_nth = value };
     if (commandAction(s, "change-with-nth")) |value| return .{ .change_with_nth = value };
+    if (std.mem.eql(u8, s, "change-multi")) return .{ .change_multi = "" };
+    if (commandAction(s, "change-multi")) |value| return .{ .change_multi = value };
     if (commandAction(s, "change-prompt")) |value| return .{ .change_prompt = value };
     if (commandAction(s, "change-ghost")) |value| return .{ .change_ghost = value };
     if (commandAction(s, "change-pointer")) |value| return .{ .change_pointer = value };
@@ -6095,7 +6127,7 @@ const usage =
     \\      --print-query        print query before selection
     \\      --expect=KEYS        print accepted key field
     \\      --bind=SPEC          key/event actions: reload/execute/become/toggle...
-    \\                           includes raw/match navigation and exclusion actions
+    \\                           includes dynamic multi/field, raw/match, and exclusion actions
     \\      --ansi               ignore ANSI CSI sequences while matching
     \\      --tac                reverse input order
     \\
@@ -6504,6 +6536,28 @@ test "shell option splitting" {
     try std.testing.expectEqualStrings("--bind=ctrl-r:reload(echo x)", args[2]);
 }
 
+test "multi modes match fzf zero and unlimited semantics" {
+    const unlimited = parseMultiMode("").?;
+    try std.testing.expect(unlimited.enabled);
+    try std.testing.expect(unlimited.max == null);
+
+    const limited = parseMultiMode("2").?;
+    try std.testing.expect(limited.enabled);
+    try std.testing.expectEqual(@as(?usize, 2), limited.max);
+
+    const disabled = parseMultiMode("0").?;
+    try std.testing.expect(!disabled.enabled);
+    try std.testing.expect(disabled.max == null);
+    try std.testing.expect(parseMultiMode("nope") == null);
+
+    const a = std.testing.allocator;
+    const args = [_][]const u8{ "zfuzz", "--multi=0" };
+    var options = try parseOptions(a, &args);
+    defer options.deinit(a);
+    try std.testing.expect(!options.multi);
+    try std.testing.expect(options.multi_max == null);
+}
+
 test "stateful binding actions parse" {
     try std.testing.expect((try parseAction("toggle-sort")) == .toggle_sort);
     try std.testing.expect((try parseAction("enable-search")) == .enable_search);
@@ -6519,6 +6573,13 @@ test "stateful binding actions parse" {
     try std.testing.expect((try parseAction("select")) == .select);
     const printed = try parseAction("print(ctrl-y)");
     try std.testing.expectEqualStrings("ctrl-y", printed.print);
+
+    const multi_unlimited = try parseAction("change-multi");
+    try std.testing.expectEqualStrings("", multi_unlimited.change_multi);
+    const multi_limit = try parseAction("change-multi(2)");
+    try std.testing.expectEqualStrings("2", multi_limit.change_multi);
+    const multi_disable = try parseAction("change-multi:0");
+    try std.testing.expectEqualStrings("0", multi_disable.change_multi);
 }
 
 test "search override actions parse" {

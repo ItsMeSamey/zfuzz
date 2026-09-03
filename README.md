@@ -77,6 +77,9 @@ example `\{}`) to keep it literal. Dynamic `change-nth`/`transform-nth` and
 `change-with-nth`/`transform-with-nth` actions follow fzf's pipe-cycling,
 default-restoration, first-line transform, and `FZF_NTH`/`FZF_WITH_NTH`
 environment semantics; background transform variants are supported as well.
+`change-multi` can enable unlimited or bounded multi-selection, disable it with
+`0`, and follows fzf's selection-clearing behavior when an active multi mode is
+changed.
 
 ## Complexity
 
