@@ -86,6 +86,8 @@ const Action = union(enum) {
     last,
     toggle,
     toggle_up,
+    select,
+    deselect,
     select_all,
     deselect_all,
     clear_query,
@@ -96,6 +98,14 @@ const Action = union(enum) {
     hide_preview,
     refresh_preview,
     toggle_preview_wrap,
+    toggle_wrap,
+    toggle_input,
+    show_input,
+    hide_input,
+    toggle_header,
+    show_header,
+    hide_header,
+    wait,
     preview_top,
     preview_bottom,
     preview_up,
@@ -127,6 +137,7 @@ const Action = union(enum) {
     transform_header: []const u8,
     transform_footer: []const u8,
     transform_preview: []const u8,
+    print: []const u8,
     reload: []const u8,
     execute: []const u8,
     execute_silent: []const u8,
@@ -647,6 +658,9 @@ const Ui = struct {
     owned_header: ?[]u8 = null,
     owned_footer: ?[]u8 = null,
     owned_preview: ?[]u8 = null,
+    print_queue: std.ArrayList([]u8) = .empty,
+    input_hidden: bool = false,
+    header_hidden: bool = false,
 
     fn init(
         allocator: Allocator,
@@ -702,6 +716,8 @@ const Ui = struct {
         if (self.owned_header) |value| self.allocator.free(value);
         if (self.owned_footer) |value| self.allocator.free(value);
         if (self.owned_preview) |value| self.allocator.free(value);
+        for (self.print_queue.items) |value| self.allocator.free(value);
+        self.print_queue.deinit(self.allocator);
     }
 
     fn run(self: *Ui) !u8 {
@@ -870,6 +886,7 @@ const Ui = struct {
     }
 
     fn headerRowCount(self: *const Ui) usize {
+        if (self.header_hidden) return 0;
         var count = self.candidates.header.len;
         if (self.options.header) |text| {
             if (text.len != 0) {
@@ -883,6 +900,7 @@ const Ui = struct {
     }
 
     fn renderHeaderBlock(self: *Ui, w: anytype, start_row: usize, content: Pane) !usize {
+        if (self.header_hidden) return start_row;
         var row = start_row;
         if (self.options.header) |text| {
             if (text.len != 0) {
@@ -913,7 +931,7 @@ const Ui = struct {
     }
 
     fn listRows(self: *Ui, rows: usize) usize {
-        var fixed: usize = 1;
+        var fixed: usize = @intFromBool(!self.input_hidden);
         if (self.options.info_style == .default or self.options.info_style == .right) fixed += 1;
         fixed += self.headerRowCount();
         if (self.options.footer != null) fixed += 1;
@@ -1184,6 +1202,8 @@ const Ui = struct {
                 self.preview_cache_key = null;
             },
             .toggle => try self.toggleCurrent(),
+            .select => try self.selectCurrent(),
+            .deselect => self.deselectCurrent(),
             .toggle_up => {
                 try self.toggleCurrent();
                 self.move(-1);
@@ -1229,6 +1249,14 @@ const Ui = struct {
                 self.preview_offset = 0;
             },
             .toggle_preview_wrap => self.options.preview.wrap = !self.options.preview.wrap,
+            .toggle_wrap => self.options.wrap = !self.options.wrap,
+            .toggle_input => self.input_hidden = !self.input_hidden,
+            .show_input => self.input_hidden = false,
+            .hide_input => self.input_hidden = true,
+            .toggle_header => self.header_hidden = !self.header_hidden,
+            .show_header => self.header_hidden = false,
+            .hide_header => self.header_hidden = true,
+            .wait => try self.waitForSearch(),
             .preview_top => self.preview_offset = 0,
             .preview_bottom => self.preview_offset = self.previewMaxOffset(),
             .preview_up => self.scrollPreview(-1),
@@ -1321,6 +1349,7 @@ const Ui = struct {
                 self.preview_cache_key = null;
                 self.preview_offset = 0;
             },
+            .print => |value| try self.print_queue.append(self.allocator, try self.allocator.dupe(u8, value)),
             .reload => |cmd| try self.reloadFromCommand(cmd),
             .execute => |cmd| try self.executeCommand(cmd, false),
             .execute_silent => |cmd| try self.executeCommand(cmd, true),
@@ -1654,6 +1683,46 @@ const Ui = struct {
         }
     }
 
+    fn selectCurrent(self: *Ui) !void {
+        if (!self.options.multi or self.result_len == 0) return;
+        const idx = self.results[self.focus];
+        if (self.selected[idx]) return;
+        if (self.options.multi_max) |max| if (self.selected_count >= max) return;
+        self.selected[idx] = true;
+        try self.selection_order.append(self.allocator, idx);
+        self.selected_count += 1;
+    }
+
+    fn deselectCurrent(self: *Ui) void {
+        if (!self.options.multi or self.result_len == 0) return;
+        const idx = self.results[self.focus];
+        if (!self.selected[idx]) return;
+        self.selected[idx] = false;
+        self.selected_count -= 1;
+    }
+
+    fn waitForSearch(self: *Ui) !void {
+        while (true) {
+            if (self.stream) |stream| {
+                if (!stream.eof) {
+                    const update = try stream.readAvailable();
+                    if (update.changed) try self.refreshFromStream();
+                    if (update.eof_became) {
+                        self.load_event_pending = true;
+                        self.result_final_event_pending = true;
+                    }
+                    if (self.dirty_search) try self.refreshSearch(false);
+                    if (!stream.eof) {
+                        self.io.sleep(.fromNanoseconds(10 * std.time.ns_per_ms), .awake) catch {};
+                        continue;
+                    }
+                }
+            }
+            if (self.dirty_search) try self.refreshSearch(false);
+            return;
+        }
+    }
+
     fn toggleCurrent(self: *Ui) !void {
         if (self.result_len == 0) return;
         const idx = self.results[self.focus];
@@ -1690,6 +1759,10 @@ const Ui = struct {
         }
         if (self.options.expect.items.len != 0) {
             if (expect_key) |k| try w.writeAll(k);
+            try w.writeAll(sep);
+        }
+        for (self.print_queue.items) |value| {
+            try w.writeAll(value);
             try w.writeAll(sep);
         }
         if (self.selected_count != 0) {
@@ -1740,8 +1813,10 @@ const Ui = struct {
         var row = content.row;
         if (self.options.layout == .reverse) {
             if (self.options.header_first) row = try self.renderHeaderBlock(w, row, content);
-            try self.renderPrompt(w, row, content.col, content.cols);
-            row += 1;
+            if (!self.input_hidden) {
+                try self.renderPrompt(w, row, content.col, content.cols);
+                row += 1;
+            }
             if (self.options.info_style == .default or self.options.info_style == .right) {
                 try self.renderInfo(w, row, content.col, content.cols);
                 row += 1;
@@ -1756,8 +1831,10 @@ const Ui = struct {
                 try self.renderInfo(w, row, content.col, content.cols);
                 row += 1;
             }
-            try self.renderPrompt(w, row, content.col, content.cols);
-            row += 1;
+            if (!self.input_hidden) {
+                try self.renderPrompt(w, row, content.col, content.cols);
+                row += 1;
+            }
             if (self.options.footer) |f| try self.renderPlainLine(w, row, content.col, f, content.cols, self.options.theme.footer);
         }
 
@@ -3086,6 +3163,8 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "first")) return .first;
     if (std.mem.eql(u8, s, "last")) return .last;
     if (std.mem.eql(u8, s, "toggle")) return .toggle;
+    if (std.mem.eql(u8, s, "select")) return .select;
+    if (std.mem.eql(u8, s, "deselect")) return .deselect;
     if (std.mem.eql(u8, s, "toggle-up")) return .toggle_up;
     if (std.mem.eql(u8, s, "select-all")) return .select_all;
     if (std.mem.eql(u8, s, "deselect-all")) return .deselect_all;
@@ -3097,6 +3176,14 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "hide-preview")) return .hide_preview;
     if (std.mem.eql(u8, s, "refresh-preview")) return .refresh_preview;
     if (std.mem.eql(u8, s, "toggle-preview-wrap")) return .toggle_preview_wrap;
+    if (std.mem.eql(u8, s, "toggle-wrap")) return .toggle_wrap;
+    if (std.mem.eql(u8, s, "toggle-input")) return .toggle_input;
+    if (std.mem.eql(u8, s, "show-input")) return .show_input;
+    if (std.mem.eql(u8, s, "hide-input")) return .hide_input;
+    if (std.mem.eql(u8, s, "toggle-header")) return .toggle_header;
+    if (std.mem.eql(u8, s, "show-header")) return .show_header;
+    if (std.mem.eql(u8, s, "hide-header")) return .hide_header;
+    if (std.mem.eql(u8, s, "wait")) return .wait;
     if (std.mem.eql(u8, s, "preview-top")) return .preview_top;
     if (std.mem.eql(u8, s, "preview-bottom")) return .preview_bottom;
     if (std.mem.eql(u8, s, "preview-up")) return .preview_up;
@@ -3128,6 +3215,7 @@ fn parseAction(s: []const u8) !Action {
     if (commandAction(s, "transform-footer")) |cmd| return .{ .transform_footer = cmd };
     if (commandAction(s, "transform-preview")) |cmd| return .{ .transform_preview = cmd };
     if (commandAction(s, "transform")) |cmd| return .{ .transform = cmd };
+    if (commandAction(s, "print")) |value| return .{ .print = value };
     if (commandAction(s, "reload")) |cmd| return .{ .reload = cmd };
     if (commandAction(s, "execute-silent")) |cmd| return .{ .execute_silent = cmd };
     if (commandAction(s, "execute")) |cmd| return .{ .execute = cmd };
@@ -4593,6 +4681,10 @@ test "stateful binding actions parse" {
     try std.testing.expectEqualStrings("printf beta", tq.transform_query);
     const t = try parseAction("transform(printf 'down+accept')");
     try std.testing.expectEqualStrings("printf 'down+accept'", t.transform);
+    try std.testing.expect((try parseAction("wait")) == .wait);
+    try std.testing.expect((try parseAction("select")) == .select);
+    const printed = try parseAction("print(ctrl-y)");
+    try std.testing.expectEqualStrings("ctrl-y", printed.print);
 }
 
 test "binding parser" {
