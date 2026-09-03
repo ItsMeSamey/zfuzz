@@ -3897,6 +3897,17 @@ fn shellSplitArgs(allocator: Allocator, text: []const u8) ![][]const u8 {
     return try args.toOwnedSlice(allocator);
 }
 
+fn validateListenAddress(address: []const u8) !void {
+    if (std.mem.endsWith(u8, address, ".sock")) return;
+    const colon = std.mem.indexOfScalar(u8, address, ':');
+    const port_text = if (colon) |pos| blk: {
+        if (std.mem.indexOfScalarPos(u8, address, pos + 1, ':') != null) return error.InvalidListenAddress;
+        break :blk address[pos + 1 ..];
+    } else address;
+    if (port_text.len == 0) return error.InvalidListenAddress;
+    _ = std.fmt.parseInt(u16, port_text, 10) catch return error.InvalidListenAddress;
+}
+
 fn parseOptions(allocator: Allocator, args: []const []const u8) !Options {
     var o: Options = .{};
     try parseOptionsInto(allocator, &o, args, 1);
@@ -3917,24 +3928,32 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.sync = false;
             continue;
         }
-        if (std.mem.eql(u8, a, "--listen")) {
-            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+        if (std.mem.eql(u8, a, "--listen") or std.mem.eql(u8, a, "--listen-unsafe")) {
+            const unsafe = std.mem.eql(u8, a, "--listen-unsafe");
+            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-") and !std.mem.startsWith(u8, args[i + 1], "+")) {
                 i += 1;
+                try validateListenAddress(args[i]);
                 o.*.listen_addr = args[i];
             } else {
                 o.*.listen_addr = "";
             }
+            o.*.listen_unsafe = unsafe;
             continue;
         }
-        if (std.mem.eql(u8, a, "--no-listen")) {
+        if (std.mem.eql(u8, a, "--no-listen") or std.mem.eql(u8, a, "--no-listen-unsafe")) {
             o.*.listen_addr = null;
+            o.*.listen_unsafe = false;
             continue;
         }
         if (std.mem.startsWith(u8, a, "--listen=")) {
+            try validateListenAddress(a[9..]);
             o.*.listen_addr = a[9..];
+            o.*.listen_unsafe = false;
             continue;
         }
-        if (std.mem.eql(u8, a, "--listen-unsafe")) {
+        if (std.mem.startsWith(u8, a, "--listen-unsafe=")) {
+            try validateListenAddress(a[16..]);
+            o.*.listen_addr = a[16..];
             o.*.listen_unsafe = true;
             continue;
         }
@@ -8040,21 +8059,52 @@ test "finder and preview border labels parse" {
 test "listen option forms and action validation" {
     const a = std.testing.allocator;
 
-    const args_port = [_][]const u8{ "zfuzz", "--listen", "6266", "--listen-unsafe" };
-    var with_port = try parseOptions(a, &args_port);
-    defer with_port.deinit(a);
-    try std.testing.expectEqualStrings("6266", with_port.listen_addr.?);
-    try std.testing.expect(with_port.listen_unsafe);
+    const unsafe_resets_address = [_][]const u8{ "zfuzz", "--listen", "6266", "--listen-unsafe" };
+    var unsafe_default = try parseOptions(a, &unsafe_resets_address);
+    defer unsafe_default.deinit(a);
+    try std.testing.expectEqualStrings("", unsafe_default.listen_addr.?);
+    try std.testing.expect(unsafe_default.listen_unsafe);
+
+    const safe_resets_address = [_][]const u8{ "zfuzz", "--listen-unsafe=6266", "--listen" };
+    var safe_default = try parseOptions(a, &safe_resets_address);
+    defer safe_default.deinit(a);
+    try std.testing.expectEqualStrings("", safe_default.listen_addr.?);
+    try std.testing.expect(!safe_default.listen_unsafe);
+
+    const unsafe_port = [_][]const u8{ "zfuzz", "--listen-unsafe", "6267" };
+    var with_unsafe_port = try parseOptions(a, &unsafe_port);
+    defer with_unsafe_port.deinit(a);
+    try std.testing.expectEqualStrings("6267", with_unsafe_port.listen_addr.?);
+    try std.testing.expect(with_unsafe_port.listen_unsafe);
+
+    const unsafe_equals = [_][]const u8{ "zfuzz", "--listen-unsafe=localhost:6268" };
+    var with_unsafe_equals = try parseOptions(a, &unsafe_equals);
+    defer with_unsafe_equals.deinit(a);
+    try std.testing.expectEqualStrings("localhost:6268", with_unsafe_equals.listen_addr.?);
+    try std.testing.expect(with_unsafe_equals.listen_unsafe);
 
     const args_ephemeral = [_][]const u8{ "zfuzz", "--listen", "--height=20%" };
     var ephemeral = try parseOptions(a, &args_ephemeral);
     defer ephemeral.deinit(a);
     try std.testing.expectEqualStrings("", ephemeral.listen_addr.?);
+    try std.testing.expect(!ephemeral.listen_unsafe);
 
-    const args_disabled = [_][]const u8{ "zfuzz", "--listen=6267", "--no-listen" };
+    const plus_is_option = [_][]const u8{ "zfuzz", "--listen-unsafe", "+s" };
+    var before_plus = try parseOptions(a, &plus_is_option);
+    defer before_plus.deinit(a);
+    try std.testing.expectEqualStrings("", before_plus.listen_addr.?);
+    try std.testing.expect(before_plus.listen_unsafe);
+    try std.testing.expect(before_plus.no_sort);
+
+    const args_disabled = [_][]const u8{ "zfuzz", "--listen-unsafe=6267", "--no-listen-unsafe" };
     var disabled = try parseOptions(a, &args_disabled);
     defer disabled.deinit(a);
     try std.testing.expect(disabled.listen_addr == null);
+    try std.testing.expect(!disabled.listen_unsafe);
+
+    try std.testing.expectError(error.InvalidListenAddress, parseOptions(a, &.{ "zfuzz", "--listen=" }));
+    try std.testing.expectError(error.InvalidListenAddress, parseOptions(a, &.{ "zfuzz", "--listen=localhost:nope" }));
+    try std.testing.expectError(error.InvalidListenAddress, parseOptions(a, &.{ "zfuzz", "--listen=a:b:6269" }));
 
     try std.testing.expect(validateActionSequence("change-query(foo)+down"));
     try std.testing.expect(validateActionSequence("execute-silent(true)"));
