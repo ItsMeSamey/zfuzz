@@ -4821,13 +4821,23 @@ fn appendExpectedKeys(allocator: Allocator, out: *std.ArrayList([]const u8), spe
     i = 0;
     while (i <= masked.len) : (i += 1) {
         if (i != masked.len and masked[i] != ',') continue;
-        if (i != start) try out.append(allocator, spec[start..i]);
+        if (i != start) try appendExpectedKey(allocator, out, spec[start..i]);
         start = i + 1;
     }
 
     const literal_comma = std.mem.eql(u8, masked, ",") or std.mem.startsWith(u8, masked, ",,") or
         std.mem.endsWith(u8, masked, ",,") or std.mem.indexOf(u8, masked, ",,,") != null;
-    if (literal_comma) try out.append(allocator, ",");
+    if (literal_comma) try appendExpectedKey(allocator, out, ",");
+}
+
+fn appendExpectedKey(allocator: Allocator, out: *std.ArrayList([]const u8), key: []const u8) !void {
+    var i: usize = 0;
+    while (i < out.items.len) {
+        if (triggerNamesEquivalent(out.items[i], key)) {
+            _ = out.orderedRemove(i);
+        } else i += 1;
+    }
+    try out.append(allocator, key);
 }
 
 fn parseScheme(spec: []const u8) !Scheme {
@@ -4917,11 +4927,51 @@ fn asciiStartsWithIgnoreCase(text: []const u8, prefix: []const u8) bool {
     return text.len >= prefix.len and std.ascii.eqlIgnoreCase(text[0..prefix.len], prefix);
 }
 
+const KeyNameIdentity = struct {
+    kind: enum { literal, alt_literal, named },
+    value: u16,
+};
+
+fn keyNameIdentity(name: []const u8) ?KeyNameIdentity {
+    if (name.len == 1) return .{ .kind = .literal, .value = name[0] };
+    if (std.ascii.eqlIgnoreCase(name, "space")) return .{ .kind = .literal, .value = ' ' };
+    if (name.len == 5 and asciiStartsWithIgnoreCase(name, "alt-")) return .{ .kind = .alt_literal, .value = name[4] };
+    if (std.ascii.eqlIgnoreCase(name, "alt-space")) return .{ .kind = .alt_literal, .value = ' ' };
+
+    const named: u16 = if (std.ascii.eqlIgnoreCase(name, "up")) 1
+        else if (std.ascii.eqlIgnoreCase(name, "down")) 2
+        else if (std.ascii.eqlIgnoreCase(name, "left")) 3
+        else if (std.ascii.eqlIgnoreCase(name, "right")) 4
+        else if (std.ascii.eqlIgnoreCase(name, "home")) 5
+        else if (std.ascii.eqlIgnoreCase(name, "end")) 6
+        else if (std.ascii.eqlIgnoreCase(name, "page-up") or std.ascii.eqlIgnoreCase(name, "pgup")) 7
+        else if (std.ascii.eqlIgnoreCase(name, "page-down") or std.ascii.eqlIgnoreCase(name, "pgdn")) 8
+        else if (std.ascii.eqlIgnoreCase(name, "delete") or std.ascii.eqlIgnoreCase(name, "del")) 9
+        else if (std.ascii.eqlIgnoreCase(name, "shift-tab") or std.ascii.eqlIgnoreCase(name, "btab")) 10
+        else if (std.ascii.eqlIgnoreCase(name, "enter") or std.ascii.eqlIgnoreCase(name, "return")) 11
+        else if (std.ascii.eqlIgnoreCase(name, "tab")) 12
+        else if (std.ascii.eqlIgnoreCase(name, "esc")) 13
+        else if (std.ascii.eqlIgnoreCase(name, "backspace") or std.ascii.eqlIgnoreCase(name, "bspace") or std.ascii.eqlIgnoreCase(name, "bs")) 14
+        else if (std.ascii.eqlIgnoreCase(name, "ctrl-space")) 15
+        else if (std.ascii.eqlIgnoreCase(name, "ctrl-^") or std.ascii.eqlIgnoreCase(name, "ctrl-6")) 16
+        else if (std.ascii.eqlIgnoreCase(name, "ctrl-/") or std.ascii.eqlIgnoreCase(name, "ctrl-_")) 17
+        else if (std.ascii.eqlIgnoreCase(name, "ctrl-\\")) 18
+        else if (std.ascii.eqlIgnoreCase(name, "ctrl-]")) 19
+        else if (std.ascii.eqlIgnoreCase(name, "alt-enter") or std.ascii.eqlIgnoreCase(name, "alt-return")) 20
+        else if (std.ascii.eqlIgnoreCase(name, "alt-bs") or std.ascii.eqlIgnoreCase(name, "alt-bspace") or std.ascii.eqlIgnoreCase(name, "alt-backspace")) 21
+        else if (name.len == 6 and asciiStartsWithIgnoreCase(name, "ctrl-") and std.ascii.isAlphabetic(name[5]))
+            100 + @as(u16, std.ascii.toLower(name[5]) - 'a')
+        else return null;
+    return .{ .kind = .named, .value = named };
+}
+
 fn triggerNamesEquivalent(a: []const u8, b: []const u8) bool {
-    if (a.len == 1 or b.len == 1) return std.mem.eql(u8, a, b);
-    const a_alt = a.len == 5 and asciiStartsWithIgnoreCase(a, "alt-");
-    const b_alt = b.len == 5 and asciiStartsWithIgnoreCase(b, "alt-");
-    if (a_alt or b_alt) return a_alt and b_alt and a[4] == b[4];
+    const ai = keyNameIdentity(a);
+    const bi = keyNameIdentity(b);
+    if (ai != null or bi != null) {
+        if (ai == null or bi == null) return false;
+        return ai.?.kind == bi.?.kind and ai.?.value == bi.?.value;
+    }
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
@@ -6582,26 +6632,35 @@ fn writeHighlighted(w: anytype, text: []const u8, query: []const u8, cols: usize
 }
 
 fn keyMatchesName(key: Key, name: []const u8) bool {
+    const identity = keyNameIdentity(name) orelse return false;
     return switch (key) {
-        .up => std.ascii.eqlIgnoreCase(name, "up"),
-        .down => std.ascii.eqlIgnoreCase(name, "down"),
-        .left => std.ascii.eqlIgnoreCase(name, "left"),
-        .right => std.ascii.eqlIgnoreCase(name, "right"),
-        .home => std.ascii.eqlIgnoreCase(name, "home"),
-        .end => std.ascii.eqlIgnoreCase(name, "end"),
-        .page_up => std.ascii.eqlIgnoreCase(name, "page-up") or std.ascii.eqlIgnoreCase(name, "pgup"),
-        .page_down => std.ascii.eqlIgnoreCase(name, "page-down") or std.ascii.eqlIgnoreCase(name, "pgdn"),
-        .delete => std.ascii.eqlIgnoreCase(name, "delete"),
-        .shift_tab => std.ascii.eqlIgnoreCase(name, "shift-tab") or std.ascii.eqlIgnoreCase(name, "btab"),
-        .alt_byte => |b| name.len == 5 and asciiStartsWithIgnoreCase(name, "alt-") and name[4] == b,
+        .up => identity.kind == .named and identity.value == 1,
+        .down => identity.kind == .named and identity.value == 2,
+        .left => identity.kind == .named and identity.value == 3,
+        .right => identity.kind == .named and identity.value == 4,
+        .home => identity.kind == .named and identity.value == 5,
+        .end => identity.kind == .named and identity.value == 6,
+        .page_up => identity.kind == .named and identity.value == 7,
+        .page_down => identity.kind == .named and identity.value == 8,
+        .delete => identity.kind == .named and identity.value == 9,
+        .shift_tab => identity.kind == .named and identity.value == 10,
+        .alt_byte => |b| (identity.kind == .alt_literal and identity.value == b) or
+            (identity.kind == .named and ((identity.value == 20 and (b == 13 or b == 10)) or
+            (identity.value == 21 and (b == 127 or b == 8)))),
         .byte => |b| blk: {
-            if ((b == 13 or b == 10) and std.ascii.eqlIgnoreCase(name, "enter")) break :blk true;
-            if (b == 9 and std.ascii.eqlIgnoreCase(name, "tab")) break :blk true;
-            if (b == 27 and std.ascii.eqlIgnoreCase(name, "esc")) break :blk true;
-            if ((b == 127 or b == 8) and std.ascii.eqlIgnoreCase(name, "backspace")) break :blk true;
-            if (b >= 1 and b <= 26 and name.len == 6 and asciiStartsWithIgnoreCase(name, "ctrl-"))
-                break :blk std.ascii.toLower(name[5]) == ('a' + b - 1);
-            break :blk name.len == 1 and name[0] == b;
+            if (identity.kind == .literal) break :blk identity.value == b;
+            if (identity.kind != .named) break :blk false;
+            if (identity.value == 11) break :blk b == 13 or b == 10;
+            if (identity.value == 12) break :blk b == 9;
+            if (identity.value == 13) break :blk b == 27;
+            if (identity.value == 14) break :blk b == 127 or b == 8;
+            if (identity.value == 15) break :blk b == 0;
+            if (identity.value == 16) break :blk b == 30;
+            if (identity.value == 17) break :blk b == 31;
+            if (identity.value == 18) break :blk b == 28;
+            if (identity.value == 19) break :blk b == 29;
+            if (identity.value >= 100 and identity.value < 126) break :blk b == identity.value - 99;
+            break :blk false;
         },
         else => false,
     };
@@ -8533,6 +8592,19 @@ test "key names follow fzf case semantics" {
     try std.testing.expect(!triggerNamesEquivalent("A", "a"));
     try std.testing.expect(triggerNamesEquivalent("AlT-A", "alt-A"));
     try std.testing.expect(!triggerNamesEquivalent("alt-A", "alt-a"));
+    try std.testing.expect(keyMatchesName(.{ .byte = 13 }, "RETURN"));
+    try std.testing.expect(keyMatchesName(.{ .byte = ' ' }, "space"));
+    try std.testing.expect(keyMatchesName(.delete, "DEL"));
+    try std.testing.expect(keyMatchesName(.{ .byte = 127 }, "bs"));
+    try std.testing.expect(keyMatchesName(.{ .alt_byte = ' ' }, "Alt-Space"));
+    try std.testing.expect(keyMatchesName(.{ .alt_byte = 13 }, "alt-return"));
+    try std.testing.expect(keyMatchesName(.{ .byte = 30 }, "ctrl-6"));
+    try std.testing.expect(keyMatchesName(.{ .byte = 31 }, "ctrl-_"));
+    try std.testing.expect(triggerNamesEquivalent("enter", "return"));
+    try std.testing.expect(triggerNamesEquivalent("backspace", "bspace"));
+    try std.testing.expect(triggerNamesEquivalent("delete", "del"));
+    try std.testing.expect(triggerNamesEquivalent("space", " "));
+    try std.testing.expect(triggerNamesEquivalent("alt-enter", "alt-return"));
 }
 
 test "fzf parser equal inverse fuzzy and boundary exact" {
@@ -8911,6 +8983,24 @@ test "expect preserves fzf comma key chords" {
     try std.testing.expectEqualStrings("a", list.expect.items[0]);
     try std.testing.expectEqualStrings("b", list.expect.items[1]);
     try std.testing.expectEqualStrings(",", list.expect.items[2]);
+}
+
+test "expect aliases keep the last fzf spelling per event" {
+    const a = std.testing.allocator;
+    const args = [_][]const u8{ "zfuzz", "--expect=return,enter,bspace,backspace,del,delete,space" };
+    var options = try parseOptions(a, &args);
+    defer options.deinit(a);
+    try std.testing.expectEqual(@as(usize, 4), options.expect.items.len);
+    try std.testing.expectEqualStrings("enter", options.expect.items[0]);
+    try std.testing.expectEqualStrings("backspace", options.expect.items[1]);
+    try std.testing.expectEqualStrings("delete", options.expect.items[2]);
+    try std.testing.expectEqualStrings("space", options.expect.items[3]);
+
+    const repeated_args = [_][]const u8{ "zfuzz", "--expect=return", "--expect=ENTER" };
+    var repeated = try parseOptions(a, &repeated_args);
+    defer repeated.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), repeated.expect.items.len);
+    try std.testing.expectEqualStrings("ENTER", repeated.expect.items[0]);
 }
 
 test "fzf parser reset options are last-one-wins" {
