@@ -4073,6 +4073,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.filepath_word = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "--no-filepath-word")) {
+            o.*.filepath_word = false;
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--scroll-off=")) {
             o.*.scroll_off = try std.fmt.parseInt(usize, a[13..], 10);
             continue;
@@ -4297,6 +4301,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             o.*.margin = try parseInsets(args[i]);
             continue;
         }
+        if (std.mem.eql(u8, a, "--no-margin")) {
+            o.*.margin = .{};
+            continue;
+        }
         if (std.mem.startsWith(u8, a, "--padding=")) {
             o.*.padding = try parseInsets(a[10..]);
             continue;
@@ -4305,6 +4313,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             i += 1;
             if (i >= args.len) return error.MissingArgument;
             o.*.padding = try parseInsets(args[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-padding")) {
+            o.*.padding = .{};
             continue;
         }
         if (std.mem.eql(u8, a, "--no-mouse")) {
@@ -4602,6 +4614,10 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             if (i >= args.len) return error.MissingArgument;
             var it = std.mem.splitScalar(u8, args[i], ',');
             while (it.next()) |k| if (k.len != 0) try o.*.expect.append(allocator, k);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-expect")) {
+            o.*.expect.clearRetainingCapacity();
             continue;
         }
         if (std.mem.startsWith(u8, a, "--bind=")) {
@@ -8043,6 +8059,63 @@ test "listen option forms and action validation" {
     try std.testing.expect(validateActionSequence("change-query(foo)+down"));
     try std.testing.expect(validateActionSequence("execute-silent(true)"));
     try std.testing.expect(!validateActionSequence("not-a-real-action"));
+}
+
+test "fzf parser reset options are last-one-wins" {
+    const a = std.testing.allocator;
+    const args = [_][]const u8{
+        "zfuzz",
+        "--filepath-word",
+        "--no-filepath-word",
+        "--margin=1,2,3,4",
+        "--no-margin",
+        "--padding=4,3,2,1",
+        "--no-padding",
+        "--expect=ctrl-a,ctrl-b",
+        "--no-expect",
+        "--filepath-word",
+        "--margin=5",
+        "--padding=6",
+        "--expect=enter",
+    };
+    var options = try parseOptions(a, &args);
+    defer options.deinit(a);
+
+    try std.testing.expect(options.filepath_word);
+    try std.testing.expectEqual(@as(usize, 1), options.expect.items.len);
+    try std.testing.expectEqualStrings("enter", options.expect.items[0]);
+    inline for (.{ options.margin.top, options.margin.right, options.margin.bottom, options.margin.left }) |side| {
+        try std.testing.expectEqual(@as(u16, 5), side.value);
+        try std.testing.expect(!side.percent);
+    }
+    inline for (.{ options.padding.top, options.padding.right, options.padding.bottom, options.padding.left }) |side| {
+        try std.testing.expectEqual(@as(u16, 6), side.value);
+        try std.testing.expect(!side.percent);
+    }
+
+    const reset_args = [_][]const u8{
+        "zfuzz",
+        "--filepath-word",
+        "--no-filepath-word",
+        "--margin=1%",
+        "--no-margin",
+        "--padding=2%",
+        "--no-padding",
+        "--expect=ctrl-a",
+        "--no-expect",
+    };
+    var reset = try parseOptions(a, &reset_args);
+    defer reset.deinit(a);
+    try std.testing.expect(!reset.filepath_word);
+    try std.testing.expectEqual(@as(usize, 0), reset.expect.items.len);
+    inline for (.{ reset.margin.top, reset.margin.right, reset.margin.bottom, reset.margin.left }) |side| {
+        try std.testing.expectEqual(@as(u16, 0), side.value);
+        try std.testing.expect(!side.percent);
+    }
+    inline for (.{ reset.padding.top, reset.padding.right, reset.padding.bottom, reset.padding.left }) |side| {
+        try std.testing.expectEqual(@as(u16, 0), side.value);
+        try std.testing.expect(!side.percent);
+    }
 }
 
 test "literal option toggles match fzf" {
