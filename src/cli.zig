@@ -83,6 +83,14 @@ const Action = union(enum) {
     down,
     page_up,
     page_down,
+    beginning_of_line,
+    end_of_line,
+    backward_char,
+    forward_char,
+    backward_delete_char,
+    backward_delete_char_eof,
+    delete_char,
+    delete_char_eof,
     backward_word,
     forward_word,
     backward_kill_word,
@@ -1272,21 +1280,11 @@ const Ui = struct {
             .page_down => self.page(1),
             .word_left => self.cursor = wordBoundaryBackward(self.query.items, self.cursor),
             .word_right => self.cursor = wordBoundaryForward(self.query.items, self.cursor),
-            .home => {
-                self.cursor = 0;
-            },
-            .end => {
-                self.cursor = self.query.items.len;
-            },
+            .home => self.cursor = 0,
+            .end => self.cursor = self.query.items.len,
             .left => self.cursor = prevUtf8Boundary(self.query.items, self.cursor),
             .right => self.cursor = nextUtf8Boundary(self.query.items, self.cursor),
-            .delete => {
-                if (self.cursor < self.query.items.len) {
-                    const next = nextUtf8Boundary(self.query.items, self.cursor);
-                    self.query.replaceRange(self.allocator, self.cursor, next - self.cursor, &.{}) catch return error.OutOfMemory;
-                    self.markQueryChanged();
-                }
-            },
+            .delete => _ = try self.deleteCharForward(),
             .shift_tab => if (self.options.multi) {
                 if (try self.toggleCurrent()) self.move(-1);
             },
@@ -1302,16 +1300,12 @@ const Ui = struct {
                 9 => if (self.options.multi) {
                     if (try self.toggleCurrent()) self.move(1);
                 },
-                127, 8 => {
-                    if (self.cursor != 0) {
-                        const prev = prevUtf8Boundary(self.query.items, self.cursor);
-                        self.query.replaceRange(self.allocator, prev, self.cursor - prev, &.{}) catch return error.OutOfMemory;
-                        self.cursor = prev;
-                        self.markQueryChanged();
-                    }
-                },
+                127, 8 => _ = try self.deleteCharBackward(),
                 1 => self.cursor = 0,
+                2 => self.cursor = prevUtf8Boundary(self.query.items, self.cursor),
+                4 => if (!try self.deleteCharForward() and self.cursor == 0) return 130,
                 5 => self.cursor = self.query.items.len,
+                6 => self.cursor = nextUtf8Boundary(self.query.items, self.cursor),
                 11 => self.move(-1),
                 16 => if (self.history != null) try self.navigateHistory(-1) else self.move(-1),
                 14 => if (self.history != null) try self.navigateHistory(1) else self.move(1),
@@ -1653,6 +1647,17 @@ const Ui = struct {
             .down => self.move(1),
             .page_up => self.page(-1),
             .page_down => self.page(1),
+            .beginning_of_line => self.cursor = 0,
+            .end_of_line => self.cursor = self.query.items.len,
+            .backward_char => self.cursor = prevUtf8Boundary(self.query.items, self.cursor),
+            .forward_char => self.cursor = nextUtf8Boundary(self.query.items, self.cursor),
+            .backward_delete_char => _ = try self.deleteCharBackward(),
+            .backward_delete_char_eof => {
+                if (self.query.items.len == 0) return 130;
+                _ = try self.deleteCharBackward();
+            },
+            .delete_char => _ = try self.deleteCharForward(),
+            .delete_char_eof => if (!try self.deleteCharForward() and self.cursor == 0) return 130,
             .up_match => self.moveMatch(-1),
             .down_match => self.moveMatch(1),
             .best => self.focusBestMatch(),
@@ -2737,6 +2742,23 @@ const Ui = struct {
             remove[self.results[self.focus]] = true;
         }
         try self.excludeCandidates(remove);
+    }
+
+    fn deleteCharBackward(self: *Ui) !bool {
+        if (self.cursor == 0) return false;
+        const prev = prevUtf8Boundary(self.query.items, self.cursor);
+        try self.query.replaceRange(self.allocator, prev, self.cursor - prev, &.{});
+        self.cursor = prev;
+        self.markQueryChanged();
+        return true;
+    }
+
+    fn deleteCharForward(self: *Ui) !bool {
+        if (self.cursor >= self.query.items.len) return false;
+        const next = nextUtf8Boundary(self.query.items, self.cursor);
+        try self.query.replaceRange(self.allocator, self.cursor, next - self.cursor, &.{});
+        self.markQueryChanged();
+        return true;
     }
 
     fn deleteWordBackward(self: *Ui) void {
@@ -4238,6 +4260,14 @@ fn parseAction(s: []const u8) !Action {
     if (std.mem.eql(u8, s, "down")) return .down;
     if (std.mem.eql(u8, s, "page-up")) return .page_up;
     if (std.mem.eql(u8, s, "page-down")) return .page_down;
+    if (std.mem.eql(u8, s, "beginning-of-line")) return .beginning_of_line;
+    if (std.mem.eql(u8, s, "end-of-line")) return .end_of_line;
+    if (std.mem.eql(u8, s, "backward-char")) return .backward_char;
+    if (std.mem.eql(u8, s, "forward-char")) return .forward_char;
+    if (std.mem.eql(u8, s, "backward-delete-char")) return .backward_delete_char;
+    if (std.mem.eql(u8, s, "backward-delete-char/eof")) return .backward_delete_char_eof;
+    if (std.mem.eql(u8, s, "delete-char")) return .delete_char;
+    if (std.mem.eql(u8, s, "delete-char/eof")) return .delete_char_eof;
     if (std.mem.eql(u8, s, "backward-word")) return .backward_word;
     if (std.mem.eql(u8, s, "forward-word")) return .forward_word;
     if (std.mem.eql(u8, s, "backward-kill-word")) return .backward_kill_word;
@@ -6623,6 +6653,14 @@ test "stateful binding actions parse" {
     try std.testing.expect((try parseAction("toggle-in")) == .toggle_in);
     try std.testing.expect((try parseAction("toggle-out")) == .toggle_out);
     try std.testing.expect((try parseAction("toggle-all")) == .toggle_all);
+    try std.testing.expect((try parseAction("beginning-of-line")) == .beginning_of_line);
+    try std.testing.expect((try parseAction("end-of-line")) == .end_of_line);
+    try std.testing.expect((try parseAction("backward-char")) == .backward_char);
+    try std.testing.expect((try parseAction("forward-char")) == .forward_char);
+    try std.testing.expect((try parseAction("backward-delete-char")) == .backward_delete_char);
+    try std.testing.expect((try parseAction("backward-delete-char/eof")) == .backward_delete_char_eof);
+    try std.testing.expect((try parseAction("delete-char")) == .delete_char);
+    try std.testing.expect((try parseAction("delete-char/eof")) == .delete_char_eof);
     const printed = try parseAction("print(ctrl-y)");
     try std.testing.expectEqualStrings("ctrl-y", printed.print);
 

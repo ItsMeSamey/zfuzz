@@ -79,7 +79,10 @@ default-restoration, first-line transform, and `FZF_NTH`/`FZF_WITH_NTH`
 environment semantics; background transform variants are supported as well.
 `change-multi` can enable unlimited or bounded multi-selection, disable it with
 `0`, and follows fzf's selection-clearing behavior when an active multi mode is
-changed.
+changed. Bindable query-edit actions also include fzf-compatible
+`beginning-of-line`, `end-of-line`, `backward-char`, `forward-char`,
+`backward-delete-char`, `delete-char`, and their `/eof` variants; character
+movement and deletion remain UTF-8 boundary-safe.
 
 ## Complexity
 
