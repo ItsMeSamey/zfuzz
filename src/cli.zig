@@ -4799,6 +4799,7 @@ fn parseOptionsInto(allocator: Allocator, o: *Options, args: []const []const u8,
             try parseBindings(allocator, &o.*.bindings, args[i]);
             continue;
         }
+        if (std.mem.eql(u8, a, "--")) continue;
         return error.UnknownOption;
     }
     return;
@@ -7924,6 +7925,15 @@ test "compact query filter and nth options match fzf" {
     try std.testing.expectEqualStrings("-x", dashed.query);
     try std.testing.expectEqualStrings("-y", dashed.filter.?);
     try std.testing.expectEqualStrings("-1", dashed.nth.?);
+}
+
+test "bare double dash is ignored without ending fzf option parsing" {
+    const a = std.testing.allocator;
+    const args = [_][]const u8{ "zfuzz", "--", "--filter=needle", "--exact" };
+    var options = try parseOptions(a, &args);
+    defer options.deinit(a);
+    try std.testing.expectEqualStrings("needle", options.filter.?);
+    try std.testing.expect(options.exact);
 }
 
 test "no-input option starts the existing input visibility state hidden" {
