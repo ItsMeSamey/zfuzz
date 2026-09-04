@@ -3968,7 +3968,7 @@ pub fn main(init: std.process.Init) !void {
         _ = try stream.readAvailable();
         const blob = try stream.materializeBlob();
         break :blk try candidatesFromOwnedBlob(allocator, blob, &options);
-    } else try readCandidates(allocator, init.io, &options, init.environ_map.get("FZF_DEFAULT_COMMAND"));
+    } else try readCandidates(allocator, init.io, &options, init.environ_map.get("FZF_DEFAULT_COMMAND"), init.environ_map.get("COMSPEC"));
     defer candidates.deinit(allocator);
 
     var index = try fuzzy.init(allocator, candidates.search);
@@ -5497,13 +5497,84 @@ fn parseWalkerOptions(spec: []const u8) !WalkerOptions {
     return out;
 }
 
-fn appendWalkerSkipExpr(allocator: Allocator, argv: *std.ArrayList([]const u8), options: *const Options) !bool {
+fn walkerDirSkipped(options: *const Options, basename: []const u8) bool {
+    if (!options.walker.hidden and basename.len != 0 and basename[0] == '.') return true;
+    var it = std.mem.splitScalar(u8, options.walker_skip, ',');
+    while (it.next()) |name| {
+        if (name.len != 0 and std.mem.eql(u8, basename, name)) return true;
+    }
+    return false;
+}
+
+fn walkerAppendPath(out: *std.ArrayList(u8), allocator: Allocator, root: []const u8, relative: []const u8, delim: u8) !void {
+    try out.appendSlice(allocator, root);
+    if (root.len != 0 and !std.fs.path.isSep(root[root.len - 1])) try out.append(allocator, std.fs.path.sep);
+    try out.appendSlice(allocator, relative);
+    try out.append(allocator, delim);
+}
+
+fn walkerAncestorContains(ancestors: []const Io.File.INode, inode: Io.File.INode) bool {
+    for (ancestors) |ancestor| if (ancestor == inode) return true;
+    return false;
+}
+
+fn walkNativeDir(
+    allocator: Allocator,
+    io: Io,
+    options: *const Options,
+    root_label: []const u8,
+    dir: Io.Dir,
+    relative: *std.ArrayList(u8),
+    ancestors: *std.ArrayList(Io.File.INode),
+    out: *std.ArrayList(u8),
+) !void {
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        const old_len = relative.items.len;
+        defer relative.shrinkRetainingCapacity(old_len);
+        if (old_len != 0) try relative.append(allocator, std.fs.path.sep);
+        try relative.appendSlice(allocator, entry.name);
+
+        var kind = entry.kind;
+        if (kind == .unknown or (kind == .sym_link and options.walker.follow)) {
+            const stat = dir.statFile(io, entry.name, .{ .follow_symlinks = options.walker.follow }) catch continue;
+            kind = stat.kind;
+        }
+
+        if (kind == .directory) {
+            if (walkerDirSkipped(options, entry.name)) continue;
+            if (options.walker.dir) try walkerAppendPath(out, allocator, root_label, relative.items, if (options.read0) 0 else '\n');
+
+            var child = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+            defer child.close(io);
+            const child_stat = child.stat(io) catch continue;
+            if (walkerAncestorContains(ancestors.items, child_stat.inode)) continue;
+            try ancestors.append(allocator, child_stat.inode);
+            defer _ = ancestors.pop();
+            try walkNativeDir(allocator, io, options, root_label, child, relative, ancestors, out);
+        } else if (kind == .file and options.walker.file) {
+            try walkerAppendPath(out, allocator, root_label, relative.items, if (options.read0) 0 else '\n');
+        }
+    }
+}
+
+fn appendNativeWalkerRoot(allocator: Allocator, io: Io, options: *const Options, root_label: []const u8, root: Io.Dir, out: *std.ArrayList(u8)) !void {
+    var relative: std.ArrayList(u8) = .empty;
+    defer relative.deinit(allocator);
+    var ancestors: std.ArrayList(Io.File.INode) = .empty;
+    defer ancestors.deinit(allocator);
+    const root_stat = try root.stat(io);
+    try ancestors.append(allocator, root_stat.inode);
+    try walkNativeDir(allocator, io, options, root_label, root, &relative, &ancestors, out);
+}
+
+fn appendWalkerSkipExpr(allocator: Allocator, argv: *std.ArrayList([]const u8), options: *const Options) !void {
     var names: std.ArrayList([]const u8) = .empty;
     defer names.deinit(allocator);
     var it = std.mem.splitScalar(u8, options.walker_skip, ',');
     while (it.next()) |name| if (name.len != 0) try names.append(allocator, name);
     const skip_hidden = !options.walker.hidden;
-    if (names.items.len == 0 and !skip_hidden) return false;
+    if (names.items.len == 0 and !skip_hidden) return;
 
     try argv.appendSlice(allocator, &.{ "(", "-type", "d", "(" });
     var first = true;
@@ -5517,59 +5588,88 @@ fn appendWalkerSkipExpr(allocator: Allocator, argv: *std.ArrayList([]const u8), 
         try argv.appendSlice(allocator, &.{ "-name", ".*" });
     }
     try argv.appendSlice(allocator, &.{ ")", ")", "-prune", "-o" });
-    return true;
 }
 
-fn runWalker(allocator: Allocator, io: Io, options: *const Options) ![]u8 {
+const ProcessStdout = struct {
+    term: std.process.Child.Term,
+    stdout: []u8,
+};
+
+fn runProcessStdout(allocator: Allocator, io: Io, argv: []const []const u8) !ProcessStdout {
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    defer child.kill(io);
+
+    var buffer: [64 * 1024]u8 = undefined;
+    var reader = child.stdout.?.readerStreaming(io, &buffer);
+    const stdout = try reader.interface.allocRemaining(allocator, .unlimited);
+    errdefer allocator.free(stdout);
+    return .{ .term = try child.wait(io), .stdout = stdout };
+}
+
+fn runFindWalker(allocator: Allocator, io: Io, options: *const Options) ![]u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.append(allocator, "/usr/bin/find");
     if (options.walker.follow) try argv.append(allocator, "-L");
     if (options.walker_roots.items.len == 0) try argv.append(allocator, ".") else try argv.appendSlice(allocator, options.walker_roots.items);
     try argv.appendSlice(allocator, &.{ "-mindepth", "1" });
-    _ = try appendWalkerSkipExpr(allocator, &argv, options);
-
+    try appendWalkerSkipExpr(allocator, &argv, options);
     if (options.walker.file and options.walker.dir) {
         try argv.appendSlice(allocator, &.{ "(", "-type", "f", "-o", "-type", "d", ")" });
     } else if (options.walker.file) {
         try argv.appendSlice(allocator, &.{ "-type", "f" });
     } else if (options.walker.dir) {
         try argv.appendSlice(allocator, &.{ "-type", "d" });
-    } else {
-        return try allocator.alloc(u8, 0);
-    }
+    } else return try allocator.alloc(u8, 0);
     try argv.append(allocator, if (options.read0) "-print0" else "-print");
 
-    const result = try std.process.run(allocator, io, .{
-        .argv = argv.items,
-        .stdout_limit = .limited(256 * 1024 * 1024),
-        .stderr_limit = .limited(4 * 1024 * 1024),
-    });
-    defer allocator.free(result.stderr);
+    const result = try runProcessStdout(allocator, io, argv.items);
     switch (result.term) {
-        .exited => |code| if (code != 0) {
-            allocator.free(result.stdout);
-            return error.WalkerFailed;
-        },
-        else => {
-            allocator.free(result.stdout);
-            return error.WalkerFailed;
-        },
+        .exited => |code| if (code == 0) return result.stdout,
+        else => {},
     }
+    allocator.free(result.stdout);
+    return error.WalkerFailed;
+}
+
+fn runWalker(allocator: Allocator, io: Io, options: *const Options) ![]u8 {
+    if (comptime builtin.os.tag != .windows and builtin.os.tag != .macos) return runFindWalker(allocator, io, options);
+    if (!options.walker.file and !options.walker.dir) return try allocator.alloc(u8, 0);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    if (options.walker_roots.items.len == 0) {
+        var root = try Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
+        defer root.close(io);
+        try appendNativeWalkerRoot(allocator, io, options, ".", root, &out);
+    } else {
+        for (options.walker_roots.items) |root_path| {
+            var root = try Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
+            defer root.close(io);
+            try appendNativeWalkerRoot(allocator, io, options, root_path, root, &out);
+        }
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn runDefaultCommand(allocator: Allocator, io: Io, command: []const u8, windows_shell: ?[]const u8) ![]u8 {
+    const result = if (comptime builtin.os.tag == .windows)
+        try runProcessStdout(allocator, io, &.{ windows_shell orelse "cmd.exe", "/d", "/s", "/c", command })
+    else
+        try runProcessStdout(allocator, io, &.{ "/bin/sh", "-c", command });
     return result.stdout;
 }
 
-fn readCandidates(allocator: Allocator, io: Io, options: *const Options, default_command: ?[]const u8) !CandidateSet {
+fn readCandidates(allocator: Allocator, io: Io, options: *const Options, default_command: ?[]const u8, windows_shell: ?[]const u8) !CandidateSet {
     if (Io.File.stdin().isTty(io) catch false) {
         const blob = if (default_command) |command| blk: {
             if (command.len == 0) break :blk try runWalker(allocator, io, options);
-            const result = try std.process.run(allocator, io, .{
-                .argv = &.{ "/bin/sh", "-c", command },
-                .stdout_limit = .limited(256 * 1024 * 1024),
-                .stderr_limit = .limited(4 * 1024 * 1024),
-            });
-            allocator.free(result.stderr);
-            break :blk result.stdout;
+            break :blk try runDefaultCommand(allocator, io, command, windows_shell);
         } else try runWalker(allocator, io, options);
         return candidatesFromOwnedBlob(allocator, blob, options);
     }
@@ -7799,6 +7899,85 @@ test "walker options match fzf defaults and parse explicit modes" {
     try std.testing.expectError(error.InvalidWalkerOption, parseWalkerOptions("file,bogus"));
     try std.testing.expectError(error.InvalidWalkerOption, parseWalkerOptions("follow,hidden"));
     try std.testing.expectError(error.InvalidWalkerOption, parseWalkerOptions(""));
+}
+
+fn testWalkerHasRecord(blob: []const u8, delim: u8, expected: []const u8) bool {
+    var it = std.mem.splitScalar(u8, blob, delim);
+    while (it.next()) |record| if (std.mem.eql(u8, record, expected)) return true;
+    return false;
+}
+
+test "default command uses the platform shell and streams stdout" {
+    const a = std.testing.allocator;
+    const command = if (builtin.os.tag == .windows) "echo beta" else "printf 'beta\\n'";
+    const got = try runDefaultCommand(a, std.testing.io, command, null);
+    defer a.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "beta") != null);
+}
+
+test "walker platform implementation enumerates an explicit root" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "needle.txt", .data = "" });
+
+    const root_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer a.free(root_path);
+    var options: Options = .{ .walker = .{ .file = true, .dir = false, .follow = true, .hidden = true } };
+    defer options.deinit(a);
+    try options.walker_roots.append(a, root_path);
+
+    const blob = try runWalker(a, std.testing.io, &options);
+    defer a.free(blob);
+    const expected = try std.fs.path.join(a, &.{ root_path, "needle.txt" });
+    defer a.free(expected);
+    try std.testing.expect(testWalkerHasRecord(blob, '\n', expected));
+}
+
+test "native walker recurses and honors skip hidden and record delimiter" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var visible = try tmp.dir.createDirPathOpen(std.testing.io, "visible", .{});
+    visible.close(std.testing.io);
+    var skipped = try tmp.dir.createDirPathOpen(std.testing.io, "node_modules", .{});
+    skipped.close(std.testing.io);
+    var hidden = try tmp.dir.createDirPathOpen(std.testing.io, ".hidden-dir", .{});
+    hidden.close(std.testing.io);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "top.txt", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".hidden-file", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "visible/keep.txt", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "node_modules/skip.txt", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".hidden-dir/skip.txt", .data = "" });
+
+    var options: Options = .{ .walker = .{ .file = true, .dir = true, .follow = false, .hidden = false } };
+    defer options.deinit(a);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try appendNativeWalkerRoot(a, std.testing.io, &options, "ROOT", tmp.dir, &out);
+
+    const sep = std.fs.path.sep_str;
+    const top = try std.mem.concat(a, u8, &.{ "ROOT", sep, "top.txt" });
+    defer a.free(top);
+    const hidden_file = try std.mem.concat(a, u8, &.{ "ROOT", sep, ".hidden-file" });
+    defer a.free(hidden_file);
+    const visible_dir = try std.mem.concat(a, u8, &.{ "ROOT", sep, "visible" });
+    defer a.free(visible_dir);
+    const keep = try std.mem.concat(a, u8, &.{ "ROOT", sep, "visible", sep, "keep.txt" });
+    defer a.free(keep);
+    try std.testing.expect(testWalkerHasRecord(out.items, '\n', top));
+    try std.testing.expect(testWalkerHasRecord(out.items, '\n', hidden_file));
+    try std.testing.expect(testWalkerHasRecord(out.items, '\n', visible_dir));
+    try std.testing.expect(testWalkerHasRecord(out.items, '\n', keep));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "node_modules") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, ".hidden-dir") == null);
+
+    options.read0 = true;
+    var nul_out: std.ArrayList(u8) = .empty;
+    defer nul_out.deinit(a);
+    try appendNativeWalkerRoot(a, std.testing.io, &options, "ROOT", tmp.dir, &nul_out);
+    try std.testing.expect(testWalkerHasRecord(nul_out.items, 0, keep));
+    try std.testing.expect(std.mem.indexOfScalar(u8, nul_out.items, '\n') == null);
 }
 
 test "walker root option consumes directories and replaces prior roots" {
