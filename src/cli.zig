@@ -1495,7 +1495,8 @@ const Ui = struct {
                 'b' => self.cursor = self.queryWordBoundaryBackward(),
                 'f' => self.cursor = self.queryWordBoundaryForward(),
                 'd' => _ = try self.killWordForward(),
-                127, 8 => _ = try self.killWordBackward(),
+                127 => _ = try self.killWordBackward(),
+                8 => {},
                 else => {},
             },
             .paste_start, .paste_end => unreachable,
@@ -4996,6 +4997,8 @@ fn keyNameIdentity(name: []const u8) ?KeyNameIdentity {
         else if (std.ascii.eqlIgnoreCase(name, "ctrl-]")) 19
         else if (std.ascii.eqlIgnoreCase(name, "alt-enter") or std.ascii.eqlIgnoreCase(name, "alt-return")) 20
         else if (std.ascii.eqlIgnoreCase(name, "alt-bs") or std.ascii.eqlIgnoreCase(name, "alt-bspace") or std.ascii.eqlIgnoreCase(name, "alt-backspace")) 21
+        else if (std.ascii.eqlIgnoreCase(name, "ctrl-alt-bs") or std.ascii.eqlIgnoreCase(name, "ctrl-alt-bspace") or std.ascii.eqlIgnoreCase(name, "ctrl-alt-backspace") or
+            (builtin.os.tag != .windows and std.ascii.eqlIgnoreCase(name, "ctrl-alt-h"))) 23
         else if (name.len == 6 and asciiStartsWithIgnoreCase(name, "ctrl-") and std.ascii.isAlphabetic(name[5]))
             100 + @as(u16, std.ascii.toLower(name[5]) - 'a')
         else return null;
@@ -6708,7 +6711,7 @@ fn keyMatchesName(key: Key, name: []const u8) bool {
         .shift_tab => identity.kind == .named and identity.value == 10,
         .alt_byte => |b| (identity.kind == .alt_literal and identity.value == b) or
             (identity.kind == .named and ((identity.value == 20 and b == 13) or
-            (identity.value == 21 and (b == 127 or b == 8)))),
+            (identity.value == 21 and b == 127) or (identity.value == 23 and b == 8))),
         .byte => |b| blk: {
             if (identity.kind == .literal) break :blk identity.value == b;
             if (identity.kind != .named) break :blk false;
@@ -8762,6 +8765,10 @@ test "key names follow fzf case semantics" {
     try std.testing.expect(keyMatchesName(.{ .alt_byte = ' ' }, "Alt-Space"));
     try std.testing.expect(keyMatchesName(.{ .alt_byte = 13 }, "alt-return"));
     try std.testing.expect(!keyMatchesName(.{ .alt_byte = 10 }, "alt-enter"));
+    try std.testing.expect(keyMatchesName(.{ .alt_byte = 127 }, "alt-backspace"));
+    try std.testing.expect(!keyMatchesName(.{ .alt_byte = 8 }, "alt-backspace"));
+    try std.testing.expect(keyMatchesName(.{ .alt_byte = 8 }, "ctrl-alt-backspace"));
+    if (builtin.os.tag != .windows) try std.testing.expect(triggerNamesEquivalent("ctrl-alt-h", "ctrl-alt-backspace"));
     try std.testing.expect(keyMatchesName(.{ .byte = 30 }, "ctrl-6"));
     try std.testing.expect(keyMatchesName(.{ .byte = 31 }, "ctrl-_"));
     try std.testing.expect(triggerNamesEquivalent("enter", "return"));
