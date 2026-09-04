@@ -3692,7 +3692,7 @@ fn applyBaseTheme(theme: *Theme, name: []const u8) !bool {
         theme.enabled = false;
         return true;
     }
-    if (std.ascii.eqlIgnoreCase(name, "dark") or std.ascii.eqlIgnoreCase(name, "base16")) {
+    if (std.ascii.eqlIgnoreCase(name, "dark") or std.ascii.eqlIgnoreCase(name, "base16") or std.mem.eql(u8, name, "16")) {
         theme.* = .{};
         return true;
     }
@@ -8232,6 +8232,14 @@ test "header footer and color reset forms are last-one-wins" {
     var color = try parseOptions(a, &color_args);
     defer color.deinit(a);
     try std.testing.expect(!color.theme.enabled);
+
+    const base16_args = [_][]const u8{ "zfuzz", "--color=base16" };
+    var base16 = try parseOptions(a, &base16_args);
+    defer base16.deinit(a);
+    const numeric16_args = [_][]const u8{ "zfuzz", "--color=light", "--color=16" };
+    var numeric16 = try parseOptions(a, &numeric16_args);
+    defer numeric16.deinit(a);
+    try std.testing.expectEqualDeep(base16.theme, numeric16.theme);
 }
 
 test "search and io reset aliases are last-one-wins" {
