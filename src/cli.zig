@@ -7980,6 +7980,186 @@ test "native walker recurses and honors skip hidden and record delimiter" {
     try std.testing.expect(std.mem.indexOfScalar(u8, nul_out.items, '\n') == null);
 }
 
+fn testWalkerRecordCount(blob: []const u8, delim: u8, expected: []const u8) usize {
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, blob, delim);
+    while (it.next()) |record| {
+        if (std.mem.eql(u8, record, expected)) count += 1;
+    }
+    return count;
+}
+
+test "walker skip policy matches exact names and hidden directory mode" {
+    var options: Options = .{};
+    defer options.deinit(std.testing.allocator);
+    options.walker_skip = "cache,,node_modules";
+    options.walker.hidden = false;
+    try std.testing.expect(walkerDirSkipped(&options, ".hidden"));
+    try std.testing.expect(walkerDirSkipped(&options, "cache"));
+    try std.testing.expect(walkerDirSkipped(&options, "node_modules"));
+    try std.testing.expect(!walkerDirSkipped(&options, "cache2"));
+    try std.testing.expect(!walkerDirSkipped(&options, "src"));
+
+    options.walker.hidden = true;
+    try std.testing.expect(!walkerDirSkipped(&options, ".hidden"));
+    try std.testing.expect(walkerDirSkipped(&options, "cache"));
+}
+
+test "walker path assembly avoids duplicate separators and supports NUL" {
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try walkerAppendPath(&out, a, "ROOT", "one", '\n');
+    const rooted = try std.mem.concat(a, u8, &.{ "ROOT", std.fs.path.sep_str });
+    defer a.free(rooted);
+    try walkerAppendPath(&out, a, rooted, "two", 0);
+    const expected = try std.mem.concat(a, u8, &.{ "ROOT", std.fs.path.sep_str, "one\nROOT", std.fs.path.sep_str, "two\x00" });
+    defer a.free(expected);
+    try std.testing.expectEqualSlices(u8, expected, out.items);
+}
+
+test "native walker keeps file and directory selection distinct" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var child = try tmp.dir.createDirPathOpen(std.testing.io, "dir", .{});
+    child.close(std.testing.io);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "top.txt", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dir/nested.txt", .data = "" });
+
+    const dir_path = try std.mem.concat(a, u8, &.{ "ROOT", std.fs.path.sep_str, "dir" });
+    defer a.free(dir_path);
+    const top_path = try std.mem.concat(a, u8, &.{ "ROOT", std.fs.path.sep_str, "top.txt" });
+    defer a.free(top_path);
+    const nested_path = try std.mem.concat(a, u8, &.{ "ROOT", std.fs.path.sep_str, "dir", std.fs.path.sep_str, "nested.txt" });
+    defer a.free(nested_path);
+
+    var files: Options = .{ .walker = .{ .file = true, .dir = false, .follow = false, .hidden = true }, .walker_skip = "" };
+    defer files.deinit(a);
+    var file_out: std.ArrayList(u8) = .empty;
+    defer file_out.deinit(a);
+    try appendNativeWalkerRoot(a, std.testing.io, &files, "ROOT", tmp.dir, &file_out);
+    try std.testing.expect(testWalkerHasRecord(file_out.items, '\n', top_path));
+    try std.testing.expect(testWalkerHasRecord(file_out.items, '\n', nested_path));
+    try std.testing.expect(!testWalkerHasRecord(file_out.items, '\n', dir_path));
+
+    var dirs: Options = .{ .walker = .{ .file = false, .dir = true, .follow = false, .hidden = true }, .walker_skip = "" };
+    defer dirs.deinit(a);
+    var dir_out: std.ArrayList(u8) = .empty;
+    defer dir_out.deinit(a);
+    try appendNativeWalkerRoot(a, std.testing.io, &dirs, "ROOT", tmp.dir, &dir_out);
+    try std.testing.expect(testWalkerHasRecord(dir_out.items, '\n', dir_path));
+    try std.testing.expect(!testWalkerHasRecord(dir_out.items, '\n', top_path));
+    try std.testing.expect(!testWalkerHasRecord(dir_out.items, '\n', nested_path));
+}
+
+test "native walker traverses hidden directories when enabled and prunes custom skips" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var hidden = try tmp.dir.createDirPathOpen(std.testing.io, ".hidden", .{});
+    hidden.close(std.testing.io);
+    var cache = try tmp.dir.createDirPathOpen(std.testing.io, "cache", .{});
+    cache.close(std.testing.io);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".hidden/keep.txt", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cache/drop.txt", .data = "" });
+
+    var options: Options = .{ .walker = .{ .file = true, .dir = false, .follow = false, .hidden = true }, .walker_skip = "cache" };
+    defer options.deinit(a);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try appendNativeWalkerRoot(a, std.testing.io, &options, "ROOT", tmp.dir, &out);
+    const keep = try std.mem.concat(a, u8, &.{ "ROOT", std.fs.path.sep_str, ".hidden", std.fs.path.sep_str, "keep.txt" });
+    defer a.free(keep);
+    try std.testing.expect(testWalkerHasRecord(out.items, '\n', keep));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "cache") == null);
+}
+
+test "native walker follow mode terminates symlink cycles and skips dangling links" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var dir = try tmp.dir.createDirPathOpen(std.testing.io, "dir", .{});
+    dir.close(std.testing.io);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dir/keep.txt", .data = "" });
+    try tmp.dir.symLink(std.testing.io, "..", "dir/loop", .{ .is_directory = true });
+    try tmp.dir.symLink(std.testing.io, "missing-target", "dangling", .{});
+
+    var options: Options = .{ .walker = .{ .file = true, .dir = false, .follow = true, .hidden = true }, .walker_skip = "" };
+    defer options.deinit(a);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try appendNativeWalkerRoot(a, std.testing.io, &options, "ROOT", tmp.dir, &out);
+    const keep = try std.mem.concat(a, u8, &.{ "ROOT", std.fs.path.sep_str, "dir", std.fs.path.sep_str, "keep.txt" });
+    defer a.free(keep);
+    try std.testing.expectEqual(@as(usize, 1), testWalkerRecordCount(out.items, '\n', keep));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "dangling") == null);
+}
+
+test "walker platform implementation supports multiple roots and NUL records" {
+    const a = std.testing.allocator;
+    var first = std.testing.tmpDir(.{ .iterate = true });
+    defer first.cleanup();
+    var second = std.testing.tmpDir(.{ .iterate = true });
+    defer second.cleanup();
+    try first.dir.writeFile(std.testing.io, .{ .sub_path = "one.txt", .data = "" });
+    try second.dir.writeFile(std.testing.io, .{ .sub_path = "two.txt", .data = "" });
+
+    const first_root = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &first.sub_path });
+    defer a.free(first_root);
+    const second_root = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &second.sub_path });
+    defer a.free(second_root);
+    var options: Options = .{ .walker = .{ .file = true, .dir = false, .follow = true, .hidden = true }, .walker_skip = "", .read0 = true };
+    defer options.deinit(a);
+    try options.walker_roots.appendSlice(a, &.{ first_root, second_root });
+
+    const blob = try runWalker(a, std.testing.io, &options);
+    defer a.free(blob);
+    const one = try std.fs.path.join(a, &.{ first_root, "one.txt" });
+    defer a.free(one);
+    const two = try std.fs.path.join(a, &.{ second_root, "two.txt" });
+    defer a.free(two);
+    try std.testing.expect(testWalkerHasRecord(blob, 0, one));
+    try std.testing.expect(testWalkerHasRecord(blob, 0, two));
+    try std.testing.expect(std.mem.indexOfScalar(u8, blob, '\n') == null);
+}
+
+test "default command streams across multiple reader buffers" {
+    const a = std.testing.allocator;
+    const command = if (builtin.os.tag == .windows)
+        "for /L %i in (1,1,5000) do @echo 0123456789abcdef"
+    else
+        "i=0; while [ $i -lt 5000 ]; do printf '0123456789abcdef\\n'; i=$((i + 1)); done";
+    const got = try runDefaultCommand(a, std.testing.io, command, null);
+    defer a.free(got);
+    try std.testing.expect(got.len > 64 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, got, "0123456789abcdef") != null);
+}
+
+test "default command keeps stderr out of candidates" {
+    const a = std.testing.allocator;
+    const command = if (builtin.os.tag == .windows)
+        "echo stdout-line & echo stderr-line 1>&2"
+    else
+        "printf 'stdout-line\\n'; printf 'stderr-line\\n' >&2";
+    const got = try runDefaultCommand(a, std.testing.io, command, null);
+    defer a.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "stdout-line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "stderr-line") == null);
+}
+
+test "default command preserves stdout even when command exits nonzero" {
+    const a = std.testing.allocator;
+    const command = if (builtin.os.tag == .windows)
+        "echo before-failure & exit /b 7"
+    else
+        "printf 'before-failure\\n'; exit 7";
+    const got = try runDefaultCommand(a, std.testing.io, command, null);
+    defer a.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "before-failure") != null);
+}
+
 test "walker root option consumes directories and replaces prior roots" {
     const a = std.testing.allocator;
 
