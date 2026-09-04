@@ -10,6 +10,10 @@ const Io = std.Io;
 const esc = "\x1b[";
 
 const Layout = enum { default, reverse };
+
+fn logicalVerticalDelta(layout: Layout, visual_delta: isize) isize {
+    return if (layout == .default) -visual_delta else visual_delta;
+}
 const CaseMode = enum { smart, ignore, respect };
 const Scheme = enum { default, path, history };
 const PreviewPosition = enum { right, left, up, down };
@@ -1444,8 +1448,8 @@ const Ui = struct {
             }
         }
         switch (key) {
-            .up => self.move(-1),
-            .down => self.move(1),
+            .up => self.moveVisual(-1),
+            .down => self.moveVisual(1),
             .page_up => self.page(-1),
             .page_down => self.page(1),
             .word_left => self.cursor = self.queryWordBoundaryBackward(),
@@ -1456,7 +1460,7 @@ const Ui = struct {
             .right => self.cursor = nextUtf8Boundary(self.query.items, self.cursor),
             .delete => _ = try self.deleteCharForward(),
             .shift_tab => if (self.options.multi) {
-                if (try self.toggleCurrent()) self.move(-1);
+                if (try self.toggleCurrent()) self.moveVisual(-1);
             },
             .mouse => |m| try self.handleMouse(m),
             .byte => |b| switch (b) {
@@ -1466,9 +1470,9 @@ const Ui = struct {
                     try self.emitSelection(self.accepted_key);
                     return 0;
                 },
-                10 => self.move(1),
+                10 => self.moveVisual(1),
                 9 => if (self.options.multi) {
-                    if (try self.toggleCurrent()) self.move(1);
+                    if (try self.toggleCurrent()) self.moveVisual(1);
                 },
                 127, 8 => _ = try self.deleteCharBackward(),
                 1 => self.cursor = 0,
@@ -1476,9 +1480,9 @@ const Ui = struct {
                 4 => if (!try self.deleteCharForward() and self.cursor == 0) return 130,
                 5 => self.cursor = self.query.items.len,
                 6 => self.cursor = nextUtf8Boundary(self.query.items, self.cursor),
-                11 => self.move(-1),
-                16 => if (self.history != null) try self.navigateHistory(-1) else self.move(-1),
-                14 => if (self.history != null) try self.navigateHistory(1) else self.move(1),
+                11 => self.moveVisual(-1),
+                16 => if (self.history != null) try self.navigateHistory(-1) else self.moveVisual(-1),
+                14 => if (self.history != null) try self.navigateHistory(1) else self.moveVisual(1),
                 21 => _ = try self.unixLineDiscard(),
                 23 => _ = try self.killWordBackward(),
                 25 => _ = try self.yankQuery(),
@@ -1811,8 +1815,8 @@ const Ui = struct {
     fn runAction(self: *Ui, action: Action, binding_slot: ?usize) anyerror!?u8 {
         switch (action) {
             .ignore => {},
-            .up => self.move(-1),
-            .down => self.move(1),
+            .up => self.moveVisual(-1),
+            .down => self.moveVisual(1),
             .page_up => self.page(-1),
             .page_down => self.page(1),
             .half_page_up => self.halfPage(-1),
@@ -1831,8 +1835,8 @@ const Ui = struct {
             },
             .delete_char => _ = try self.deleteCharForward(),
             .delete_char_eof => if (!try self.deleteCharForward() and self.cursor == 0) return 130,
-            .up_match => self.moveMatch(-1),
-            .down_match => self.moveMatch(1),
+            .up_match => self.moveMatch(self.visualDelta(-1)),
+            .down_match => self.moveMatch(self.visualDelta(1)),
             .best => self.focusBestMatch(),
             .backward_word => self.cursor = self.queryWordBoundaryBackward(),
             .forward_word => self.cursor = self.queryWordBoundaryForward(),
@@ -1889,10 +1893,10 @@ const Ui = struct {
             .toggle => _ = try self.toggleCurrent(),
             .select => try self.selectCurrent(),
             .deselect => self.deselectCurrent(),
-            .toggle_up => if (try self.toggleCurrent()) self.move(-1),
-            .toggle_down => if (try self.toggleCurrent()) self.move(1),
-            .toggle_in => if (try self.toggleCurrent()) self.move(if (self.options.layout == .default) 1 else -1),
-            .toggle_out => if (try self.toggleCurrent()) self.move(if (self.options.layout == .default) -1 else 1),
+            .toggle_up => if (try self.toggleCurrent()) self.moveVisual(-1),
+            .toggle_down => if (try self.toggleCurrent()) self.moveVisual(1),
+            .toggle_in => if (try self.toggleCurrent()) self.moveVisual(-1),
+            .toggle_out => if (try self.toggleCurrent()) self.moveVisual(1),
             .toggle_all => try self.toggleAll(),
             .select_all => {
                 if (self.options.multi) {
@@ -2703,6 +2707,14 @@ const Ui = struct {
         }
     }
 
+    fn visualDelta(self: *const Ui, delta: isize) isize {
+        return logicalVerticalDelta(self.options.layout, delta);
+    }
+
+    fn moveVisual(self: *Ui, delta: isize) void {
+        self.move(self.visualDelta(delta));
+    }
+
     fn focusCandidate(self: *Ui, candidate_idx: usize) void {
         for (self.results[0..self.result_len], 0..) |idx, pos| {
             if (idx != candidate_idx) continue;
@@ -2762,12 +2774,12 @@ const Ui = struct {
 
     fn page(self: *Ui, delta: isize) void {
         const rows = @max(@as(usize, 1), self.visibleListRows());
-        self.move(delta * @as(isize, @intCast(rows)));
+        self.moveVisual(delta * @as(isize, @intCast(rows)));
     }
 
     fn halfPage(self: *Ui, delta: isize) void {
         const rows = @max(@as(usize, 1), self.visibleListRows() / 2);
-        self.move(delta * @as(isize, @intCast(rows)));
+        self.moveVisual(delta * @as(isize, @intCast(rows)));
     }
 
     const OffsetDirection = enum { up, down };
@@ -5013,39 +5025,18 @@ fn keyNameIdentity(name: []const u8) ?KeyNameIdentity {
     if (name.len == 5 and asciiStartsWithIgnoreCase(name, "alt-")) return .{ .kind = .alt_literal, .value = name[4] };
     if (std.ascii.eqlIgnoreCase(name, "alt-space")) return .{ .kind = .alt_literal, .value = ' ' };
 
-    const named: u16 = if (std.ascii.eqlIgnoreCase(name, "up")) 1
-        else if (std.ascii.eqlIgnoreCase(name, "down")) 2
-        else if (std.ascii.eqlIgnoreCase(name, "left")) 3
-        else if (std.ascii.eqlIgnoreCase(name, "right")) 4
-        else if (std.ascii.eqlIgnoreCase(name, "home")) 5
-        else if (std.ascii.eqlIgnoreCase(name, "end")) 6
-        else if (std.ascii.eqlIgnoreCase(name, "page-up") or std.ascii.eqlIgnoreCase(name, "pgup")) 7
-        else if (std.ascii.eqlIgnoreCase(name, "page-down") or std.ascii.eqlIgnoreCase(name, "pgdn")) 8
-        else if (std.ascii.eqlIgnoreCase(name, "delete") or std.ascii.eqlIgnoreCase(name, "del")) 9
-        else if (std.ascii.eqlIgnoreCase(name, "shift-tab") or std.ascii.eqlIgnoreCase(name, "btab")) 10
-        else if (std.ascii.eqlIgnoreCase(name, "enter") or std.ascii.eqlIgnoreCase(name, "return") or std.ascii.eqlIgnoreCase(name, "ctrl-m")) 11
-        else if (std.ascii.eqlIgnoreCase(name, "tab") or std.ascii.eqlIgnoreCase(name, "ctrl-i")) 12
-        else if (std.ascii.eqlIgnoreCase(name, "esc")) 13
-        else if (std.ascii.eqlIgnoreCase(name, "backspace") or std.ascii.eqlIgnoreCase(name, "bspace") or std.ascii.eqlIgnoreCase(name, "bs")) 14
-        else if (std.ascii.eqlIgnoreCase(name, "ctrl-bs") or std.ascii.eqlIgnoreCase(name, "ctrl-bspace") or std.ascii.eqlIgnoreCase(name, "ctrl-backspace") or
-            (builtin.os.tag != .windows and std.ascii.eqlIgnoreCase(name, "ctrl-h"))) 22
-        else if (std.ascii.eqlIgnoreCase(name, "ctrl-space")) 15
-        else if (std.ascii.eqlIgnoreCase(name, "ctrl-^") or std.ascii.eqlIgnoreCase(name, "ctrl-6")) 16
-        else if (std.ascii.eqlIgnoreCase(name, "ctrl-/") or std.ascii.eqlIgnoreCase(name, "ctrl-_")) 17
-        else if (std.ascii.eqlIgnoreCase(name, "ctrl-\\")) 18
-        else if (std.ascii.eqlIgnoreCase(name, "ctrl-]")) 19
-        else if (std.ascii.eqlIgnoreCase(name, "alt-enter") or std.ascii.eqlIgnoreCase(name, "alt-return")) 20
-        else if (std.ascii.eqlIgnoreCase(name, "alt-bs") or std.ascii.eqlIgnoreCase(name, "alt-bspace") or std.ascii.eqlIgnoreCase(name, "alt-backspace")) 21
-        else if (std.ascii.eqlIgnoreCase(name, "ctrl-alt-bs") or std.ascii.eqlIgnoreCase(name, "ctrl-alt-bspace") or std.ascii.eqlIgnoreCase(name, "ctrl-alt-backspace") or
-            (builtin.os.tag != .windows and std.ascii.eqlIgnoreCase(name, "ctrl-alt-h"))) 23
-        else if (name.len == 10 and asciiStartsWithIgnoreCase(name, "ctrl-alt-") and std.ascii.isAlphabetic(name[9])) blk: {
-            const letter = std.ascii.toLower(name[9]);
-            if (letter == 'm') break :blk 20;
-            if (builtin.os.tag != .windows and letter == 'h') break :blk 23;
-            break :blk 200 + @as(u16, letter - 'a');
-        } else if (name.len == 6 and asciiStartsWithIgnoreCase(name, "ctrl-") and std.ascii.isAlphabetic(name[5]))
-            100 + @as(u16, std.ascii.toLower(name[5]) - 'a')
-        else return null;
+    const named: u16 = if (std.ascii.eqlIgnoreCase(name, "up")) 1 else if (std.ascii.eqlIgnoreCase(name, "down")) 2 else if (std.ascii.eqlIgnoreCase(name, "left")) 3 else if (std.ascii.eqlIgnoreCase(name, "right")) 4 else if (std.ascii.eqlIgnoreCase(name, "home")) 5 else if (std.ascii.eqlIgnoreCase(name, "end")) 6 else if (std.ascii.eqlIgnoreCase(name, "page-up") or std.ascii.eqlIgnoreCase(name, "pgup")) 7 else if (std.ascii.eqlIgnoreCase(name, "page-down") or std.ascii.eqlIgnoreCase(name, "pgdn")) 8 else if (std.ascii.eqlIgnoreCase(name, "delete") or std.ascii.eqlIgnoreCase(name, "del")) 9 else if (std.ascii.eqlIgnoreCase(name, "shift-tab") or std.ascii.eqlIgnoreCase(name, "btab")) 10 else if (std.ascii.eqlIgnoreCase(name, "enter") or std.ascii.eqlIgnoreCase(name, "return") or std.ascii.eqlIgnoreCase(name, "ctrl-m")) 11 else if (std.ascii.eqlIgnoreCase(name, "tab") or std.ascii.eqlIgnoreCase(name, "ctrl-i")) 12 else if (std.ascii.eqlIgnoreCase(name, "esc")) 13 else if (std.ascii.eqlIgnoreCase(name, "backspace") or std.ascii.eqlIgnoreCase(name, "bspace") or std.ascii.eqlIgnoreCase(name, "bs")) 14 else if (std.ascii.eqlIgnoreCase(name, "ctrl-bs") or std.ascii.eqlIgnoreCase(name, "ctrl-bspace") or std.ascii.eqlIgnoreCase(name, "ctrl-backspace") or
+        (builtin.os.tag != .windows and std.ascii.eqlIgnoreCase(name, "ctrl-h"))) 22 else if (std.ascii.eqlIgnoreCase(name, "ctrl-space")) 15 else if (std.ascii.eqlIgnoreCase(name, "ctrl-^") or std.ascii.eqlIgnoreCase(name, "ctrl-6")) 16 else if (std.ascii.eqlIgnoreCase(name, "ctrl-/") or std.ascii.eqlIgnoreCase(name, "ctrl-_")) 17 else if (std.ascii.eqlIgnoreCase(name, "ctrl-\\")) 18 else if (std.ascii.eqlIgnoreCase(name, "ctrl-]")) 19 else if (std.ascii.eqlIgnoreCase(name, "alt-enter") or std.ascii.eqlIgnoreCase(name, "alt-return")) 20 else if (std.ascii.eqlIgnoreCase(name, "alt-bs") or std.ascii.eqlIgnoreCase(name, "alt-bspace") or std.ascii.eqlIgnoreCase(name, "alt-backspace")) 21 else if (std.ascii.eqlIgnoreCase(name, "ctrl-alt-bs") or std.ascii.eqlIgnoreCase(name, "ctrl-alt-bspace") or std.ascii.eqlIgnoreCase(name, "ctrl-alt-backspace") or
+        (builtin.os.tag != .windows and std.ascii.eqlIgnoreCase(name, "ctrl-alt-h"))) 23 else if (name.len == 10 and asciiStartsWithIgnoreCase(name, "ctrl-alt-") and std.ascii.isAlphabetic(name[9]))
+    blk: {
+        const letter = std.ascii.toLower(name[9]);
+        if (letter == 'm') break :blk 20;
+        if (builtin.os.tag != .windows and letter == 'h') break :blk 23;
+        break :blk 200 + @as(u16, letter - 'a');
+    } else if (name.len == 6 and asciiStartsWithIgnoreCase(name, "ctrl-") and std.ascii.isAlphabetic(name[5]))
+        100 + @as(u16, std.ascii.toLower(name[5]) - 'a')
+    else
+        return null;
     return .{ .kind = .named, .value = named };
 }
 
@@ -6755,8 +6746,8 @@ fn keyMatchesName(key: Key, name: []const u8) bool {
         .shift_tab => identity.kind == .named and identity.value == 10,
         .alt_byte => |b| (identity.kind == .alt_literal and identity.value == b) or
             (identity.kind == .named and ((identity.value == 20 and b == 13) or
-            (identity.value == 21 and b == 127) or (identity.value == 23 and b == 8) or
-            (identity.value >= 200 and identity.value < 226 and b == identity.value - 199))),
+                (identity.value == 21 and b == 127) or (identity.value == 23 and b == 8) or
+                (identity.value >= 200 and identity.value < 226 and b == identity.value - 199))),
         .byte => |b| blk: {
             if (identity.kind == .literal) break :blk identity.value == b;
             if (identity.kind != .named) break :blk false;
@@ -7491,6 +7482,13 @@ const usage =
     \\  Ctrl-P/N history when --history is active, Tab toggle,
     \\  Ctrl-A/E line edges, Ctrl-U clear, Ctrl-W erase word.
 ;
+
+test "vertical navigation follows visual layout direction" {
+    try std.testing.expectEqual(@as(isize, 1), logicalVerticalDelta(.default, -1));
+    try std.testing.expectEqual(@as(isize, -1), logicalVerticalDelta(.default, 1));
+    try std.testing.expectEqual(@as(isize, -1), logicalVerticalDelta(.reverse, -1));
+    try std.testing.expectEqual(@as(isize, 1), logicalVerticalDelta(.reverse, 1));
+}
 
 test "scroll-off viewport constraint matches single-line fzf semantics" {
     // 20 visible rows, default scroll-off 3: keep the cursor three rows
