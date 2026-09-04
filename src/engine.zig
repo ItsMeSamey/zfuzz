@@ -3103,6 +3103,36 @@ pub fn scoreFoldedForCli(index: *Index, query: []const u8, entry_index: usize) ?
     return index.scoreV2(&q, index.entries[entry_index]);
 }
 
+/// Internal CLI prepared-query view. The slices alias Index-owned query scratch,
+/// so this value remains valid only until the next query preparation/search on
+/// the same Index. It is intentionally not re-exported by root.zig.
+pub const CliFoldedQuery = struct {
+    query: Query,
+};
+
+pub fn prepareFoldedForCli(index: *Index, query: []const u8) CliFoldedQuery {
+    return .{ .query = index.compileQuery(query) };
+}
+
+/// Exact fzf-V2 score for one candidate using a query compiled once by
+/// prepareFoldedForCli. Uses the same indexed/specialized score-only kernels as
+/// Index.search; null means the candidate is not an ordered subsequence match.
+pub fn scorePreparedFoldedForCli(index: *Index, prepared: *const CliFoldedQuery, entry_index: usize) ?i32 {
+    if (entry_index >= index.entries.len) return null;
+    const q = &prepared.query;
+    if (q.impossible) return null;
+    const entry = index.entries[entry_index];
+    if (q.bytes.len == 0) return 0;
+    if (q.bytes.len > entry.len) return null;
+    if (q.bytes.len == 1) return index.scoreV2Single(q, entry);
+
+    const first_class: usize = @intCast(q.classes[0]);
+    const first_slot: u8 = if (first_class < exact_signature_classes) index.last_slot_for_class[first_class] else 0xff;
+    if (q.bytes.len == 2) return index.scoreV2TwoIndexedOrdered(q, entry, entry_index, first_slot);
+    if (!index.subsequenceIndexed(q, entry, entry_index, first_slot, entry.len)) return null;
+    return index.scoreV2IndexedFromFirst(q, entry, entry_index);
+}
+
 /// Internal CLI scoring result. Kept in the engine module so the executable can
 /// implement fzf's extended-query ranking without widening the public facade.
 pub const CliMatch = struct {
@@ -3240,6 +3270,13 @@ fn cliScoreV1(index: *const Index, entry: Entry, candidate: []const u8, pattern:
         .start = compact_start,
         .end = end,
     };
+}
+
+pub fn matchFuzzyV1ForCliScheme(index: *Index, query: []const u8, candidate: []const u8, entry_index: usize, case_sensitive: bool, scheme: CliScheme) ?CliMatch {
+    if (entry_index >= index.entries.len) return null;
+    const entry = index.entries[entry_index];
+    if (candidate.len != entry.len or query.len > candidate.len) return null;
+    return cliScoreV1(index, entry, candidate, query, case_sensitive, scheme);
 }
 
 fn cliSubsequenceStart(candidate: []const u8, pattern: []const u8, case_sensitive: bool) ?usize {
@@ -3575,6 +3612,110 @@ fn cliPrepareUnicodePattern(query: []const u8, case_sensitive: bool, normalize: 
     return n;
 }
 
+/// Internal CLI prefilters for ASCII fuzzy terms. Presence checks are only
+/// supersets of exact ordered-subsequence matches, so they may admit extra rows
+/// but must never reject a real match.
+pub fn cliFoldedAsciiPresenceUpperBound(index: *const Index, query: []const u8) usize {
+    if (query.len == 0) return index.entries.len;
+    var once: u64 = 0;
+    var twice: u64 = 0;
+    for (query) |raw| {
+        const class = signatureClass(lower(raw));
+        const bit = @as(u64, 1) << class;
+        if ((once & bit) != 0) twice |= bit else once |= bit;
+    }
+    var upper = index.entries.len;
+    var needed = once;
+    while (needed != 0) {
+        const class: usize = @intCast(@ctz(needed));
+        upper = @min(upper, index.plane_frequency[class]);
+        needed &= needed - 1;
+    }
+    needed = twice;
+    while (needed != 0) {
+        const class: usize = @intCast(@ctz(needed));
+        upper = @min(upper, index.plane_frequency[signature_classes + class]);
+        needed &= needed - 1;
+    }
+    return upper;
+}
+
+pub fn cliCollectMayMatchAllFoldedAscii(index: *const Index, terms: []const []const u8, out: []usize) []usize {
+    if (out.len == 0 or index.entries.len == 0) return out[0..0];
+    var once: u64 = 0;
+    var twice: u64 = 0;
+    for (terms) |term| {
+        var term_once: u64 = 0;
+        var term_twice: u64 = 0;
+        for (term) |raw| {
+            const class = signatureClass(lower(raw));
+            const bit = @as(u64, 1) << class;
+            if ((term_once & bit) != 0) term_twice |= bit else term_once |= bit;
+        }
+        once |= term_once;
+        twice |= term_twice;
+    }
+    if (once == 0) {
+        const n = @min(out.len, index.entries.len);
+        for (out[0..n], 0..) |*slot, i| slot.* = i;
+        return out[0..n];
+    }
+    var count: usize = 0;
+    var word: usize = 0;
+    while (word < index.words and count < out.len) : (word += 1) {
+        var bits: u64 = std.math.maxInt(u64);
+        var needed = once;
+        while (needed != 0 and bits != 0) {
+            const class: usize = @intCast(@ctz(needed));
+            bits &= index.planes[class * index.words + word];
+            needed &= needed - 1;
+        }
+        needed = twice;
+        while (needed != 0 and bits != 0) {
+            const class: usize = @intCast(@ctz(needed));
+            bits &= index.planes[(signature_classes + class) * index.words + word];
+            needed &= needed - 1;
+        }
+        while (bits != 0 and count < out.len) {
+            const bit_index: usize = @intCast(@ctz(bits));
+            bits &= bits - 1;
+            const idx = word * 64 + bit_index;
+            if (idx < index.entries.len) {
+                out[count] = idx;
+                count += 1;
+            }
+        }
+    }
+    return out[0..count];
+}
+
+pub fn cliMayContainFoldedAscii(index: *const Index, entry_index: usize, query: []const u8) bool {
+    if (entry_index >= index.entries.len or query.len > index.entries[entry_index].len) return false;
+    if (query.len == 0) return true;
+    const word = entry_index / 64;
+    const row_bit = @as(u64, 1) << @intCast(entry_index & 63);
+    var once: u64 = 0;
+    var twice: u64 = 0;
+    for (query) |raw| {
+        const class = signatureClass(lower(raw));
+        const bit = @as(u64, 1) << class;
+        if ((once & bit) != 0) twice |= bit else once |= bit;
+    }
+    var needed = once;
+    while (needed != 0) {
+        const class: usize = @intCast(@ctz(needed));
+        if ((index.planes[class * index.words + word] & row_bit) == 0) return false;
+        needed &= needed - 1;
+    }
+    needed = twice;
+    while (needed != 0) {
+        const class: usize = @intCast(@ctz(needed));
+        if ((index.planes[(signature_classes + class) * index.words + word] & row_bit) == 0) return false;
+        needed &= needed - 1;
+    }
+    return true;
+}
+
 pub fn cliTextHasNonAscii(text: []const u8) bool {
     for (text) |c| if (c >= 0x80) return true;
     return false;
@@ -3726,6 +3867,15 @@ fn cliScoreUnicodeV1Stored(index: *Index, candidate_len: usize, pattern_len: usi
 fn cliUnicodeExactAtStored(index: *const Index, pattern_len: usize, start: usize) bool {
     for (0..pattern_len) |k| if (index.position_scratch[start + k] != cliStoredPatternAt(index, k)) return false;
     return true;
+}
+
+pub fn matchFuzzyUnicodeV1ForCliScheme(index: *Index, query: []const u8, candidate: []const u8, case_sensitive: bool, normalize: bool, scheme: CliScheme) ?CliMatch {
+    if (!std.unicode.utf8ValidateSlice(query)) return null;
+    const n = cliPrepareUnicodeCandidate(index, candidate, case_sensitive, normalize, scheme) orelse return null;
+    const m = std.unicode.utf8CountCodepoints(query) catch return null;
+    if (m == 0) return .{ .score = 0, .start = 0, .end = 0 };
+    if (m > n or !cliStoreUnicodePattern(index, query, case_sensitive, normalize, m)) return null;
+    return cliScoreUnicodeV1Stored(index, n, m);
 }
 
 pub fn matchFuzzyUnicodeForCliScheme(index: *Index, query: []const u8, candidate: []const u8, case_sensitive: bool, normalize: bool, scheme: CliScheme) ?CliMatch {
@@ -4742,5 +4892,40 @@ test "randomized indexed top-k matches brute-force V2" {
         for (got, exact[0..expected_len]) |entry_index, expected| {
             try std.testing.expectEqual(expected.entry, entry_index);
         }
+    }
+}
+
+test "CLI ASCII signature filters are sound" {
+    const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-/.: ";
+    var buffers: [96][96]u8 = undefined;
+    var values: [96][]const u8 = undefined;
+    var state: u64 = 0x7d21a508d31c9b47;
+    for (&buffers, 0..) |*buffer, i| {
+        const len = 8 + (i * 37 % 89);
+        for (buffer[0..len]) |*slot| {
+            state = state *% 6364136223846793005 +% 1442695040888963407;
+            slot.* = alphabet[@as(usize, @intCast(state >> 32)) % alphabet.len];
+        }
+        values[i] = buffer[0..len];
+    }
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+
+    var query_buf: [14]u8 = undefined;
+    for (0..4000) |trial| {
+        const qlen = 1 + (trial % query_buf.len);
+        for (query_buf[0..qlen]) |*slot| {
+            state = state *% 2862933555777941757 +% 3037000493;
+            slot.* = alphabet[@as(usize, @intCast(state >> 33)) % alphabet.len];
+        }
+        const query = query_buf[0..qlen];
+        for (values, 0..) |candidate, i| {
+            const exact = matchFuzzyForCliScheme(&index, query, candidate, i, false, .default);
+            if (exact != null) try std.testing.expect(cliMayContainFoldedAscii(&index, i, query));
+        }
+        const one = [_][]const u8{query};
+        var possible_buf: [values.len]usize = undefined;
+        const possible = cliCollectMayMatchAllFoldedAscii(&index, &one, &possible_buf);
+        try std.testing.expect(possible.len <= cliFoldedAsciiPresenceUpperBound(&index, query));
     }
 }

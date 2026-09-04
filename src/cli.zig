@@ -16,6 +16,7 @@ fn logicalVerticalDelta(layout: Layout, visual_delta: isize) isize {
 }
 const CaseMode = enum { smart, ignore, respect };
 const Scheme = enum { default, path, history };
+const Algorithm = enum { v2, v1, heuristic };
 const PreviewPosition = enum { right, left, up, down };
 const TieBreak = enum { length, chunk, pathname, begin, end };
 const StylePreset = enum { default, minimal, full };
@@ -282,6 +283,8 @@ const Options = struct {
     case_mode: CaseMode = .smart,
     literal: bool = false,
     scheme: Scheme = .default,
+    algorithm: Algorithm = .v2,
+    temp_dir: []const u8 = "",
     tac: bool = false,
     tail: ?usize = null,
     sync: bool = false,
@@ -448,6 +451,9 @@ const StreamInput = struct {
     }
 
     fn readAvailable(self: *StreamInput) !StreamUpdate {
+        // Zig 0.16 has no portable zero-timeout stdin-pipe readiness probe on Windows.
+        // Windows therefore uses normal batch stdin instead of live pipe refresh.
+        if (comptime builtin.os.tag == .windows) return .{};
         if (self.eof) return .{};
         var update: StreamUpdate = .{};
         var buffer: [64 * 1024]u8 = undefined;
@@ -500,10 +506,11 @@ const StreamInput = struct {
 };
 
 const TerminalSize = struct { rows: usize, cols: usize };
+const TerminalOriginal = if (builtin.os.tag == .windows) void else std.posix.termios;
 
 const Terminal = struct {
     file: Io.File,
-    original: std.posix.termios,
+    original: TerminalOriginal,
     active: bool = false,
     mouse: bool,
     inline_mode: bool,
@@ -511,6 +518,7 @@ const Terminal = struct {
     inline_rows: usize = 0,
 
     fn open(io: Io, mouse: bool, height_percent: u8) !Terminal {
+        if (comptime builtin.os.tag == .windows) return error.UnsupportedTerminal;
         var file = try Io.Dir.openFileAbsolute(io, "/dev/tty", .{ .mode = .read_write });
         errdefer file.close(io);
         const original = try std.posix.tcgetattr(file.handle);
@@ -523,6 +531,7 @@ const Terminal = struct {
     }
 
     fn enter(self: *Terminal) !void {
+        if (comptime builtin.os.tag == .windows) return error.UnsupportedTerminal;
         var raw = self.original;
         raw.lflag.ECHO = false;
         raw.lflag.ICANON = false;
@@ -556,6 +565,10 @@ const Terminal = struct {
     }
 
     fn leave(self: *Terminal) void {
+        if (comptime builtin.os.tag == .windows) {
+            self.active = false;
+            return;
+        }
         if (!self.active) return;
         if (self.mouse) self.write("\x1b[?1000l\x1b[?1006l") catch {};
         if (self.inline_mode) {
@@ -579,6 +592,7 @@ const Terminal = struct {
     }
 
     fn write(self: *Terminal, bytes: []const u8) !void {
+        if (comptime builtin.os.tag == .windows) return error.UnsupportedTerminal;
         var off: usize = 0;
         while (off < bytes.len) {
             const n = std.c.write(self.file.handle, bytes.ptr + off, bytes.len - off);
@@ -587,7 +601,8 @@ const Terminal = struct {
         }
     }
 
-    fn readByte(self: *Terminal) !u8 {
+    fn readByte(self: *Terminal) error{ UnsupportedTerminal, Timeout, ReadFailed }!u8 {
+        if (comptime builtin.os.tag == .windows) return error.UnsupportedTerminal;
         var b: [1]u8 = undefined;
         while (true) {
             const n = std.c.read(self.file.handle, &b, 1);
@@ -600,6 +615,7 @@ const Terminal = struct {
     }
 
     fn physicalSize(self: *Terminal) TerminalSize {
+        if (comptime builtin.os.tag == .windows) return .{ .rows = 24, .cols = 80 };
         var ws: std.posix.winsize = undefined;
         const rc = std.c.ioctl(self.file.handle, std.c.T.IOCGWINSZ, &ws);
         if (rc != 0 or ws.row == 0 or ws.col == 0) return .{ .rows = 24, .cols = 80 };
@@ -3883,6 +3899,18 @@ pub fn main(init: std.process.Init) !void {
     try parseOptionsInto(allocator, init.io, &options, args, 1);
     defer options.deinit(allocator);
 
+    var fallback_temp_dir: ?[:0]u8 = null;
+    defer if (fallback_temp_dir) |path| allocator.free(path);
+    if (builtin.os.tag == .windows) {
+        options.temp_dir = init.environ_map.get("TEMP") orelse init.environ_map.get("TMP") orelse "";
+    } else {
+        options.temp_dir = init.environ_map.get("TMPDIR") orelse "/tmp";
+    }
+    if (options.temp_dir.len == 0) {
+        fallback_temp_dir = try std.process.currentPathAlloc(init.io, allocator);
+        options.temp_dir = fallback_temp_dir.?;
+    }
+
     if (hasArg(args, "--help") or hasArg(args, "-h")) {
         try Io.File.stdout().writeStreamingAll(init.io, usage);
         return;
@@ -3928,7 +3956,8 @@ pub fn main(init: std.process.Init) !void {
         null;
     defer if (terminal_opt) |*terminal| terminal.close(init.io);
 
-    const live_stdin = terminal_opt != null and std.c.isatty(std.posix.STDIN_FILENO) != 1 and !options.sync;
+    const stdin_is_tty = Io.File.stdin().isTty(init.io) catch false;
+    const live_stdin = builtin.os.tag != .windows and terminal_opt != null and !stdin_is_tty and !options.sync;
     var stream_input: ?StreamInput = if (live_stdin)
         StreamInput.init(allocator, if (options.read0) 0 else '\n', options.tail, options.header_lines)
     else
@@ -4401,6 +4430,16 @@ fn parseOptionsInto(allocator: Allocator, io: Io, o: *Options, args: []const []c
         }
         if (std.mem.eql(u8, a, "--no-literal")) {
             o.*.literal = false;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--algo=")) {
+            o.*.algorithm = try parseAlgorithm(a[7..]);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--algo")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgument;
+            o.*.algorithm = try parseAlgorithm(args[i]);
             continue;
         }
         if (std.mem.startsWith(u8, a, "--scheme=")) {
@@ -4925,6 +4964,13 @@ fn setToggleSortBinding(allocator: Allocator, options: *Options, key_spec: []con
     if (keys.items.len == 0) return error.InvalidBinding;
     if (keys.items.len != 1) return error.MultipleKeysSpecified;
     try applyBindingSpec(allocator, &options.bindings, keys.items[0], "toggle-sort");
+}
+
+fn parseAlgorithm(spec: []const u8) !Algorithm {
+    if (std.ascii.eqlIgnoreCase(spec, "v2")) return .v2;
+    if (std.ascii.eqlIgnoreCase(spec, "v1")) return .v1;
+    if (std.ascii.eqlIgnoreCase(spec, "heuristic")) return .heuristic;
+    return error.InvalidAlgorithm;
 }
 
 fn parseScheme(spec: []const u8) !Scheme {
@@ -5514,7 +5560,7 @@ fn runWalker(allocator: Allocator, io: Io, options: *const Options) ![]u8 {
 }
 
 fn readCandidates(allocator: Allocator, io: Io, options: *const Options, default_command: ?[]const u8) !CandidateSet {
-    if (std.c.isatty(std.posix.STDIN_FILENO) == 1) {
+    if (Io.File.stdin().isTty(io) catch false) {
         const blob = if (default_command) |command| blk: {
             if (command.len == 0) break :blk try runWalker(allocator, io, options);
             const result = try std.process.run(allocator, io, .{
@@ -5528,11 +5574,11 @@ fn readCandidates(allocator: Allocator, io: Io, options: *const Options, default
         return candidatesFromOwnedBlob(allocator, blob, options);
     }
     if (options.tail) |tail| {
-        const blob = try readTailBlobStdin(allocator, tail, options.header_lines, if (options.read0) 0 else '\n');
+        const blob = try readTailBlobStdin(allocator, io, tail, options.header_lines, if (options.read0) 0 else '\n');
         return candidatesFromOwnedBlob(allocator, blob, options);
     }
     var buffer: [64 * 1024]u8 = undefined;
-    var reader = Io.File.stdin().reader(io, &buffer);
+    var reader = Io.File.stdin().readerStreaming(io, &buffer);
     const blob = try reader.interface.allocRemaining(allocator, .unlimited);
     return candidatesFromOwnedBlob(allocator, blob, options);
 }
@@ -5556,7 +5602,7 @@ const TailRing = struct {
     }
 };
 
-fn readTailBlobStdin(allocator: Allocator, tail: usize, header_lines: usize, delim: u8) ![]u8 {
+fn readTailBlobStdin(allocator: Allocator, io: Io, tail: usize, header_lines: usize, delim: u8) ![]u8 {
     const slots = try allocator.alloc(?[]u8, tail);
     @memset(slots, null);
     var ring = TailRing{ .allocator = allocator, .slots = slots };
@@ -5570,17 +5616,13 @@ fn readTailBlobStdin(allocator: Allocator, tail: usize, header_lines: usize, del
     var current: std.ArrayList(u8) = .empty;
     defer current.deinit(allocator);
     var buffer: [64 * 1024]u8 = undefined;
+    var reader_buffer: [4096]u8 = undefined;
+    var stdin_reader = Io.File.stdin().readerStreaming(io, &reader_buffer);
     var saw_any = false;
     var last_was_delim = false;
     while (true) {
-        const n = std.c.read(std.posix.STDIN_FILENO, &buffer, buffer.len);
-        if (n < 0) {
-            const e = std.c._errno().*;
-            if (e == @intFromEnum(std.posix.E.INTR)) continue;
-            return error.ReadFailed;
-        }
-        if (n == 0) break;
-        const count: usize = @intCast(n);
+        const count = stdin_reader.interface.readSliceShort(&buffer) catch return error.ReadFailed;
+        if (count == 0) break;
         saw_any = true;
         for (buffer[0..count]) |byte| {
             if (byte == delim) {
@@ -5916,6 +5958,50 @@ fn betterExtended(ctx: RankContext, a: ExtendedRank, b: ExtendedRank) bool {
     return a.entry < b.entry;
 }
 
+fn bubbleWorstExtended(heap: []ExtendedRank, ctx: RankContext, start: usize) void {
+    var child = start;
+    while (child != 0) {
+        const parent = (child - 1) / 2;
+        if (!betterExtended(ctx, heap[parent], heap[child])) break;
+        std.mem.swap(ExtendedRank, &heap[parent], &heap[child]);
+        child = parent;
+    }
+}
+
+fn siftWorstExtended(heap: []ExtendedRank, ctx: RankContext, start: usize) void {
+    var parent = start;
+    while (true) {
+        const left = parent * 2 + 1;
+        if (left >= heap.len) break;
+        const right = left + 1;
+        var worse_child = left;
+        if (right < heap.len and betterExtended(ctx, heap[left], heap[right])) worse_child = right;
+        if (!betterExtended(ctx, heap[parent], heap[worse_child])) break;
+        std.mem.swap(ExtendedRank, &heap[parent], &heap[worse_child]);
+        parent = worse_child;
+    }
+}
+
+fn selectTopExtended(ranks: []ExtendedRank, limit: usize, ctx: RankContext) []ExtendedRank {
+    const take = @min(limit, ranks.len);
+    if (take == 0) return ranks[0..0];
+
+    var heap_len: usize = 0;
+    for (0..ranks.len) |i| {
+        const item = ranks[i];
+        if (heap_len < take) {
+            ranks[heap_len] = item;
+            bubbleWorstExtended(ranks[0 .. heap_len + 1], ctx, heap_len);
+            heap_len += 1;
+        } else if (betterExtended(ctx, item, ranks[0])) {
+            ranks[0] = item;
+            siftWorstExtended(ranks[0..heap_len], ctx, 0);
+        }
+    }
+    std.mem.sort(ExtendedRank, ranks[0..heap_len], ctx, betterExtended);
+    return ranks[0..heap_len];
+}
+
 fn searchCandidates(
     index: *fuzzy.Index,
     candidates: *const CandidateSet,
@@ -5934,19 +6020,29 @@ fn searchCandidates(
 
     var term_buf: [512]QueryTerm = undefined;
     const parsed = try parseQuery(query, options, &term_buf);
+    const heuristic_ascii = options.algorithm == .heuristic and !fuzzy_engine.cliTextHasNonAscii(query);
+    var heuristic_term_buf: [512][]const u8 = undefined;
+    const heuristic_terms = if (heuristic_ascii and parsed.direct == null) heuristicPureAndTerms(parsed, options.case_mode, &heuristic_term_buf) else null;
 
     if (parsed.direct) |direct| {
-        if (!candidates.has_non_ascii and !fuzzy_engine.cliTextHasNonAscii(direct) and options.scheme == .default and !termCaseSensitive(options.case_mode, direct) and options.tiebreak_count == 1 and options.tiebreaks[0] == .length) {
-            return try index.search(direct, out[0..cap]);
-        }
+        const fast_direct = !candidates.has_non_ascii and !fuzzy_engine.cliTextHasNonAscii(direct) and options.scheme == .default and !termCaseSensitive(options.case_mode, direct) and options.tiebreak_count == 1 and options.tiebreaks[0] == .length;
+        if (fast_direct and (options.algorithm == .v2 or options.algorithm == .heuristic)) return try index.search(direct, out[0..cap]);
     }
 
     // fzf does not sort inverse-only extended queries. --no-sort likewise
     // preserves input order after filtering.
     if (options.no_sort or !parsed.sortable) {
         var write: usize = 0;
+        if (heuristic_terms) |terms| {
+            if (!candidates.has_non_ascii) {
+                var source = fuzzy_engine.cliCollectMayMatchAllFoldedAscii(index, terms, out);
+                source = heuristicFilterPureAndAscii(candidates, source, terms);
+                return source[0..@min(cap, source.len)];
+            }
+        }
         for (candidates.search, 0..) |line, idx| {
-            if (scoreParsedCandidate(index, parsed, line, idx, options.case_mode, !options.literal, options.scheme) == null) continue;
+            if (heuristic_ascii and heuristicHasPresenceClause(parsed) and !fuzzy_engine.cliTextHasNonAscii(line) and !heuristicPresenceClausesMatch(index, parsed, idx)) continue;
+            if (scoreParsedCandidate(index, parsed, line, idx, options.case_mode, !options.literal, options.scheme, options.algorithm) == null) continue;
             out[write] = idx;
             write += 1;
             if (write == cap) break;
@@ -5954,22 +6050,75 @@ fn searchCandidates(
         return out[0..write];
     }
 
+    if (heuristic_terms) |terms| {
+        if (options.scheme == .default and heuristicScoreOnlyTiebreakSafe(options)) {
+            var source = fuzzy_engine.cliCollectMayMatchAllFoldedAscii(index, terms, out);
+            source = heuristicFilterPureAndAscii(candidates, source, terms);
+
+            var rank_len = source.len;
+            for (source, 0..) |idx, i| rank_scratch[i] = .{ .entry = idx, .score = .{} };
+            for (terms) |term| {
+                const prepared = fuzzy_engine.prepareFoldedForCli(index, term);
+                var keep: usize = 0;
+                for (rank_scratch[0..rank_len]) |rank| {
+                    const term_score = fuzzy_engine.scorePreparedFoldedForCli(index, &prepared, rank.entry) orelse continue;
+                    var next = rank;
+                    next.score.score += term_score;
+                    rank_scratch[keep] = next;
+                    keep += 1;
+                }
+                rank_len = keep;
+                if (rank_len == 0) break;
+            }
+            if (candidates.has_non_ascii) {
+                for (candidates.search, 0..) |line, idx| {
+                    if (!fuzzy_engine.cliTextHasNonAscii(line)) continue;
+                    const score = scoreParsedCandidate(index, parsed, line, idx, options.case_mode, !options.literal, options.scheme, options.algorithm) orelse continue;
+                    rank_scratch[rank_len] = .{ .entry = idx, .score = score };
+                    rank_len += 1;
+                }
+            }
+            const top = selectTopExtended(rank_scratch[0..rank_len], cap, .{ .candidates = candidates, .options = options });
+            for (top, 0..) |rank, i| out[i] = rank.entry;
+            return out[0..top.len];
+        }
+    }
+
     var source: []usize = out;
-    if (parsed.driver) |driver| {
+    const heuristic_source = heuristic_ascii and parsed.direct == null and heuristicHasPresenceClause(parsed);
+    if (heuristic_terms) |terms| {
+        source = fuzzy_engine.cliCollectMayMatchAllFoldedAscii(index, terms, out);
+        source = heuristicFilterPureAndAscii(candidates, source, terms);
+    } else if (heuristic_source) {
+        var source_len: usize = 0;
+        for (candidates.search, 0..) |line, idx| {
+            if (!fuzzy_engine.cliTextHasNonAscii(line) and !heuristicPresenceClausesMatch(index, parsed, idx)) continue;
+            out[source_len] = idx;
+            source_len += 1;
+        }
+        source = out[0..source_len];
+    } else if (parsed.driver) |driver| {
         // The byte index is not a sound prefilter when Unicode folding or fzf
         // normalization can make a non-ASCII candidate match an ASCII query.
         if (!candidates.has_non_ascii and !fuzzy_engine.cliTextHasNonAscii(driver)) {
-            source = try index.search(driver, out);
+            if (options.algorithm == .heuristic) {
+                const one = [_][]const u8{driver};
+                source = fuzzy_engine.cliCollectMayMatchAllFoldedAscii(index, &one, out);
+            } else source = try index.search(driver, out);
         } else {
-            for (out, 0..) |*slot, i| slot.* = i;
+            const count = @min(out.len, candidates.search.len);
+            for (out[0..count], 0..) |*slot, i| slot.* = i;
+            source = out[0..count];
         }
     } else {
-        for (out, 0..) |*slot, i| slot.* = i;
+        const count = @min(out.len, candidates.search.len);
+        for (out[0..count], 0..) |*slot, i| slot.* = i;
+        source = out[0..count];
     }
 
     var rank_len: usize = 0;
     for (source) |idx| {
-        const score = scoreParsedCandidate(index, parsed, candidates.search[idx], idx, options.case_mode, !options.literal, options.scheme) orelse continue;
+        const score = scoreParsedCandidate(index, parsed, candidates.search[idx], idx, options.case_mode, !options.literal, options.scheme, options.algorithm) orelse continue;
         rank_scratch[rank_len] = .{ .entry = idx, .score = score };
         rank_len += 1;
     }
@@ -5980,7 +6129,7 @@ fn searchCandidates(
     return out[0..take];
 }
 
-fn scoreParsedCandidate(index: *fuzzy.Index, parsed: ParsedQuery, line: []const u8, entry_index: usize, mode: CaseMode, normalize_enabled: bool, scheme: Scheme) ?CandidateScore {
+fn scoreParsedCandidate(index: *fuzzy.Index, parsed: ParsedQuery, line: []const u8, entry_index: usize, mode: CaseMode, normalize_enabled: bool, scheme: Scheme, algorithm: Algorithm) ?CandidateScore {
     if (parsed.terms.len == 0) return .{};
     var total: CandidateScore = .{ .rune_offsets = fuzzy_engine.cliTextHasNonAscii(line) and std.unicode.utf8ValidateSlice(line) };
     var clause: usize = 0;
@@ -5989,7 +6138,7 @@ fn scoreParsedCandidate(index: *fuzzy.Index, parsed: ParsedQuery, line: []const 
         var contribution: ?fuzzy_engine.CliMatch = null;
         for (parsed.terms) |term| {
             if (term.clause != clause) continue;
-            const term_match = scoreTerm(index, term, line, entry_index, mode, normalize_enabled, scheme);
+            const term_match = scoreTerm(index, term, line, entry_index, mode, normalize_enabled, scheme, algorithm);
             if (term_match) |value| {
                 if (term.inverse) continue;
                 contribution = value;
@@ -6009,7 +6158,7 @@ fn scoreParsedCandidate(index: *fuzzy.Index, parsed: ParsedQuery, line: []const 
     return total;
 }
 
-fn scoreTerm(index: *fuzzy.Index, term: QueryTerm, line: []const u8, entry_index: usize, mode: CaseMode, normalize_enabled: bool, scheme: Scheme) ?fuzzy_engine.CliMatch {
+fn scoreTerm(index: *fuzzy.Index, term: QueryTerm, line: []const u8, entry_index: usize, mode: CaseMode, normalize_enabled: bool, scheme: Scheme, algorithm: Algorithm) ?fuzzy_engine.CliMatch {
     const sensitive = termCaseSensitive(mode, term.text);
     const normalize = fuzzy_engine.cliNormalizeTerm(term.text, normalize_enabled);
     const cli_scheme: fuzzy_engine.CliScheme = switch (scheme) {
@@ -6020,7 +6169,10 @@ fn scoreTerm(index: *fuzzy.Index, term: QueryTerm, line: []const u8, entry_index
     const unicode_path = (fuzzy_engine.cliTextHasNonAscii(term.text) or fuzzy_engine.cliTextHasNonAscii(line)) and
         std.unicode.utf8ValidateSlice(term.text) and std.unicode.utf8ValidateSlice(line);
     if (unicode_path) return switch (term.kind) {
-        .fuzzy => fuzzy_engine.matchFuzzyUnicodeForCliScheme(index, term.text, line, sensitive, normalize, cli_scheme),
+        .fuzzy => if (algorithm == .v1)
+            fuzzy_engine.matchFuzzyUnicodeV1ForCliScheme(index, term.text, line, sensitive, normalize, cli_scheme)
+        else
+            fuzzy_engine.matchFuzzyUnicodeForCliScheme(index, term.text, line, sensitive, normalize, cli_scheme),
         .exact => fuzzy_engine.scoreExactUnicodeForCliScheme(index, term.text, line, sensitive, normalize, false, cli_scheme),
         .boundary_exact => fuzzy_engine.scoreExactUnicodeForCliScheme(index, term.text, line, sensitive, normalize, true, cli_scheme),
         .prefix => fuzzy_engine.scorePrefixUnicodeForCliScheme(index, term.text, line, sensitive, normalize, cli_scheme),
@@ -6028,7 +6180,11 @@ fn scoreTerm(index: *fuzzy.Index, term: QueryTerm, line: []const u8, entry_index
         .equal => fuzzy_engine.scoreEqualUnicodeForCliScheme(index, term.text, line, sensitive, normalize, cli_scheme),
     };
     return switch (term.kind) {
-        .fuzzy => fuzzy_engine.matchFuzzyForCliScheme(index, term.text, line, entry_index, sensitive, cli_scheme),
+        .fuzzy => switch (algorithm) {
+            .v2 => fuzzy_engine.matchFuzzyForCliScheme(index, term.text, line, entry_index, sensitive, cli_scheme),
+            .v1 => fuzzy_engine.matchFuzzyV1ForCliScheme(index, term.text, line, entry_index, sensitive, cli_scheme),
+            .heuristic => fuzzy_engine.matchFuzzyForCliScheme(index, term.text, line, entry_index, sensitive, cli_scheme),
+        },
         .exact => fuzzy_engine.scoreExactForCliScheme(index, term.text, line, entry_index, sensitive, false, cli_scheme),
         .boundary_exact => fuzzy_engine.scoreExactForCliScheme(index, term.text, line, entry_index, sensitive, true, cli_scheme),
         .prefix => fuzzy_engine.scorePrefixForCliScheme(index, term.text, line, entry_index, sensitive, cli_scheme),
@@ -6139,6 +6295,76 @@ fn parseTerm(raw: []const u8, exact_mode: bool, clause: u16) QueryTerm {
     }
 
     return .{ .text = text, .kind = kind, .inverse = inverse, .clause = clause };
+}
+
+fn heuristicPureAndTerms(parsed: ParsedQuery, mode: CaseMode, storage: *[512][]const u8) ?[]const []const u8 {
+    if (parsed.clause_count == 0 or parsed.terms.len != parsed.clause_count) return null;
+    for (parsed.terms, 0..) |term, i| {
+        if (term.inverse or term.kind != .fuzzy or termCaseSensitive(mode, term.text)) return null;
+        storage[i] = term.text;
+    }
+    return storage[0..parsed.terms.len];
+}
+
+fn heuristicScoreOnlyTiebreakSafe(options: *const Options) bool {
+    var i: usize = 0;
+    while (i < options.tiebreak_count) : (i += 1) {
+        if (options.tiebreaks[i] != .length) return false;
+    }
+    return true;
+}
+
+fn heuristicFilterPureAndAscii(candidates: *const CandidateSet, source: []usize, terms: []const []const u8) []usize {
+    var keep: usize = 0;
+    for (source) |idx| {
+        if (fuzzy_engine.cliTextHasNonAscii(candidates.search[idx])) continue;
+        var matched = true;
+        for (terms) |term| {
+            if (!fuzzySubsequence(candidates.search[idx], term, false)) {
+                matched = false;
+                break;
+            }
+        }
+        if (!matched) continue;
+        source[keep] = idx;
+        keep += 1;
+    }
+    return source[0..keep];
+}
+
+fn heuristicHasPresenceClause(parsed: ParsedQuery) bool {
+    var clause: usize = 0;
+    while (clause < parsed.clause_count) : (clause += 1) {
+        var seen = false;
+        var usable = true;
+        for (parsed.terms) |term| {
+            if (term.clause != clause) continue;
+            seen = true;
+            if (term.kind != .fuzzy or term.inverse) usable = false;
+        }
+        if (seen and usable) return true;
+    }
+    return false;
+}
+
+fn heuristicPresenceClausesMatch(index: *const fuzzy.Index, parsed: ParsedQuery, entry_index: usize) bool {
+    var clause: usize = 0;
+    while (clause < parsed.clause_count) : (clause += 1) {
+        var seen = false;
+        var usable = true;
+        var possible = false;
+        for (parsed.terms) |term| {
+            if (term.clause != clause) continue;
+            seen = true;
+            if (term.kind != .fuzzy or term.inverse) {
+                usable = false;
+                continue;
+            }
+            possible = possible or fuzzy_engine.cliMayContainFoldedAscii(index, entry_index, term.text);
+        }
+        if (seen and usable and !possible) return false;
+    }
+    return true;
 }
 
 fn queryMatches(parsed: ParsedQuery, line: []const u8, mode: CaseMode) bool {
@@ -7089,7 +7315,7 @@ fn expandCommandImplWithForcePlus(
     return try out.toOwnedSlice(allocator);
 }
 
-var placeholder_file_counter: std.atomic.Value(u64) = .init(0);
+var placeholder_file_counter: std.atomic.Value(u32) = .init(0);
 
 fn appendFilePlaceholder(
     allocator: Allocator,
@@ -7105,12 +7331,25 @@ fn appendFilePlaceholder(
     matched: []const usize,
     force_plus: bool,
 ) !void {
+    var fallback_temp_dir: ?[:0]u8 = null;
+    defer if (fallback_temp_dir) |value| allocator.free(value);
+    const temp_dir = if (options.temp_dir.len != 0) options.temp_dir else blk: {
+        fallback_temp_dir = try std.process.currentPathAlloc(io, allocator);
+        break :blk fallback_temp_dir.?;
+    };
+
     var path: ?[]u8 = null;
     var file: ?Io.File = null;
     var attempt: usize = 0;
     while (attempt < 32) : (attempt += 1) {
         const serial = placeholder_file_counter.fetchAdd(1, .monotonic);
-        const candidate_path = try std.fmt.allocPrint(allocator, "/tmp/zfuzz-{d}-{d}.tmp", .{ std.c.getpid(), serial });
+        const process_id: u64 = if (builtin.os.tag == .windows)
+            @intCast(std.os.windows.GetCurrentProcessId())
+        else
+            @intCast(std.c.getpid());
+        const filename = try std.fmt.allocPrint(allocator, "zfuzz-{d}-{d}.tmp", .{ process_id, serial });
+        defer allocator.free(filename);
+        const candidate_path = try std.fs.path.join(allocator, &.{ temp_dir, filename });
         const opened = Io.Dir.createFileAbsolute(io, candidate_path, .{ .exclusive = true, .permissions = @enumFromInt(0o600) }) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 allocator.free(candidate_path);
@@ -7410,6 +7649,7 @@ const usage =
     \\      --no-sort            preserve input order after filtering
     \\      --raw                show non-matching items dimmed alongside matches
     \\      --tiebreak=CRI       score tie-breaks: length/chunk/pathname/begin/end/index
+    \\      --algo=ALGO          fuzzy algorithm: v2 (default), v1, heuristic (exact V2 ranking)
     \\      --scheme=SCHEME      ranking scheme: default/path/history
     \\      --tail=N             keep only the last N input items in memory
     \\      --track              keep current item focused across result updates
@@ -7717,7 +7957,11 @@ test "file placeholders materialize selected fields" {
     const got = try expandCommandImpl(a, "cat {+f1}", "", &candidates, &options, 0, &order, &selected, &matched, "", options.prompt, std.testing.io, &temp_files);
     defer a.free(got);
     try std.testing.expectEqual(@as(usize, 1), temp_files.items.len);
-    try std.testing.expect(std.mem.startsWith(u8, got, "cat '/tmp/zfuzz-"));
+    try std.testing.expect(std.fs.path.isAbsolute(temp_files.items[0]));
+    const temp_name = std.fs.path.basename(temp_files.items[0]);
+    try std.testing.expect(std.mem.startsWith(u8, temp_name, "zfuzz-"));
+    try std.testing.expect(std.mem.endsWith(u8, temp_name, ".tmp"));
+    try std.testing.expect(std.mem.indexOf(u8, got, temp_files.items[0]) != null);
 
     const file = try Io.Dir.openFileAbsolute(std.testing.io, temp_files.items[0], .{});
     defer file.close(std.testing.io);
@@ -7813,7 +8057,11 @@ test "matched file placeholder materializes transformed values" {
     const got = try expandCommandImpl(a, "cat {*f1}", "", &candidates, &options, 0, &.{}, &selected, &matched, "", options.prompt, std.testing.io, &temp_files);
     defer a.free(got);
     try std.testing.expectEqual(@as(usize, 1), temp_files.items.len);
-    try std.testing.expect(std.mem.startsWith(u8, got, "cat '/tmp/zfuzz-"));
+    try std.testing.expect(std.fs.path.isAbsolute(temp_files.items[0]));
+    const temp_name = std.fs.path.basename(temp_files.items[0]);
+    try std.testing.expect(std.mem.startsWith(u8, temp_name, "zfuzz-"));
+    try std.testing.expect(std.mem.endsWith(u8, temp_name, ".tmp"));
+    try std.testing.expect(std.mem.indexOf(u8, got, temp_files.items[0]) != null);
 
     const file = try Io.Dir.openFileAbsolute(std.testing.io, temp_files.items[0], .{});
     defer file.close(std.testing.io);
@@ -9381,4 +9629,109 @@ test "subword boundary helpers match fzf fixtures" {
     try std.testing.expectEqual(@as(usize, q.len - 3), subwordBoundaryBackward(q, q.len));
     try std.testing.expectEqual(@as(usize, "αβ".len), subwordBoundaryForward("αβ-γδ", 0));
     try std.testing.expectEqual(@as(usize, "αβ-".len), subwordBoundaryBackward("αβ-γδ", "αβ-γδ".len));
+}
+
+test "algorithm option accepts v1 v2 and heuristic" {
+    const a = std.testing.allocator;
+    const v2_args = [_][]const u8{ "zfuzz", "--algo=v2" };
+    var v2 = try parseOptions(a, &v2_args);
+    defer v2.deinit(a);
+    try std.testing.expectEqual(Algorithm.v2, v2.algorithm);
+
+    const v1_args = [_][]const u8{ "zfuzz", "--algo=v1" };
+    var v1 = try parseOptions(a, &v1_args);
+    defer v1.deinit(a);
+    try std.testing.expectEqual(Algorithm.v1, v1.algorithm);
+
+    const heuristic_args = [_][]const u8{ "zfuzz", "--algo", "heuristic" };
+    var heuristic = try parseOptions(a, &heuristic_args);
+    defer heuristic.deinit(a);
+    try std.testing.expectEqual(Algorithm.heuristic, heuristic.algorithm);
+
+    const bad_args = [_][]const u8{ "zfuzz", "--algo=nope" };
+    try std.testing.expectError(error.InvalidAlgorithm, parseOptions(a, &bad_args));
+}
+
+test "heuristic mixed Unicode top-k is identical to v2" {
+    const a = std.testing.allocator;
+    const input =
+        "src/group7/needle3\n" ++
+        "Só Danço Samba source group7 needle3\n" ++
+        "source group7 needle3\n" ++
+        "é foo_bar source\n" ++
+        "é FooBar source\n" ++
+        "é f---b source\n" ++
+        "café module target\n" ++
+        "CAFÉ module target\n" ++
+        "other\n";
+    var build_options: Options = .{};
+    defer build_options.deinit(a);
+    var candidates = try candidatesFromOwnedBlob(a, try a.dupe(u8, input), &build_options);
+    defer candidates.deinit(a);
+    try std.testing.expect(candidates.has_non_ascii);
+    var v2_index = try fuzzy.init(a, candidates.search);
+    defer v2_index.deinit();
+    var heuristic_index = try fuzzy.init(a, candidates.search);
+    defer heuristic_index.deinit();
+    var v2_options: Options = .{};
+    defer v2_options.deinit(a);
+    var heuristic_options: Options = .{ .algorithm = .heuristic };
+    defer heuristic_options.deinit(a);
+    var v2_out: [16]usize = undefined;
+    var heuristic_out: [16]usize = undefined;
+    var v2_ranks: [16]ExtendedRank = undefined;
+    var heuristic_ranks: [16]ExtendedRank = undefined;
+    const queries = [_][]const u8{
+        "source group7 needle3",
+        "fb source",
+        "cafe module",
+        "café target",
+    };
+    for (queries) |query| {
+        const expected = try searchCandidates(&v2_index, &candidates, &v2_options, query, &v2_out, &v2_ranks, v2_out.len);
+        const got = try searchCandidates(&heuristic_index, &candidates, &heuristic_options, query, &heuristic_out, &heuristic_ranks, heuristic_out.len);
+        try std.testing.expectEqualSlices(usize, expected, got);
+    }
+}
+
+test "heuristic algorithm is randomized top-k identical to v2" {
+    const a = std.testing.allocator;
+    var blob_builder: std.ArrayList(u8) = .empty;
+    defer blob_builder.deinit(a);
+    var line_buf: [128]u8 = undefined;
+    for (0..1280) |i| {
+        const line = try std.fmt.bufPrint(&line_buf, "src/group{d}/module{d}/item-{d}-needle{d}", .{ i % 17, i % 23, i, i % 11 });
+        try blob_builder.appendSlice(a, line);
+        try blob_builder.append(a, '\n');
+    }
+    const blob = try blob_builder.toOwnedSlice(a);
+    var build_options: Options = .{};
+    defer build_options.deinit(a);
+    var candidates = try candidatesFromOwnedBlob(a, blob, &build_options);
+    defer candidates.deinit(a);
+
+    var v2_index = try fuzzy.init(a, candidates.search);
+    defer v2_index.deinit();
+    var heuristic_index = try fuzzy.init(a, candidates.search);
+    defer heuristic_index.deinit();
+    var v2_options: Options = .{};
+    defer v2_options.deinit(a);
+    var heuristic_options: Options = .{ .algorithm = .heuristic };
+    defer heuristic_options.deinit(a);
+    var v2_out: [1280]usize = undefined;
+    var heuristic_out: [1280]usize = undefined;
+    var v2_ranks: [1280]ExtendedRank = undefined;
+    var heuristic_ranks: [1280]ExtendedRank = undefined;
+    var query_buf: [96]u8 = undefined;
+    for (0..600) |trial| {
+        const query = switch (trial % 3) {
+            0 => try std.fmt.bufPrint(&query_buf, "src group{d} needle{d}", .{ trial % 17, trial % 11 }),
+            1 => try std.fmt.bufPrint(&query_buf, "module{d} item needle{d}", .{ trial % 23, (trial * 7) % 11 }),
+            else => try std.fmt.bufPrint(&query_buf, "group{d} | needle{d}", .{ trial % 17, (trial * 5) % 11 }),
+        };
+        const limit = 16 + trial % 128;
+        const expected = try searchCandidates(&v2_index, &candidates, &v2_options, query, &v2_out, &v2_ranks, limit);
+        const got = try searchCandidates(&heuristic_index, &candidates, &heuristic_options, query, &heuristic_out, &heuristic_ranks, limit);
+        try std.testing.expectEqualSlices(usize, expected, got);
+    }
 }

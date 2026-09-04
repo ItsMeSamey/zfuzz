@@ -34,6 +34,29 @@ That is the API: preprocess the candidate array once with `fuzzy.init`, then cal
 `index.search(query, output_buffer)`. Query preprocessing is automatic on every
 search; there is no unprepared search path.
 
+## CLI fuzzy algorithms
+
+The command-line frontend supports three selectable fuzzy scorers with `--algo`:
+
+- `--algo=v2` is the default and preserves exact fzf V2 ranking.
+- `--algo=v1` uses fzf V1 fuzzy scoring.
+- `--algo=heuristic` preserves exact V2 match membership **and ranking**. For
+  suitable ASCII multi-term AND queries it uses conservative signature and ordered-
+  subsequence filters, then the same exact specialized V2 scoring kernels on the
+  survivors. Direct/selective queries reuse the normal V2 search path.
+
+Mixed Unicode candidate sets remain exact: ASCII rows can use the indexed fast path,
+while non-ASCII rows are scored through the normal Unicode-aware frontend and merged
+before top-K selection. Unsupported heuristic fast-path shapes simply fall back to the
+ordinary exact V2 scorer. Exact/prefix/suffix/equal terms keep their normal semantics
+under every algorithm.
+
+## Portability
+
+The interactive terminal backend and live pipe-refresh path are currently POSIX-only.
+Windows builds support piped/filter workflows, but native interactive TTY mode is not
+yet implemented.
+
 `fuzzy.init` copies the searchable representation, so the input strings do not
 need to remain alive afterward. Search returns indices in the original input
 ordering, sorted best-first. The caller chooses top-K by the size of the output

@@ -110,9 +110,22 @@ pub fn main(init: std.process.Init) !void {
     try runCases(&suite, &basic_cases);
     try runCases(&suite, &io_cases);
     try runCases(&suite, &config_cases);
+    try runCases(&suite, &algorithm_cases);
+    try runCases(&suite, &algorithm_diff_cases);
     if (builtin.os.tag == .linux) {
         try runCases(&suite, &interactive_cases);
         try runCases(&suite, &interactive_input_cases);
     }
     std.debug.print("E2E: {d} cases passed\n", .{suite.passed});
 }
+
+const algorithm_cases = [_]Case{
+    .{ .name = "v1 algorithm", .script = "printf 'foo_bar\\nFooBar\\nfzzzzb\\n' | \"$1\" --algo=v1 --filter=fb", .stdout = "FooBar\nfoo_bar\nfzzzzb\n" },
+    .{ .name = "heuristic algorithm", .script = "printf 'src/foo-needle\\nsrc/bar\\nlib/foo-needle\\n' | \"$1\" --algo=heuristic --filter='src needle'", .stdout = "src/foo-needle\n" },
+    .{ .name = "invalid algorithm", .script = "printf 'one\\n' | \"$1\" --algo=nope --filter=one", .stdout = "", .exit_code = 1 },
+};
+
+const algorithm_diff_cases = [_]Case{
+    .{ .name = "heuristic membership differential", .script = "D=.zig-cache/e2e-algo-$$; mkdir -p \"$D\"; trap 'rm -rf \"$D\"' EXIT; printf 'src/group7/module1/needle3\\nsrc/group7/module2/other\\nsrc/group2/module1/needle3\\nsrc/x/group7-y-needle3\\nlib/group7/needle3\\nsrc/group7/needle30\\nsrc/group70/needle3\\n' > \"$D/in\"; \"$1\" --algo=v2 --no-sort --filter='src group7 needle3' < \"$D/in\" > \"$D/v2\"; \"$1\" --algo=heuristic --no-sort --filter='src group7 needle3' < \"$D/in\" > \"$D/h\"; [ \"$(sha256sum \"$D/v2\" | cut -d' ' -f1)\" = \"$(sha256sum \"$D/h\" | cut -d' ' -f1)\" ]; printf 'equal\\n'", .stdout = "equal\n" },
+    .{ .name = "heuristic unicode membership differential", .script = "D=.zig-cache/e2e-algo-u-$$; mkdir -p \"$D\"; trap 'rm -rf \"$D\"' EXIT; printf 'Só Danço Samba source\\nDanco source\\nsource Danço\\nother\\n' > \"$D/in\"; \"$1\" --algo=v2 --no-sort --filter='danco source' < \"$D/in\" > \"$D/v2\"; \"$1\" --algo=heuristic --no-sort --filter='danco source' < \"$D/in\" > \"$D/h\"; [ \"$(sha256sum \"$D/v2\" | cut -d' ' -f1)\" = \"$(sha256sum \"$D/h\" | cut -d' ' -f1)\" ]; printf 'equal\\n'", .stdout = "equal\n" },
+};
