@@ -4999,7 +4999,12 @@ fn keyNameIdentity(name: []const u8) ?KeyNameIdentity {
         else if (std.ascii.eqlIgnoreCase(name, "alt-bs") or std.ascii.eqlIgnoreCase(name, "alt-bspace") or std.ascii.eqlIgnoreCase(name, "alt-backspace")) 21
         else if (std.ascii.eqlIgnoreCase(name, "ctrl-alt-bs") or std.ascii.eqlIgnoreCase(name, "ctrl-alt-bspace") or std.ascii.eqlIgnoreCase(name, "ctrl-alt-backspace") or
             (builtin.os.tag != .windows and std.ascii.eqlIgnoreCase(name, "ctrl-alt-h"))) 23
-        else if (name.len == 6 and asciiStartsWithIgnoreCase(name, "ctrl-") and std.ascii.isAlphabetic(name[5]))
+        else if (name.len == 10 and asciiStartsWithIgnoreCase(name, "ctrl-alt-") and std.ascii.isAlphabetic(name[9])) blk: {
+            const letter = std.ascii.toLower(name[9]);
+            if (letter == 'm') break :blk 20;
+            if (builtin.os.tag != .windows and letter == 'h') break :blk 23;
+            break :blk 200 + @as(u16, letter - 'a');
+        } else if (name.len == 6 and asciiStartsWithIgnoreCase(name, "ctrl-") and std.ascii.isAlphabetic(name[5]))
             100 + @as(u16, std.ascii.toLower(name[5]) - 'a')
         else return null;
     return .{ .kind = .named, .value = named };
@@ -6711,7 +6716,8 @@ fn keyMatchesName(key: Key, name: []const u8) bool {
         .shift_tab => identity.kind == .named and identity.value == 10,
         .alt_byte => |b| (identity.kind == .alt_literal and identity.value == b) or
             (identity.kind == .named and ((identity.value == 20 and b == 13) or
-            (identity.value == 21 and b == 127) or (identity.value == 23 and b == 8))),
+            (identity.value == 21 and b == 127) or (identity.value == 23 and b == 8) or
+            (identity.value >= 200 and identity.value < 226 and b == identity.value - 199))),
         .byte => |b| blk: {
             if (identity.kind == .literal) break :blk identity.value == b;
             if (identity.kind != .named) break :blk false;
@@ -8768,6 +8774,10 @@ test "key names follow fzf case semantics" {
     try std.testing.expect(keyMatchesName(.{ .alt_byte = 127 }, "alt-backspace"));
     try std.testing.expect(!keyMatchesName(.{ .alt_byte = 8 }, "alt-backspace"));
     try std.testing.expect(keyMatchesName(.{ .alt_byte = 8 }, "ctrl-alt-backspace"));
+    try std.testing.expect(keyMatchesName(.{ .alt_byte = 10 }, "ctrl-alt-j"));
+    try std.testing.expect(keyMatchesName(.{ .alt_byte = 10 }, "CTRL-ALT-J"));
+    try std.testing.expect(triggerNamesEquivalent("ctrl-alt-m", "alt-enter"));
+    try std.testing.expect(keyMatchesName(.{ .alt_byte = 13 }, "ctrl-alt-m"));
     if (builtin.os.tag != .windows) try std.testing.expect(triggerNamesEquivalent("ctrl-alt-h", "ctrl-alt-backspace"));
     try std.testing.expect(keyMatchesName(.{ .byte = 30 }, "ctrl-6"));
     try std.testing.expect(keyMatchesName(.{ .byte = 31 }, "ctrl-_"));
@@ -9180,6 +9190,13 @@ test "expect aliases keep the last fzf spelling per event" {
         try std.testing.expectEqualStrings("ctrl-backspace", backspaces.expect.items[0]);
         try std.testing.expectEqualStrings("backspace", backspaces.expect.items[1]);
     }
+
+    const ctrl_alt_args = [_][]const u8{ "zfuzz", "--expect=alt-enter,ctrl-alt-m,ctrl-alt-j" };
+    var ctrl_alt = try parseOptions(a, &ctrl_alt_args);
+    defer ctrl_alt.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), ctrl_alt.expect.items.len);
+    try std.testing.expectEqualStrings("ctrl-alt-m", ctrl_alt.expect.items[0]);
+    try std.testing.expectEqualStrings("ctrl-alt-j", ctrl_alt.expect.items[1]);
 
     const repeated_args = [_][]const u8{ "zfuzz", "--expect=return", "--expect=ENTER" };
     var repeated = try parseOptions(a, &repeated_args);
