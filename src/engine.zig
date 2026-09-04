@@ -3322,7 +3322,7 @@ pub fn matchFuzzyForCliScheme(index: *Index, query: []const u8, candidate: []con
                 var b: i16 = @intCast(cliSchemeBonusAt(index, entry, candidate, j, scheme));
                 consecutive = prev_c[j - 1] + 1;
                 if (consecutive > 1) {
-                    const first_index = j - @as(usize, @intCast(consecutive)) + 1;
+                    const first_index = j + 1 - @as(usize, @intCast(consecutive));
                     const first_bonus: i16 = @intCast(cliSchemeBonusAt(index, entry, candidate, first_index, scheme));
                     if (b >= bonus_boundary and b > first_bonus) {
                         consecutive = 1;
@@ -3804,7 +3804,7 @@ pub fn matchFuzzyUnicodeForCliScheme(index: *Index, query: []const u8, candidate
                 var b: i16 = @intCast(cliRuneMetaBonus(index.last_position_scratch[j]));
                 consecutive = prev_c[j - 1] + 1;
                 if (consecutive > 1) {
-                    const first_index = j - @as(usize, @intCast(consecutive)) + 1;
+                    const first_index = j + 1 - @as(usize, @intCast(consecutive));
                     const first_bonus: i16 = @intCast(cliRuneMetaBonus(index.last_position_scratch[first_index]));
                     if (b >= bonus_boundary and b > first_bonus) {
                         consecutive = 1;
