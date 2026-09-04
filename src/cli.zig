@@ -6707,12 +6707,12 @@ fn keyMatchesName(key: Key, name: []const u8) bool {
         .delete => identity.kind == .named and identity.value == 9,
         .shift_tab => identity.kind == .named and identity.value == 10,
         .alt_byte => |b| (identity.kind == .alt_literal and identity.value == b) or
-            (identity.kind == .named and ((identity.value == 20 and (b == 13 or b == 10)) or
+            (identity.kind == .named and ((identity.value == 20 and b == 13) or
             (identity.value == 21 and (b == 127 or b == 8)))),
         .byte => |b| blk: {
             if (identity.kind == .literal) break :blk identity.value == b;
             if (identity.kind != .named) break :blk false;
-            if (identity.value == 11) break :blk b == 13 or b == 10;
+            if (identity.value == 11) break :blk b == 13;
             if (identity.value == 12) break :blk b == 9;
             if (identity.value == 13) break :blk b == 27;
             if (identity.value == 14) break :blk b == 127;
@@ -8751,6 +8751,8 @@ test "key names follow fzf case semantics" {
     try std.testing.expect(triggerNamesEquivalent("AlT-A", "alt-A"));
     try std.testing.expect(!triggerNamesEquivalent("alt-A", "alt-a"));
     try std.testing.expect(keyMatchesName(.{ .byte = 13 }, "RETURN"));
+    try std.testing.expect(!keyMatchesName(.{ .byte = 10 }, "enter"));
+    try std.testing.expect(keyMatchesName(.{ .byte = 10 }, "ctrl-j"));
     try std.testing.expect(keyMatchesName(.{ .byte = ' ' }, "space"));
     try std.testing.expect(keyMatchesName(.delete, "DEL"));
     try std.testing.expect(keyMatchesName(.{ .byte = 127 }, "bs"));
@@ -8759,6 +8761,7 @@ test "key names follow fzf case semantics" {
     if (builtin.os.tag != .windows) try std.testing.expect(triggerNamesEquivalent("ctrl-h", "ctrl-backspace"));
     try std.testing.expect(keyMatchesName(.{ .alt_byte = ' ' }, "Alt-Space"));
     try std.testing.expect(keyMatchesName(.{ .alt_byte = 13 }, "alt-return"));
+    try std.testing.expect(!keyMatchesName(.{ .alt_byte = 10 }, "alt-enter"));
     try std.testing.expect(keyMatchesName(.{ .byte = 30 }, "ctrl-6"));
     try std.testing.expect(keyMatchesName(.{ .byte = 31 }, "ctrl-_"));
     try std.testing.expect(triggerNamesEquivalent("enter", "return"));
