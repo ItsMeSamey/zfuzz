@@ -19,6 +19,7 @@ pub fn build(b: *std.Build) void {
 
     const exe = b.addExecutable(.{
         .name = "zfuzz",
+        .use_llvm = true,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/cli.zig"),
             .target = target,
@@ -41,6 +42,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_exe.step);
 
     const cli_unit_tests = b.addTest(.{
+        .use_llvm = true,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/cli.zig"),
             .target = target,
