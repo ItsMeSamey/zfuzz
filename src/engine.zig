@@ -4696,3 +4696,51 @@ test "CLI fuzzy scorer covers V1 fallback above 1000 bytes" {
     const actual = scoreFuzzyForCli(&index, query, values[0], 0, false);
     try std.testing.expectEqual(expected, actual);
 }
+
+test "randomized indexed top-k matches brute-force V2" {
+    const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789_-/.: ";
+    var buffers: [96][80]u8 = undefined;
+    var values: [96][]const u8 = undefined;
+    var state: u64 = 0xd1ff3e7a91b5c243;
+
+    for (&buffers, 0..) |*buffer, i| {
+        const len = 4 + (i * 37 % 77);
+        for (buffer[0..len]) |*slot| {
+            state = state *% 6364136223846793005 +% 1442695040888963407;
+            slot.* = alphabet[@as(usize, @intCast(state >> 32)) % alphabet.len];
+        }
+        values[i] = buffer[0..len];
+    }
+
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+    var query_buf: [12]u8 = undefined;
+    var got_buf: [11]usize = undefined;
+    var exact: [values.len]StageMatch = undefined;
+    for (0..1200) |trial| {
+        const qlen = 1 + trial % query_buf.len;
+        for (query_buf[0..qlen]) |*slot| {
+            state = state *% 2862933555777941757 +% 3037000493;
+            slot.* = alphabet[@as(usize, @intCast(state >> 33)) % alphabet.len];
+        }
+        const query = query_buf[0..qlen];
+        index.resetHistory();
+        const q = index.compileQuery(query);
+        var exact_len: usize = 0;
+        for (index.entries, 0..) |entry, entry_index| {
+            const score = index.scoreV2(&q, entry) orelse continue;
+            exact[exact_len] = .{ .entry = entry_index, .score = score };
+            stageBubbleWorst(index.entries, exact[0 .. exact_len + 1], exact_len);
+            exact_len += 1;
+        }
+        stageSortBestFirst(index.entries, exact[0..exact_len]);
+
+        index.resetHistory();
+        const got = try index.search(query, &got_buf);
+        const expected_len = @min(got_buf.len, exact_len);
+        try std.testing.expectEqual(expected_len, got.len);
+        for (got, exact[0..expected_len]) |entry_index, expected| {
+            try std.testing.expectEqual(expected.entry, entry_index);
+        }
+    }
+}

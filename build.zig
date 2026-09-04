@@ -56,12 +56,31 @@ pub fn build(b: *std.Build) void {
     });
     const run_cli_unit_tests = b.addRunArtifact(cli_unit_tests);
 
+    const engine_unit_tests = b.addTest(.{
+        .root_module = engine_module,
+    });
+    const run_engine_unit_tests = b.addRunArtifact(engine_unit_tests);
+
     const lib_unit_tests = b.addTest(.{
         .root_module = fuzzy_module,
     });
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
+    const e2e = b.addExecutable(.{
+        .name = "zfuzz-e2e",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_e2e = b.addRunArtifact(e2e);
+    run_e2e.addArtifactArg(exe);
+    run_e2e.setCwd(b.path("."));
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
+    test_step.dependOn(&run_engine_unit_tests.step);
     test_step.dependOn(&run_cli_unit_tests.step);
+    test_step.dependOn(&run_e2e.step);
 }
