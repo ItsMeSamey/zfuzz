@@ -3852,9 +3852,21 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(allocator);
     var options: Options = .{};
     if (init.environ_map.get("NO_COLOR") != null) options.theme.enabled = false;
+    var file_default_args: ?[][]const u8 = null;
+    defer if (file_default_args) |parsed| freeShellArgs(allocator, parsed);
+    if (init.environ_map.get("FZF_DEFAULT_OPTS_FILE")) |path| {
+        if (path.len != 0) {
+            const defaults_text = try readOptionsFile(allocator, init.io, path);
+            defer allocator.free(defaults_text);
+            file_default_args = try shellSplitArgs(allocator, defaults_text);
+            try parseOptionsInto(allocator, init.io, &options, file_default_args.?, 0);
+        }
+    }
+    var env_default_args: ?[][]const u8 = null;
+    defer if (env_default_args) |parsed| freeShellArgs(allocator, parsed);
     if (init.environ_map.get("FZF_DEFAULT_OPTS")) |defaults_text| {
-        const default_args = try shellSplitArgs(allocator, defaults_text);
-        try parseOptionsInto(allocator, init.io, &options, default_args, 0);
+        env_default_args = try shellSplitArgs(allocator, defaults_text);
+        try parseOptionsInto(allocator, init.io, &options, env_default_args.?, 0);
     }
     try parseOptionsInto(allocator, init.io, &options, args, 1);
     defer options.deinit(allocator);
@@ -3944,6 +3956,19 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+fn freeShellArgs(allocator: Allocator, args: []const []const u8) void {
+    for (args) |arg| allocator.free(arg);
+    allocator.free(args);
+}
+
+fn readOptionsFile(allocator: Allocator, io: Io, path: []const u8) ![]u8 {
+    const file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var buffer: [8192]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    return reader.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024));
+}
+
 fn shellSplitArgs(allocator: Allocator, text: []const u8) ![][]const u8 {
     var args: std.ArrayList([]const u8) = .empty;
     errdefer {
@@ -3954,8 +3979,13 @@ fn shellSplitArgs(allocator: Allocator, text: []const u8) ![][]const u8 {
     defer token.deinit(allocator);
     var quote: u8 = 0;
     var escaped = false;
+    var comment = false;
     var have = false;
     for (text) |c| {
+        if (comment) {
+            if (c == '\n') comment = false;
+            continue;
+        }
         if (escaped) {
             try token.append(allocator, c);
             escaped = false;
@@ -3970,6 +4000,10 @@ fn shellSplitArgs(allocator: Allocator, text: []const u8) ![][]const u8 {
         if (quote != 0) {
             if (c == quote) quote = 0 else try token.append(allocator, c);
             have = true;
+            continue;
+        }
+        if (c == '#' and token.items.len == 0) {
+            comment = true;
             continue;
         }
         if (c == '\'' or c == '"') {
@@ -7942,6 +7976,30 @@ test "shell option splitting" {
     try std.testing.expectEqual(@as(usize, 3), args.len);
     try std.testing.expectEqualStrings("--prompt=pick > ", args[1]);
     try std.testing.expectEqualStrings("--bind=ctrl-r:reload(echo x)", args[2]);
+
+    const commented = try shellSplitArgs(a, "# defaults\n--exact # trailing\n--prompt='pick # > ' foo#bar");
+    defer freeShellArgs(a, commented);
+    try std.testing.expectEqual(@as(usize, 3), commented.len);
+    try std.testing.expectEqualStrings("--exact", commented[0]);
+    try std.testing.expectEqualStrings("--prompt=pick # > ", commented[1]);
+    try std.testing.expectEqualStrings("foo#bar", commented[2]);
+}
+
+test "default options file accepts shell-word options" {
+    const a = std.testing.allocator;
+    const path = "/tmp/zfuzz-default-options-file-test";
+    Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "# managed fzf defaults\n--exact # keep exact matching\n--filter='file value'\n" }) catch {};
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    const text = try readOptionsFile(a, std.testing.io, path);
+    defer a.free(text);
+    const args = try shellSplitArgs(a, text);
+    defer freeShellArgs(a, args);
+    var options: Options = .{};
+    defer options.deinit(a);
+    try parseOptionsInto(a, std.testing.io, &options, args, 0);
+    try std.testing.expect(options.exact);
+    try std.testing.expectEqualStrings("file value", options.filter.?);
 }
 
 test "multi modes match fzf zero and unlimited semantics" {
