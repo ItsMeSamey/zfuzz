@@ -4983,8 +4983,8 @@ fn keyNameIdentity(name: []const u8) ?KeyNameIdentity {
         else if (std.ascii.eqlIgnoreCase(name, "page-down") or std.ascii.eqlIgnoreCase(name, "pgdn")) 8
         else if (std.ascii.eqlIgnoreCase(name, "delete") or std.ascii.eqlIgnoreCase(name, "del")) 9
         else if (std.ascii.eqlIgnoreCase(name, "shift-tab") or std.ascii.eqlIgnoreCase(name, "btab")) 10
-        else if (std.ascii.eqlIgnoreCase(name, "enter") or std.ascii.eqlIgnoreCase(name, "return")) 11
-        else if (std.ascii.eqlIgnoreCase(name, "tab")) 12
+        else if (std.ascii.eqlIgnoreCase(name, "enter") or std.ascii.eqlIgnoreCase(name, "return") or std.ascii.eqlIgnoreCase(name, "ctrl-m")) 11
+        else if (std.ascii.eqlIgnoreCase(name, "tab") or std.ascii.eqlIgnoreCase(name, "ctrl-i")) 12
         else if (std.ascii.eqlIgnoreCase(name, "esc")) 13
         else if (std.ascii.eqlIgnoreCase(name, "backspace") or std.ascii.eqlIgnoreCase(name, "bspace") or std.ascii.eqlIgnoreCase(name, "bs")) 14
         else if (std.ascii.eqlIgnoreCase(name, "ctrl-space")) 15
@@ -8551,6 +8551,16 @@ test "repeated fzf bindings replace unless action list starts with plus" {
     try std.testing.expectEqual(@as(usize, 1), aliases.items.len);
     try std.testing.expectEqualStrings("enter", aliases.items[0].trigger);
     try std.testing.expect(aliases.items[0].action == .down);
+    try parseBindings(a, &aliases, "ctrl-m:accept");
+    try std.testing.expectEqual(@as(usize, 1), aliases.items.len);
+    try std.testing.expectEqualStrings("ctrl-m", aliases.items[0].trigger);
+    try std.testing.expect(aliases.items[0].action == .accept);
+
+    aliases.clearRetainingCapacity();
+    try parseBindings(a, &aliases, "tab:up,Ctrl-I:down");
+    try std.testing.expectEqual(@as(usize, 1), aliases.items.len);
+    try std.testing.expectEqualStrings("Ctrl-I", aliases.items[0].trigger);
+    try std.testing.expect(aliases.items[0].action == .down);
 }
 
 test "binding parser groups pending fzf keys" {
@@ -8746,6 +8756,10 @@ test "key names follow fzf case semantics" {
     try std.testing.expect(keyMatchesName(.{ .byte = 30 }, "ctrl-6"));
     try std.testing.expect(keyMatchesName(.{ .byte = 31 }, "ctrl-_"));
     try std.testing.expect(triggerNamesEquivalent("enter", "return"));
+    try std.testing.expect(triggerNamesEquivalent("enter", "ctrl-m"));
+    try std.testing.expect(triggerNamesEquivalent("tab", "Ctrl-I"));
+    try std.testing.expect(keyMatchesName(.{ .byte = 13 }, "ctrl-m"));
+    try std.testing.expect(keyMatchesName(.{ .byte = 9 }, "Ctrl-I"));
     try std.testing.expect(triggerNamesEquivalent("backspace", "bspace"));
     try std.testing.expect(triggerNamesEquivalent("delete", "del"));
     try std.testing.expect(triggerNamesEquivalent("space", " "));
@@ -9132,14 +9146,15 @@ test "expect preserves fzf comma key chords" {
 
 test "expect aliases keep the last fzf spelling per event" {
     const a = std.testing.allocator;
-    const args = [_][]const u8{ "zfuzz", "--expect=return,enter,bspace,backspace,del,delete,space" };
+    const args = [_][]const u8{ "zfuzz", "--expect=return,enter,ctrl-m,bspace,backspace,del,delete,space,tab,Ctrl-I" };
     var options = try parseOptions(a, &args);
     defer options.deinit(a);
-    try std.testing.expectEqual(@as(usize, 4), options.expect.items.len);
-    try std.testing.expectEqualStrings("enter", options.expect.items[0]);
+    try std.testing.expectEqual(@as(usize, 5), options.expect.items.len);
+    try std.testing.expectEqualStrings("ctrl-m", options.expect.items[0]);
     try std.testing.expectEqualStrings("backspace", options.expect.items[1]);
     try std.testing.expectEqualStrings("delete", options.expect.items[2]);
     try std.testing.expectEqualStrings("space", options.expect.items[3]);
+    try std.testing.expectEqualStrings("Ctrl-I", options.expect.items[4]);
 
     const repeated_args = [_][]const u8{ "zfuzz", "--expect=return", "--expect=ENTER" };
     var repeated = try parseOptions(a, &repeated_args);
