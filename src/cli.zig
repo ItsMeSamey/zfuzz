@@ -4005,6 +4005,11 @@ fn validateListenAddress(address: []const u8) !void {
     _ = std.fmt.parseInt(u16, port_text, 10) catch return error.InvalidListenAddress;
 }
 
+fn firstLine(value: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, value, '\n') orelse value.len;
+    return value[0..end];
+}
+
 fn parseOptions(allocator: Allocator, args: []const []const u8) !Options {
     var o: Options = .{};
     try parseOptionsInto(allocator, std.testing.io, &o, args, 1);
@@ -4606,23 +4611,23 @@ fn parseOptionsInto(allocator: Allocator, io: Io, o: *Options, args: []const []c
             continue;
         }
         if (std.mem.startsWith(u8, a, "--pointer=")) {
-            o.*.pointer = a[10..];
+            o.*.pointer = firstLine(a[10..]);
             continue;
         }
         if (std.mem.eql(u8, a, "--pointer")) {
             i += 1;
             if (i >= args.len) return error.MissingArgument;
-            o.*.pointer = args[i];
+            o.*.pointer = firstLine(args[i]);
             continue;
         }
         if (std.mem.startsWith(u8, a, "--marker=")) {
-            o.*.marker = a[9..];
+            o.*.marker = firstLine(a[9..]);
             continue;
         }
         if (std.mem.eql(u8, a, "--marker")) {
             i += 1;
             if (i >= args.len) return error.MissingArgument;
-            o.*.marker = args[i];
+            o.*.marker = firstLine(args[i]);
             continue;
         }
         if (std.mem.startsWith(u8, a, "--header=")) {
@@ -8163,6 +8168,22 @@ test "prompt pointer and marker accept separate arguments" {
     try std.testing.expectEqualStrings("pick> ", options.prompt);
     try std.testing.expectEqualStrings(">>", options.pointer);
     try std.testing.expectEqualStrings("**", options.marker);
+}
+
+test "pointer and marker use only the first fzf line" {
+    const a = std.testing.allocator;
+
+    const separate_args = [_][]const u8{ "zfuzz", "--pointer", "A\r\nignored", "--marker", "B\nignored" };
+    var separate = try parseOptions(a, &separate_args);
+    defer separate.deinit(a);
+    try std.testing.expectEqualStrings("A\r", separate.pointer);
+    try std.testing.expectEqualStrings("B", separate.marker);
+
+    const inline_args = [_][]const u8{ "zfuzz", "--pointer=X\nignored", "--marker=Y\r\nignored" };
+    var inline_options = try parseOptions(a, &inline_args);
+    defer inline_options.deinit(a);
+    try std.testing.expectEqualStrings("X", inline_options.pointer);
+    try std.testing.expectEqualStrings("Y\r", inline_options.marker);
 }
 
 test "preview and label reset options are last-one-wins" {
