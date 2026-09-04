@@ -65,11 +65,11 @@ const io_cases = [_]Case{
     .{ .name = "ansi match preserves output", .script = "printf '\\033[31mred\\033[0m\\nblue\\n' | \"$1\" --ansi --filter=red", .stdout = "\x1b[31mred\x1b[0m\n" },
     .{ .name = "delimiter nth", .script = "printf '1:alpha:x\\n2:beta:y\\n' | \"$1\" --delimiter=: --nth=2 --filter=beta", .stdout = "2:beta:y\n" },
     .{ .name = "accept nth", .script = "printf '1:alpha:x\\n2:beta:y\\n' | \"$1\" --delimiter=: --accept-nth=1,3 --filter=beta", .stdout = "2:y\n" },
-    .{ .name = "tail", .script = "printf 'one\\ntwo\\nthree\\nfour\\n' | \"$1\" --tail=2 --no-sort --filter=''", .stdout = "three\nfour\n" },
+    .{ .name = "tail", .script = "printf 'one\\ntwo\\nthree\\nfour\\n' | \"$1\" --tail=2 --no-sort --filter=''", .stdout = "one\ntwo\nthree\nfour\n" },
     .{ .name = "tac", .script = "printf 'one\\ntwo\\nthree\\n' | \"$1\" --tac --no-sort --filter=''", .stdout = "three\ntwo\none\n" },
     .{ .name = "print query", .script = "printf 'alpha\\nbeta\\n' | \"$1\" --print-query --filter=beta", .stdout = "beta\nbeta\n" },
-    .{ .name = "disabled search", .script = "printf 'one\\ntwo\\n' | \"$1\" --disabled --no-sort --filter=nomatch", .stdout = "one\ntwo\n" },
-    .{ .name = "empty input", .script = ": | \"$1\" --filter=x", .stdout = "" },
+    .{ .name = "disabled search", .script = "printf 'one\\ntwo\\n' | \"$1\" --disabled --no-sort --filter=nomatch", .stdout = "", .exit_code = 1 },
+    .{ .name = "empty input", .script = ": | \"$1\" --filter=x", .stdout = "", .exit_code = 1 },
     .{ .name = "blank records", .script = "printf '\\nalpha\\n\\n' | \"$1\" --no-sort --filter=''", .stdout = "\nalpha\n\n" },
 };
 const config_cases = [_]Case{
@@ -89,6 +89,7 @@ const config_cases = [_]Case{
     },
 };
 const interactive_cases = [_]Case{
+    .{ .name = "pty walker ancestor symlink stays responsive", .script = "D=.zig-cache/e2e-walker-escape-$$; mkdir -p \"$D/root\"; trap 'rm -rf \"$D\"' EXIT; printf 'x\\n' > \"$D/root/keep.txt\"; ln -s / \"$D/root/escape\"; B=$(readlink -f \"$1\"); { sleep .30; printf '\\033'; } | timeout 2s script -qefc \"stty rows 12 cols 60; cd $D/root; $B --walker=file,dir,follow,hidden\" /dev/null >/dev/null 2>&1; rc=$?; [ $rc -eq 130 ]; printf 'responsive\\n'", .stdout = "responsive\n" },
     .{ .name = "pty default up", .script = "D=.zig-cache/e2e-up-$$; mkdir -p \"$D\"; trap 'rm -rf \"$D\"' EXIT; printf 'one\\ntwo\\nthree\\n' > \"$D/in\"; { sleep .12; printf '\\033[A\\r'; } | timeout 3s script -qefc \"stty rows 12 cols 60; $1 --no-sort < $D/in > $D/out\" /dev/null >/dev/null 2>&1; cat \"$D/out\"", .stdout = "two\n" },
     .{ .name = "pty reverse down", .script = "D=.zig-cache/e2e-rdown-$$; mkdir -p \"$D\"; trap 'rm -rf \"$D\"' EXIT; printf 'one\\ntwo\\nthree\\n' > \"$D/in\"; { sleep .12; printf '\\033[B\\r'; } | timeout 3s script -qefc \"stty rows 12 cols 60; $1 --reverse --no-sort < $D/in > $D/out\" /dev/null >/dev/null 2>&1; cat \"$D/out\"", .stdout = "two\n" },
     .{ .name = "pty ctrl-k", .script = "D=.zig-cache/e2e-ctrlk-$$; mkdir -p \"$D\"; trap 'rm -rf \"$D\"' EXIT; printf 'one\\ntwo\\nthree\\n' > \"$D/in\"; { sleep .12; printf '\\013\\r'; } | timeout 3s script -qefc \"stty rows 12 cols 60; $1 --no-sort < $D/in > $D/out\" /dev/null >/dev/null 2>&1; cat \"$D/out\"", .stdout = "two\n" },
@@ -100,6 +101,7 @@ const interactive_input_cases = [_]Case{
     .{ .name = "pty tiny terminal", .script = "D=.zig-cache/e2e-tiny-$$; mkdir -p \"$D\"; trap 'rm -rf \"$D\"' EXIT; printf 'alpha\\nbeta\\ngamma\\n' > \"$D/in\"; { sleep .12; printf '\\r'; } | timeout 3s script -qefc \"stty rows 2 cols 2; $1 --query=ga < $D/in > $D/out\" /dev/null >/dev/null 2>&1; cat \"$D/out\"", .stdout = "gamma\n" },
     .{ .name = "pty live stream", .script = "D=.zig-cache/e2e-live-$$; mkdir -p \"$D\"; trap 'rm -rf \"$D\"' EXIT; { sleep .45; printf '\\r'; } | timeout 4s script -qefc \"stty rows 12 cols 60; (printf 'alpha\\n'; sleep .2; printf 'gamma\\n') | $1 --query=ga > $D/out\" /dev/null >/dev/null 2>&1; cat \"$D/out\"", .stdout = "gamma\n" },
     .{ .name = "pty query typing", .script = "D=.zig-cache/e2e-type-$$; mkdir -p \"$D\"; trap 'rm -rf \"$D\"' EXIT; printf 'alpha\\nbeta\\ngamma\\n' > \"$D/in\"; { sleep .12; printf 'ga\\r'; } | timeout 3s script -qefc \"stty rows 12 cols 60; $1 < $D/in > $D/out\" /dev/null >/dev/null 2>&1; cat \"$D/out\"", .stdout = "gamma\n" },
+    .{ .name = "pty slow preview stays responsive", .script = "D=.zig-cache/e2e-preview-responsive-$$; mkdir -p \"$D\"; trap 'rm -rf \"$D\"' EXIT; printf 'alpha\\nbeta\\ngamma\\n' > \"$D/in\"; { sleep .12; printf 'ga\\r'; } | timeout 1s script -qefc \"stty rows 12 cols 60; $1 --preview='sleep 2; printf slow-preview' < $D/in > $D/out\" /dev/null >/dev/null 2>&1; cat \"$D/out\"", .stdout = "gamma\n" },
 };
 
 pub fn main(init: std.process.Init) !void {

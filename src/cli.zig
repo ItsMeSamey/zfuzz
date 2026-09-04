@@ -254,8 +254,8 @@ const Options = struct {
     filter: ?[]const u8 = null,
     prompt: []const u8 = "> ",
     no_input: bool = false,
-    pointer: []const u8 = ">",
-    marker: []const u8 = ">",
+    pointer: []const u8 = "▌",
+    marker: []const u8 = "┃",
     header: ?[]const u8 = null,
     header_lines: usize = 0,
     header_first: bool = false,
@@ -299,8 +299,8 @@ const Options = struct {
     listen_unsafe: bool = false,
     mouse: bool = true,
     style_preset: StylePreset = .default,
-    border: bool = true,
-    border_style: BorderStyle = .rounded,
+    border: bool = false,
+    border_style: BorderStyle = .none,
     border_label: ?[]const u8 = null,
     border_label_pos: LabelPosition = .{},
     bold: bool = true,
@@ -310,7 +310,7 @@ const Options = struct {
     separator: ?[]const u8 = "─",
     ghost: ?[]const u8 = null,
     margin: Insets = .{},
-    padding: Insets = .{ .right = .{ .value = 1 }, .left = .{ .value = 1 } },
+    padding: Insets = .{},
     height_percent: u8 = 100,
     preview: PreviewOptions = .{},
     delimiter: ?[]const u8 = null,
@@ -411,6 +411,7 @@ const StreamInput = struct {
             return;
         }
         if (self.tail) |limit| {
+            if (limit == 0) return;
             while (self.records.items.len - self.head >= limit) {
                 self.allocator.free(self.records.items[self.head]);
                 self.head += 1;
@@ -760,7 +761,7 @@ const QueryHistory = struct {
     }
 };
 
-const BackgroundKind = enum { actions, query, search, nth, with_nth, prompt, ghost, pointer, border_label, preview_label, header, footer, preview, reload };
+const BackgroundKind = enum { actions, query, search, nth, with_nth, prompt, ghost, pointer, border_label, preview_label, header, footer, preview, preview_content, reload };
 
 const BackgroundResult = struct {
     kind: BackgroundKind,
@@ -983,7 +984,11 @@ fn backgroundTransformThread(ctx: *BackgroundContext) void {
         ctx.env.deinit();
         allocator.destroy(ctx);
     }
-    const max_stdout: usize = if (ctx.kind == .reload) 64 * 1024 * 1024 else 1024 * 1024;
+    const max_stdout: usize = switch (ctx.kind) {
+        .reload => 64 * 1024 * 1024,
+        .preview_content => 512 * 1024,
+        else => 1024 * 1024,
+    };
     const result = if (ctx.kind == .reload)
         std.process.run(allocator, ctx.io, .{
             .argv = &.{ "/bin/sh", "-c", ctx.expanded.text },
@@ -999,11 +1004,26 @@ fn backgroundTransformThread(ctx: *BackgroundContext) void {
             ctx.queue.finish(ctx.kind, null, ctx.generation, ctx.binding_slot, ctx.cancel_generation);
             return;
         };
-    allocator.free(result.stderr);
     if (ctx.kind == .reload) {
+        allocator.free(result.stderr);
         ctx.queue.finish(ctx.kind, result.stdout, ctx.generation, ctx.binding_slot, ctx.cancel_generation);
         return;
     }
+    if (ctx.kind == .preview_content) {
+        const output = allocator.alloc(u8, result.stdout.len + result.stderr.len) catch {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+            ctx.queue.finish(ctx.kind, null, ctx.generation, ctx.binding_slot, ctx.cancel_generation);
+            return;
+        };
+        @memcpy(output[0..result.stdout.len], result.stdout);
+        @memcpy(output[result.stdout.len..], result.stderr);
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+        ctx.queue.finish(ctx.kind, output, ctx.generation, ctx.binding_slot, ctx.cancel_generation);
+        return;
+    }
+    allocator.free(result.stderr);
     defer allocator.free(result.stdout);
     const trimmed = std.mem.trimEnd(u8, result.stdout, "\r\n");
     const text = switch (ctx.kind) {
@@ -1028,6 +1048,7 @@ const Ui = struct {
     server: ?*listen.Server,
     child_env: *const std.process.Environ.Map,
     bg_queue: *BackgroundQueue,
+    preview_queue: *BackgroundQueue,
     history: ?QueryHistory = null,
     track_once: bool = false,
     pending_track_key: ?[]u8 = null,
@@ -1053,6 +1074,7 @@ const Ui = struct {
     preview_forced: bool = false,
     preview_text: []u8 = &.{},
     preview_offset: usize = 0,
+    last_frame: []u8 = &.{},
     accepted_key: ?[]const u8 = null,
     change_event_pending: bool = false,
     load_event_pending: bool = false,
@@ -1084,6 +1106,7 @@ const Ui = struct {
     timer_last_ms: []u64 = &.{},
     last_activity_ms: u64 = 0,
     reload_generation: u64 = 0,
+    preview_generation: u64 = 0,
 
     fn init(
         allocator: Allocator,
@@ -1118,6 +1141,8 @@ const Ui = struct {
         @memset(timer_last_ms, now_ms);
         const bg_queue = try BackgroundQueue.create(allocator, io);
         errdefer bg_queue.close();
+        const preview_queue = try BackgroundQueue.create(allocator, io);
+        errdefer preview_queue.close();
         return .{
             .allocator = allocator,
             .io = io,
@@ -1129,6 +1154,7 @@ const Ui = struct {
             .server = server,
             .child_env = child_env,
             .bg_queue = bg_queue,
+            .preview_queue = preview_queue,
             .history = history,
             .nth_default = options.nth,
             .with_nth_default = options.with_nth,
@@ -1147,6 +1173,7 @@ const Ui = struct {
     }
 
     fn deinit(self: *Ui) void {
+        self.preview_queue.close();
         self.bg_queue.close();
         if (self.history) |*history| history.deinit();
         if (self.pending_track_key) |key| self.allocator.free(key);
@@ -1159,6 +1186,7 @@ const Ui = struct {
         self.allocator.free(self.match_flags);
         self.selection_order.deinit(self.allocator);
         if (self.preview_text.len != 0) self.allocator.free(self.preview_text);
+        if (self.last_frame.len != 0) self.allocator.free(self.last_frame);
         if (self.owned_prompt) |value| self.allocator.free(value);
         if (self.owned_search_override) |value| self.allocator.free(value);
         if (self.owned_nth) |value| self.allocator.free(value);
@@ -1241,6 +1269,7 @@ const Ui = struct {
             if (try self.fireTimers()) |code| return code;
             if (try self.processServerRequests()) |code| return code;
             if (try self.processBackgroundResults()) |code| return code;
+            self.processPreviewResults();
             try self.render();
             const key = try readKey(self.terminal);
             if (key != .unknown) self.last_activity_ms = monotonicMilliseconds(self.io);
@@ -1666,6 +1695,18 @@ const Ui = struct {
         return null;
     }
 
+    fn processPreviewResults(self: *Ui) void {
+        var results = self.preview_queue.takeAll();
+        defer results.deinit(self.allocator);
+        for (results.items) |result| {
+            defer self.allocator.free(result.output);
+            if (result.kind != .preview_content or result.generation != self.preview_generation) continue;
+            self.clearPreviewText();
+            if (result.output.len != 0) self.preview_text = self.allocator.dupe(u8, result.output) catch &.{};
+            self.preview_offset = 0;
+        }
+    }
+
     fn processBackgroundResults(self: *Ui) !?u8 {
         var results = self.bg_queue.takeAll();
         defer results.deinit(self.allocator);
@@ -1730,6 +1771,7 @@ const Ui = struct {
                     self.preview_offset = 0;
                     owned = null;
                 },
+                .preview_content => continue,
                 .reload => {
                     if (result.generation != self.reload_generation) continue;
                     var new_candidates = try candidatesFromOwnedBlob(self.allocator, result.output, self.options);
@@ -2351,23 +2393,23 @@ const Ui = struct {
         return env;
     }
 
-    fn launchBackgroundCommand(self: *Ui, kind: BackgroundKind, command: []const u8, generation: u64, binding_slot: ?usize) !void {
+    fn launchBackgroundCommandOn(self: *Ui, queue: *BackgroundQueue, kind: BackgroundKind, command: []const u8, generation: u64, binding_slot: ?usize) !void {
         var expanded = try self.expandedCommand(command);
         errdefer expanded.deinit();
         var env = try self.commandEnvironment();
         errdefer env.deinit();
-        const cancel_generation = self.bg_queue.begin() orelse {
+        const cancel_generation = queue.begin() orelse {
             expanded.deinit();
             env.deinit();
             return;
         };
         const ctx = self.allocator.create(BackgroundContext) catch |err| {
-            self.bg_queue.finish(kind, null, generation, binding_slot, cancel_generation);
+            queue.finish(kind, null, generation, binding_slot, cancel_generation);
             return err;
         };
         errdefer self.allocator.destroy(ctx);
         ctx.* = .{
-            .queue = self.bg_queue,
+            .queue = queue,
             .allocator = self.allocator,
             .io = self.io,
             .kind = kind,
@@ -2378,10 +2420,14 @@ const Ui = struct {
             .env = env,
         };
         const thread = std.Thread.spawn(.{}, backgroundTransformThread, .{ctx}) catch |err| {
-            self.bg_queue.finish(kind, null, generation, binding_slot, cancel_generation);
+            queue.finish(kind, null, generation, binding_slot, cancel_generation);
             return err;
         };
         thread.detach();
+    }
+
+    fn launchBackgroundCommand(self: *Ui, kind: BackgroundKind, command: []const u8, generation: u64, binding_slot: ?usize) !void {
+        try self.launchBackgroundCommandOn(self.bg_queue, kind, command, generation, binding_slot);
     }
 
     fn launchBackgroundTransform(self: *Ui, kind: BackgroundKind, command: []const u8) !void {
@@ -3272,6 +3318,10 @@ const Ui = struct {
         var frame: Io.Writer.Allocating = .init(self.allocator);
         defer frame.deinit();
         const w = &frame.writer;
+        // Synchronized output keeps a multi-row redraw from becoming visible
+        // half-written on terminals that implement DEC mode 2026. Unsupported
+        // terminals simply ignore the private mode.
+        try w.writeAll("\x1b[?2026h");
         if (self.terminal.inline_mode) {
             var clear_row: usize = 1;
             while (clear_row <= size.rows) : (clear_row += 1) {
@@ -3320,7 +3370,13 @@ const Ui = struct {
             try self.renderPreviewOverlay(&frame, size, geom, preview);
         }
 
-        try self.terminal.write(frame.written());
+        try w.writeAll("\x1b[?2026l");
+        const rendered = frame.written();
+        if (std.mem.eql(u8, rendered, self.last_frame)) return;
+        const cached = try self.allocator.dupe(u8, rendered);
+        if (self.last_frame.len != 0) self.allocator.free(self.last_frame);
+        self.last_frame = cached;
+        try self.terminal.write(rendered);
     }
 
     fn statusText(self: *Ui) ![]u8 {
@@ -3343,11 +3399,14 @@ const Ui = struct {
             try writeTruncated(w, status, cols, false, "");
         } else {
             try cursorTo(w, row, col, self.terminal.inline_mode);
-            try writeTruncated(w, status, cols, false, "");
+            const lead: usize = @min(@as(usize, 2), cols);
+            if (lead != 0) try w.writeAll("  "[0..lead]);
+            const available = cols - lead;
+            try writeTruncated(w, status, available, false, "");
             if (self.options.separator) |sep| {
-                if (sep.len != 0 and cols > status.len + 1) {
+                if (sep.len != 0 and available > status.len + 1) {
                     try w.writeAll(" ");
-                    var used = status.len + 1;
+                    var used = lead + status.len + 1;
                     while (used < cols) : (used += 1) try w.writeAll(sep);
                 }
             }
@@ -3416,20 +3475,21 @@ const Ui = struct {
             const dimmed = self.options.raw and !self.match_flags[idx];
             try writeRoleStyle(w, if (focused) self.options.theme.current else self.options.theme.normal, self.options.theme.enabled, self.options.bold);
             if (dimmed and self.options.theme.enabled) try w.writeAll("\x1b[2m");
-            if (focused) {
-                try writeRoleStyleOverlay(w, self.options.theme.pointer, self.options.theme.enabled, self.options.bold);
-                try w.writeAll(self.options.pointer);
-                try writeRoleStyle(w, self.options.theme.current, self.options.theme.enabled, self.options.bold);
-            } else try w.writeAll(" ");
+            if (focused) try writeRoleStyleOverlay(w, self.options.theme.pointer, self.options.theme.enabled, self.options.bold);
+            try w.writeAll(self.options.pointer);
+            try writeRoleStyle(w, if (focused) self.options.theme.current else self.options.theme.normal, self.options.theme.enabled, self.options.bold);
             try w.writeAll(" ");
-            if (marked) {
-                try writeRoleStyleOverlay(w, self.options.theme.marker, self.options.theme.enabled, self.options.bold);
-                try w.writeAll(self.options.marker);
-                try writeRoleStyle(w, if (focused) self.options.theme.current else self.options.theme.normal, self.options.theme.enabled, self.options.bold);
-            } else try w.writeAll(" ");
-            try w.writeAll(" ");
+            if (self.options.multi) {
+                if (marked) {
+                    try writeRoleStyleOverlay(w, self.options.theme.marker, self.options.theme.enabled, self.options.bold);
+                    try w.writeAll(self.options.marker);
+                    try writeRoleStyle(w, if (focused) self.options.theme.current else self.options.theme.normal, self.options.theme.enabled, self.options.bold);
+                } else try w.writeAll(" ");
+                try w.writeAll(" ");
+            }
             if (dimmed and self.options.theme.enabled) try w.writeAll("\x1b[2m");
-            try writeHighlighted(w, self.candidates.display[idx], if (dimmed) "" else self.query.items, if (content.cols > 4) content.cols - 4 else content.cols, self.options.wrap, self.options.ansi, &self.options.theme, focused, self.options.bold);
+            const prefix_cols: usize = if (self.options.multi) 4 else 2;
+            try writeHighlighted(w, self.candidates.display[idx], if (dimmed) "" else self.query.items, content.cols -| prefix_cols, self.options.wrap, self.options.ansi, &self.options.theme, focused, self.options.bold);
             try writeReset(w);
         }
         return start_row + rows;
@@ -3453,38 +3513,27 @@ const Ui = struct {
             (flags.plus and self.selected_count != 0) or self.result_len != 0;
     }
 
-    fn runPreviewTemplate(self: *Ui, command: []const u8) !void {
+    fn schedulePreviewTemplate(self: *Ui, command: []const u8) !void {
         if (!self.previewTemplateRunnable(command)) {
+            self.preview_queue.cancel();
+            self.preview_generation +%= 1;
             self.clearPreviewText();
             self.cachePreviewForCurrent();
             return;
         }
-        var expanded = try self.expandedCommand(command);
-        defer expanded.deinit();
-        var env = try self.commandEnvironment();
-        defer env.deinit();
-        const result = std.process.run(self.allocator, self.io, .{
-            .argv = &.{ "/bin/sh", "-c", expanded.text },
-            .environ_map = &env,
-            .stdout_limit = .limited(512 * 1024),
-            .stderr_limit = .limited(128 * 1024),
-        }) catch return;
-        defer self.allocator.free(result.stdout);
-        defer self.allocator.free(result.stderr);
+        self.preview_queue.cancel();
+        self.preview_generation +%= 1;
         self.clearPreviewText();
-        const output_len = result.stdout.len + result.stderr.len;
-        if (output_len != 0) {
-            self.preview_text = try self.allocator.alloc(u8, output_len);
-            @memcpy(self.preview_text[0..result.stdout.len], result.stdout);
-            @memcpy(self.preview_text[result.stdout.len..], result.stderr);
-        }
+        // Cache the request at launch time so idle render ticks do not spawn
+        // duplicate previews while the process is still running.
         self.cachePreviewForCurrent();
+        try self.launchBackgroundCommandOn(self.preview_queue, .preview_content, command, self.preview_generation, null);
     }
 
     fn runPreviewAction(self: *Ui, command: []const u8) !void {
         self.preview_forced = true;
         self.options.preview.hidden = false;
-        if (command.len != 0) try self.runPreviewTemplate(command);
+        if (command.len != 0) try self.schedulePreviewTemplate(command);
     }
 
     fn ensurePreview(self: *Ui) !void {
@@ -3493,7 +3542,7 @@ const Ui = struct {
         const idx = self.results[self.focus];
         const qhash = std.hash.Wyhash.hash(0, self.query.items);
         if (self.preview_cache_key == idx and self.preview_cache_query_hash == qhash) return;
-        try self.runPreviewTemplate(cmd_template);
+        try self.schedulePreviewTemplate(cmd_template);
     }
 
     fn renderPreviewOverlay(self: *Ui, frame: *Io.Writer.Allocating, size: anytype, geom: PaneGeometry, preview: Pane) !void {
@@ -3854,8 +3903,8 @@ fn applyStylePreset(options: *Options, text: []const u8) !void {
     const preset = parts.next() orelse return error.InvalidStylePreset;
     if (std.ascii.eqlIgnoreCase(preset, "default")) {
         options.style_preset = .default;
-        options.border = true;
-        options.border_style = .rounded;
+        options.border = false;
+        options.border_style = .none;
         options.preview.border_style = .rounded;
     } else if (std.ascii.eqlIgnoreCase(preset, "minimal")) {
         options.style_preset = .minimal;
@@ -5497,19 +5546,70 @@ fn parseWalkerOptions(spec: []const u8) !WalkerOptions {
     return out;
 }
 
-fn walkerDirSkipped(options: *const Options, basename: []const u8) bool {
+fn walkerTrimRoot(root: []const u8) []const u8 {
+    var out = root;
+    while (out.len > 1 and out[0] == '.' and std.fs.path.isSep(out[1])) out = out[2..];
+    if (out.len == 0) return ".";
+    return out;
+}
+
+fn walkerSkipHasSeparator(skip: []const u8) bool {
+    for (skip) |byte| if (std.fs.path.isSep(byte)) return true;
+    return false;
+}
+
+fn walkerLogicalPath(root: []const u8, relative: []const u8, buffer: []u8) ?[]const u8 {
+    const label = walkerTrimRoot(root);
+    var at: usize = 0;
+    if (!std.mem.eql(u8, label, ".")) {
+        if (label.len > buffer.len) return null;
+        @memcpy(buffer[0..label.len], label);
+        at = label.len;
+        if (at != 0 and !std.fs.path.isSep(buffer[at - 1])) {
+            if (at == buffer.len) return null;
+            buffer[at] = std.fs.path.sep;
+            at += 1;
+        }
+    }
+    if (relative.len > buffer.len - at) return null;
+    @memcpy(buffer[at .. at + relative.len], relative);
+    return buffer[0 .. at + relative.len];
+}
+
+fn walkerPathSuffixMatch(path: []const u8, suffix: []const u8) bool {
+    if (std.mem.eql(u8, path, suffix)) return true;
+    if (path.len <= suffix.len or !std.mem.endsWith(u8, path, suffix)) return false;
+    return std.fs.path.isSep(path[path.len - suffix.len - 1]);
+}
+
+fn walkerDirSkipped(options: *const Options, root_label: []const u8, relative: []const u8, basename: []const u8) bool {
     if (!options.walker.hidden and basename.len != 0 and basename[0] == '.') return true;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const logical_path = walkerLogicalPath(root_label, relative, &path_buf) orelse return false;
     var it = std.mem.splitScalar(u8, options.walker_skip, ',');
-    while (it.next()) |name| {
-        if (name.len != 0 and std.mem.eql(u8, basename, name)) return true;
+    while (it.next()) |skip| {
+        if (skip.len == 0) continue;
+        if (!walkerSkipHasSeparator(skip)) {
+            if (std.mem.eql(u8, basename, skip)) return true;
+            continue;
+        }
+        if (std.fs.path.isSep(skip[0])) {
+            if (std.mem.endsWith(u8, logical_path, skip)) return true;
+        } else if (walkerPathSuffixMatch(logical_path, skip)) {
+            return true;
+        }
     }
     return false;
 }
 
-fn walkerAppendPath(out: *std.ArrayList(u8), allocator: Allocator, root: []const u8, relative: []const u8, delim: u8) !void {
-    try out.appendSlice(allocator, root);
-    if (root.len != 0 and !std.fs.path.isSep(root[root.len - 1])) try out.append(allocator, std.fs.path.sep);
+fn walkerAppendPath(out: *std.ArrayList(u8), allocator: Allocator, root: []const u8, relative: []const u8, is_dir: bool, delim: u8) !void {
+    const label = walkerTrimRoot(root);
+    if (!std.mem.eql(u8, label, ".")) {
+        try out.appendSlice(allocator, label);
+        if (label.len != 0 and !std.fs.path.isSep(label[label.len - 1])) try out.append(allocator, std.fs.path.sep);
+    }
     try out.appendSlice(allocator, relative);
+    if (is_dir and (out.items.len == 0 or !std.fs.path.isSep(out.items[out.items.len - 1]))) try out.append(allocator, std.fs.path.sep);
     try out.append(allocator, delim);
 }
 
@@ -5518,11 +5618,32 @@ fn walkerAncestorContains(ancestors: []const Io.File.INode, inode: Io.File.INode
     return false;
 }
 
+fn walkerPathEqual(a: []const u8, b: []const u8) bool {
+    return if (comptime builtin.os.tag == .windows) std.ascii.eqlIgnoreCase(a, b) else std.mem.eql(u8, a, b);
+}
+
+fn walkerPathHasPrefix(path: []const u8, prefix: []const u8) bool {
+    if (path.len < prefix.len) return false;
+    return if (comptime builtin.os.tag == .windows)
+        std.ascii.eqlIgnoreCase(path[0..prefix.len], prefix)
+    else
+        std.mem.eql(u8, path[0..prefix.len], prefix);
+}
+
+fn walkerSymlinkTargetIsRootAncestor(root_real: []const u8, target_real: []const u8) bool {
+    if (walkerPathEqual(root_real, target_real)) return true;
+    if (target_real.len == 0 or target_real.len >= root_real.len) return false;
+    if (!walkerPathHasPrefix(root_real, target_real)) return false;
+    if (std.fs.path.isSep(target_real[target_real.len - 1])) return true;
+    return std.fs.path.isSep(root_real[target_real.len]);
+}
+
 fn walkNativeDir(
     allocator: Allocator,
     io: Io,
     options: *const Options,
     root_label: []const u8,
+    root_real: []const u8,
     dir: Io.Dir,
     relative: *std.ArrayList(u8),
     ancestors: *std.ArrayList(Io.File.INode),
@@ -5535,15 +5656,30 @@ fn walkNativeDir(
         if (old_len != 0) try relative.append(allocator, std.fs.path.sep);
         try relative.appendSlice(allocator, entry.name);
 
+        const is_symlink = entry.kind == .sym_link;
         var kind = entry.kind;
-        if (kind == .unknown or (kind == .sym_link and options.walker.follow)) {
-            const stat = dir.statFile(io, entry.name, .{ .follow_symlinks = options.walker.follow }) catch continue;
+        var is_dir_symlink = false;
+        if (is_symlink) {
+            const followed = dir.statFile(io, entry.name, .{ .follow_symlinks = true }) catch null;
+            is_dir_symlink = if (followed) |stat| stat.kind == .directory else false;
+            if (is_dir_symlink) {
+                if (!options.walker.follow) continue;
+                var target_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const target_len = dir.realPathFile(io, entry.name, &target_buf) catch continue;
+                if (walkerSymlinkTargetIsRootAncestor(root_real, target_buf[0..target_len])) continue;
+                kind = .directory;
+            } else {
+                // fzf treats non-directory symlinks, including dangling links, as file entries.
+                kind = .file;
+            }
+        } else if (kind == .unknown) {
+            const stat = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch continue;
             kind = stat.kind;
         }
 
         if (kind == .directory) {
-            if (walkerDirSkipped(options, entry.name)) continue;
-            if (options.walker.dir) try walkerAppendPath(out, allocator, root_label, relative.items, if (options.read0) 0 else '\n');
+            if (walkerDirSkipped(options, root_label, relative.items, entry.name)) continue;
+            if (options.walker.dir) try walkerAppendPath(out, allocator, root_label, relative.items, true, if (options.read0) 0 else '\n');
 
             var child = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
             defer child.close(io);
@@ -5551,9 +5687,9 @@ fn walkNativeDir(
             if (walkerAncestorContains(ancestors.items, child_stat.inode)) continue;
             try ancestors.append(allocator, child_stat.inode);
             defer _ = ancestors.pop();
-            try walkNativeDir(allocator, io, options, root_label, child, relative, ancestors, out);
+            try walkNativeDir(allocator, io, options, root_label, root_real, child, relative, ancestors, out);
         } else if (kind == .file and options.walker.file) {
-            try walkerAppendPath(out, allocator, root_label, relative.items, if (options.read0) 0 else '\n');
+            try walkerAppendPath(out, allocator, root_label, relative.items, false, if (options.read0) 0 else '\n');
         }
     }
 }
@@ -5563,31 +5699,12 @@ fn appendNativeWalkerRoot(allocator: Allocator, io: Io, options: *const Options,
     defer relative.deinit(allocator);
     var ancestors: std.ArrayList(Io.File.INode) = .empty;
     defer ancestors.deinit(allocator);
+    var root_real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_real_len = try root.realPath(io, &root_real_buf);
+    const root_real = root_real_buf[0..root_real_len];
     const root_stat = try root.stat(io);
     try ancestors.append(allocator, root_stat.inode);
-    try walkNativeDir(allocator, io, options, root_label, root, &relative, &ancestors, out);
-}
-
-fn appendWalkerSkipExpr(allocator: Allocator, argv: *std.ArrayList([]const u8), options: *const Options) !void {
-    var names: std.ArrayList([]const u8) = .empty;
-    defer names.deinit(allocator);
-    var it = std.mem.splitScalar(u8, options.walker_skip, ',');
-    while (it.next()) |name| if (name.len != 0) try names.append(allocator, name);
-    const skip_hidden = !options.walker.hidden;
-    if (names.items.len == 0 and !skip_hidden) return;
-
-    try argv.appendSlice(allocator, &.{ "(", "-type", "d", "(" });
-    var first = true;
-    for (names.items) |name| {
-        if (!first) try argv.append(allocator, "-o");
-        try argv.appendSlice(allocator, &.{ "-name", name });
-        first = false;
-    }
-    if (skip_hidden) {
-        if (!first) try argv.append(allocator, "-o");
-        try argv.appendSlice(allocator, &.{ "-name", ".*" });
-    }
-    try argv.appendSlice(allocator, &.{ ")", ")", "-prune", "-o" });
+    try walkNativeDir(allocator, io, options, root_label, root_real, root, &relative, &ancestors, out);
 }
 
 const ProcessStdout = struct {
@@ -5611,48 +5728,27 @@ fn runProcessStdout(allocator: Allocator, io: Io, argv: []const []const u8) !Pro
     return .{ .term = try child.wait(io), .stdout = stdout };
 }
 
-fn runFindWalker(allocator: Allocator, io: Io, options: *const Options) ![]u8 {
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-    try argv.append(allocator, "/usr/bin/find");
-    if (options.walker.follow) try argv.append(allocator, "-L");
-    if (options.walker_roots.items.len == 0) try argv.append(allocator, ".") else try argv.appendSlice(allocator, options.walker_roots.items);
-    try argv.appendSlice(allocator, &.{ "-mindepth", "1" });
-    try appendWalkerSkipExpr(allocator, &argv, options);
-    if (options.walker.file and options.walker.dir) {
-        try argv.appendSlice(allocator, &.{ "(", "-type", "f", "-o", "-type", "d", ")" });
-    } else if (options.walker.file) {
-        try argv.appendSlice(allocator, &.{ "-type", "f" });
-    } else if (options.walker.dir) {
-        try argv.appendSlice(allocator, &.{ "-type", "d" });
-    } else return try allocator.alloc(u8, 0);
-    try argv.append(allocator, if (options.read0) "-print0" else "-print");
-
-    const result = try runProcessStdout(allocator, io, argv.items);
-    switch (result.term) {
-        .exited => |code| if (code == 0) return result.stdout,
-        else => {},
+fn runWalkerRoot(allocator: Allocator, io: Io, options: *const Options, root_path: []const u8, explicit: bool, out: *std.ArrayList(u8)) !void {
+    const label = walkerTrimRoot(root_path);
+    if (explicit and !std.mem.eql(u8, label, ".")) {
+        const basename = std.fs.path.basename(label);
+        if (walkerDirSkipped(options, ".", label, basename)) return;
+        if (options.walker.dir) try walkerAppendPath(out, allocator, ".", label, true, if (options.read0) 0 else '\n');
     }
-    allocator.free(result.stdout);
-    return error.WalkerFailed;
+    var root = try Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
+    defer root.close(io);
+    try appendNativeWalkerRoot(allocator, io, options, root_path, root, out);
 }
 
 fn runWalker(allocator: Allocator, io: Io, options: *const Options) ![]u8 {
-    if (comptime builtin.os.tag != .windows and builtin.os.tag != .macos) return runFindWalker(allocator, io, options);
     if (!options.walker.file and !options.walker.dir) return try allocator.alloc(u8, 0);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
     if (options.walker_roots.items.len == 0) {
-        var root = try Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
-        defer root.close(io);
-        try appendNativeWalkerRoot(allocator, io, options, ".", root, &out);
+        try runWalkerRoot(allocator, io, options, ".", false, &out);
     } else {
-        for (options.walker_roots.items) |root_path| {
-            var root = try Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
-            defer root.close(io);
-            try appendNativeWalkerRoot(allocator, io, options, root_path, root, &out);
-        }
+        for (options.walker_roots.items) |root_path| try runWalkerRoot(allocator, io, options, root_path, true, &out);
     }
     return try out.toOwnedSlice(allocator);
 }
@@ -5665,6 +5761,10 @@ fn runDefaultCommand(allocator: Allocator, io: Io, command: []const u8, windows_
     return result.stdout;
 }
 
+fn filterUsesStreamingPath(options: *const Options) bool {
+    return options.filter != null and options.no_sort and !options.tac and !options.sync;
+}
+
 fn readCandidates(allocator: Allocator, io: Io, options: *const Options, default_command: ?[]const u8, windows_shell: ?[]const u8) !CandidateSet {
     if (Io.File.stdin().isTty(io) catch false) {
         const blob = if (default_command) |command| blk: {
@@ -5673,9 +5773,13 @@ fn readCandidates(allocator: Allocator, io: Io, options: *const Options, default
         } else try runWalker(allocator, io, options);
         return candidatesFromOwnedBlob(allocator, blob, options);
     }
-    if (options.tail) |tail| {
-        const blob = try readTailBlobStdin(allocator, io, tail, options.header_lines, if (options.read0) 0 else '\n');
-        return candidatesFromOwnedBlob(allocator, blob, options);
+    if (!filterUsesStreamingPath(options)) {
+        if (options.tail) |tail| {
+            const empty_filter_trim = if (options.filter) |filter| filter.len == 0 else false;
+            const body_tail = if (empty_filter_trim) tail -| options.header_lines else tail;
+            const blob = try readTailBlobStdin(allocator, io, body_tail, options.header_lines, if (options.read0) 0 else '\n');
+            return candidatesFromOwnedBlob(allocator, blob, options);
+        }
     }
     var buffer: [64 * 1024]u8 = undefined;
     var reader = Io.File.stdin().readerStreaming(io, &buffer);
@@ -5689,6 +5793,10 @@ const TailRing = struct {
     total: usize = 0,
 
     fn push(self: *TailRing, record: []const u8) !void {
+        if (self.slots.len == 0) {
+            self.total += 1;
+            return;
+        }
         const owned = try self.allocator.dupe(u8, record);
         const slot = self.total % self.slots.len;
         if (self.slots[slot]) |old| self.allocator.free(old);
@@ -5702,8 +5810,8 @@ const TailRing = struct {
     }
 };
 
-fn readTailBlobStdin(allocator: Allocator, io: Io, tail: usize, header_lines: usize, delim: u8) ![]u8 {
-    const slots = try allocator.alloc(?[]u8, tail);
+fn readTailBlobStdin(allocator: Allocator, io: Io, body_tail: usize, header_lines: usize, delim: u8) ![]u8 {
+    const slots = try allocator.alloc(?[]u8, body_tail);
     @memset(slots, null);
     var ring = TailRing{ .allocator = allocator, .slots = slots };
     defer ring.deinit();
@@ -5747,11 +5855,11 @@ fn readTailBlobStdin(allocator: Allocator, io: Io, tail: usize, header_lines: us
         }
     }
 
-    const kept = @min(ring.total, tail);
-    const first = if (ring.total > tail) ring.total % tail else 0;
+    const kept = @min(ring.total, body_tail);
+    const first = if (body_tail != 0 and ring.total > body_tail) ring.total % body_tail else 0;
     var bytes: usize = headers.items.len + kept;
     for (headers.items) |line| bytes += line.len;
-    for (0..kept) |i| bytes += ring.slots[(first + i) % tail].?.len;
+    for (0..kept) |i| bytes += ring.slots[(first + i) % body_tail].?.len;
     if (bytes == 0) return try allocator.alloc(u8, 0);
     const blob = try allocator.alloc(u8, bytes);
     var at: usize = 0;
@@ -5762,7 +5870,7 @@ fn readTailBlobStdin(allocator: Allocator, io: Io, tail: usize, header_lines: us
         at += 1;
     }
     for (0..kept) |i| {
-        const record = ring.slots[(first + i) % tail].?;
+        const record = ring.slots[(first + i) % body_tail].?;
         @memcpy(blob[at .. at + record.len], record);
         at += record.len;
         blob[at] = delim;
@@ -5789,7 +5897,12 @@ fn candidatesFromOwnedBlob(allocator: Allocator, blob: []u8, options: *const Opt
     }
     const header_count = @min(total_count, options.header_lines);
     const body_count = total_count - header_count;
-    const keep_count = if (options.tail) |tail| @min(body_count, tail) else body_count;
+    const apply_tail = !filterUsesStreamingPath(options);
+    const keep_count = if (apply_tail) (if (options.tail) |tail| blk: {
+        const empty_filter_trim = if (options.filter) |filter| filter.len == 0 else false;
+        const body_tail = if (empty_filter_trim) tail -| header_count else tail;
+        break :blk @min(body_count, body_tail);
+    } else body_count) else body_count;
     const skip_body = body_count - keep_count;
     const header = try allocator.alloc([]const u8, header_count);
     errdefer allocator.free(header);
@@ -5826,12 +5939,14 @@ fn candidatesFromOwnedBlob(allocator: Allocator, blob: []u8, options: *const Opt
         var built: usize = 0;
         errdefer for (display[0..built]) |line| allocator.free(line);
         for (output, 0..) |line, idx| {
-            display[idx] = try transformFields(allocator, line, options.delimiter, spec, idx);
+            display[idx] = try transformWithNth(allocator, line, options.delimiter, spec, idx);
             built += 1;
         }
         owned_display = true;
     }
 
+    // fzf applies --with-nth first. --nth then retokenizes that transformed
+    // presentation, including delimiters retained by numeric --with-nth.
     const base_search = if (options.with_nth != null) display else output;
     if (options.nth == null and !options.ansi) {
         return .{ .blob = blob, .header = header, .output = output, .display = display, .search = base_search, .owned_display = owned_display, .owned_search = false, .has_non_ascii = anyNonAscii(base_search) };
@@ -5844,7 +5959,7 @@ fn candidatesFromOwnedBlob(allocator: Allocator, blob: []u8, options: *const Opt
     for (base_search, 0..) |line, idx| {
         var transformed: ?[]u8 = null;
         const scoped: []const u8 = if (options.nth) |spec| blk: {
-            const tmp = try transformFields(allocator, line, options.delimiter, spec, idx);
+            const tmp = try transformNthSearch(allocator, line, options.delimiter, spec, idx);
             transformed = tmp;
             break :blk tmp;
         } else line;
@@ -6585,12 +6700,20 @@ fn isWordByte(c: u8) bool {
 }
 
 fn filterMode(allocator: Allocator, io: Io, index: *fuzzy.Index, candidates: *const CandidateSet, options: *const Options, query: []const u8) !void {
+    // fzf's --filter path always performs matching even when --disabled/--phony
+    // is present. With --no-sort it streams directly only when neither --sync
+    // nor --tac forces a snapshot; snapshot filtering still ranks a non-empty
+    // query (the matcher sorts within its chunk even with global sorting off).
+    var filter_options = options.*;
+    filter_options.disabled = false;
+    if (options.no_sort and !filterUsesStreamingPath(options) and query.len != 0) filter_options.no_sort = false;
+
     const out = try allocator.alloc(usize, candidates.display.len);
     defer allocator.free(out);
     const ranks = try allocator.alloc(ExtendedRank, candidates.display.len);
     defer allocator.free(ranks);
-    const found = try searchCandidates(index, candidates, options, query, out, ranks, out.len);
-    if (options.no_sort) std.mem.sort(usize, found, {}, comptime std.sort.asc(usize));
+    const found = try searchCandidates(index, candidates, &filter_options, query, out, ranks, out.len);
+    if (filter_options.no_sort) std.mem.sort(usize, found, {}, comptime std.sort.asc(usize));
     var stdout_buffer: [8192]u8 = undefined;
     var writer = Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const sep: []const u8 = if (options.print0) "\x00" else "\n";
@@ -6609,7 +6732,7 @@ fn filterMode(allocator: Allocator, io: Io, index: *fuzzy.Index, candidates: *co
         try writer.interface.writeAll(sep);
     }
     try writer.flush();
-    if (options.exit_0 and found.len == 0) std.process.exit(1);
+    if (found.len == 0) std.process.exit(1);
 }
 
 fn canonicalNthSpec(allocator: Allocator, spec: []const u8) ![]u8 {
@@ -6645,6 +6768,141 @@ fn canonicalNthSpec(allocator: Allocator, spec: []const u8) ![]u8 {
     return try out.toOwnedSlice(allocator);
 }
 
+fn nthSpecNumeric(spec: []const u8) bool {
+    if (spec.len == 0) return false;
+    for (spec) |c| switch (c) {
+        '0'...'9', '-', '.', ',' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn splitNthTokens(allocator: Allocator, out: *std.ArrayList([]const u8), line: []const u8, delimiter: ?[]const u8) !void {
+    if (delimiter) |d| {
+        if (d.len == 0) {
+            try out.append(allocator, line);
+            return;
+        }
+        var start: usize = 0;
+        while (start < line.len) {
+            if (std.mem.indexOfPos(u8, line, start, d)) |pos| {
+                try out.append(allocator, line[start .. pos + d.len]);
+                start = pos + d.len;
+                if (start == line.len) try out.append(allocator, line[start..start]);
+            } else {
+                try out.append(allocator, line[start..]);
+                start = line.len;
+            }
+        }
+        if (line.len == 0) try out.append(allocator, line);
+        return;
+    }
+
+    // fzf's AWK-style tokenizer keeps trailing whitespace on each token and
+    // ignores leading whitespace before the first token.
+    var state: enum { none, black, white } = .none;
+    var begin: usize = 0;
+    var end: usize = 0;
+    for (line, 0..) |c, idx| {
+        const white = c == ' ' or c == '\t' or c == '\n';
+        switch (state) {
+            .none => if (!white) {
+                state = .black;
+                begin = idx;
+                end = idx + 1;
+            },
+            .black => {
+                end = idx + 1;
+                if (white) state = .white;
+            },
+            .white => if (white) {
+                end = idx + 1;
+            } else {
+                try out.append(allocator, line[begin..end]);
+                state = .black;
+                begin = idx;
+                end = idx + 1;
+            },
+        }
+    }
+    if (begin < end) try out.append(allocator, line[begin..end]);
+}
+
+fn appendNthRange(allocator: Allocator, out: *std.ArrayList(u8), tokens: []const []const u8, range: PlaceholderRange) !void {
+    const n: isize = @intCast(tokens.len);
+    if (range.begin == range.end) {
+        if (range.begin == 0) {
+            for (tokens) |token| try out.appendSlice(allocator, token);
+            return;
+        }
+        var idx = range.begin;
+        if (idx < 0) idx += n + 1;
+        if (idx >= 1 and idx <= n) try out.appendSlice(allocator, tokens[@intCast(idx - 1)]);
+        return;
+    }
+
+    var begin: isize = undefined;
+    var end: isize = undefined;
+    if (range.begin == 0) {
+        begin = 1;
+        end = range.end;
+        if (end < 0) end += n + 1;
+    } else if (range.end == 0) {
+        begin = range.begin;
+        end = n;
+        if (begin < 0) begin += n + 1;
+    } else {
+        begin = range.begin;
+        end = range.end;
+        if (begin < 0) begin += n + 1;
+        if (end < 0) end += n + 1;
+    }
+    var idx = begin;
+    while (idx <= end) : (idx += 1) {
+        if (idx >= 1 and idx <= n) try out.appendSlice(allocator, tokens[@intCast(idx - 1)]);
+    }
+}
+
+fn stripNthLastDelimiter(bytes: []u8, delimiter: ?[]const u8) []u8 {
+    if (delimiter) |d| {
+        if (d.len != 0 and std.mem.endsWith(u8, bytes, d)) return bytes[0 .. bytes.len - d.len];
+        return bytes;
+    }
+    var end = bytes.len;
+    while (end != 0 and std.ascii.isWhitespace(bytes[end - 1])) end -= 1;
+    return bytes[0..end];
+}
+
+fn transformNthNumeric(allocator: Allocator, line: []const u8, delimiter: ?[]const u8, spec: []const u8, strip_last: bool) ![]u8 {
+    var tokens: std.ArrayList([]const u8) = .empty;
+    defer tokens.deinit(allocator);
+    try splitNthTokens(allocator, &tokens, line, delimiter);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var terms = std.mem.splitScalar(u8, spec, ',');
+    while (terms.next()) |term_raw| {
+        const term = std.mem.trim(u8, term_raw, " \t");
+        if (term.len == 0) continue;
+        const range = parsePlaceholderRange(term) orelse continue;
+        try appendNthRange(allocator, &out, tokens.items, range);
+    }
+    if (strip_last) {
+        const stripped = stripNthLastDelimiter(out.items, delimiter);
+        out.shrinkRetainingCapacity(stripped.len);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn transformWithNth(allocator: Allocator, line: []const u8, delimiter: ?[]const u8, spec: []const u8, ordinal: usize) ![]u8 {
+    if (nthSpecNumeric(spec)) return transformNthNumeric(allocator, line, delimiter, spec, false);
+    return transformFields(allocator, line, delimiter, spec, ordinal);
+}
+
+fn transformNthSearch(allocator: Allocator, line: []const u8, delimiter: ?[]const u8, spec: []const u8, ordinal: usize) ![]u8 {
+    if (nthSpecNumeric(spec)) return transformNthNumeric(allocator, line, delimiter, spec, true);
+    return transformFields(allocator, line, delimiter, spec, ordinal);
+}
+
 fn transformFields(allocator: Allocator, line: []const u8, delimiter: ?[]const u8, spec: []const u8, ordinal: usize) ![]u8 {
     var fields: std.ArrayList([]const u8) = .empty;
     defer fields.deinit(allocator);
@@ -6678,6 +6936,8 @@ fn transformFields(allocator: Allocator, line: []const u8, delimiter: ?[]const u
         }
         return try out.toOwnedSlice(allocator);
     }
+
+    if (nthSpecNumeric(spec)) return transformNthNumeric(allocator, line, delimiter, spec, true);
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -7023,12 +7283,85 @@ fn nextUtf8Boundary(s: []const u8, pos: usize) usize {
     return p;
 }
 
+const DisplayRune = struct {
+    bytes: []const u8,
+    cp: u21,
+};
+
+fn nextDisplayRune(text: []const u8, at: *usize) DisplayRune {
+    const start = at.*;
+    const first = text[start];
+    const seq_len = std.unicode.utf8ByteSequenceLength(first) catch {
+        at.* += 1;
+        return .{ .bytes = text[start .. start + 1], .cp = first };
+    };
+    const len: usize = seq_len;
+    if (start + len > text.len) {
+        at.* += 1;
+        return .{ .bytes = text[start .. start + 1], .cp = first };
+    }
+    const bytes = text[start .. start + len];
+    const cp = std.unicode.utf8Decode(bytes) catch {
+        at.* += 1;
+        return .{ .bytes = text[start .. start + 1], .cp = first };
+    };
+    at.* += len;
+    return .{ .bytes = bytes, .cp = cp };
+}
+
+fn runeCellWidth(cp: u21) usize {
+    if (cp == 0 or cp < 0x20 or (cp >= 0x7f and cp < 0xa0)) return 0;
+    // Common combining marks, variation selectors and joiners occupy no cell.
+    if ((cp >= 0x0300 and cp <= 0x036f) or (cp >= 0x0483 and cp <= 0x0489) or
+        (cp >= 0x0591 and cp <= 0x05bd) or (cp >= 0x05bf and cp <= 0x05bf) or
+        (cp >= 0x05c1 and cp <= 0x05c2) or (cp >= 0x05c4 and cp <= 0x05c5) or
+        (cp >= 0x0610 and cp <= 0x061a) or (cp >= 0x064b and cp <= 0x065f) or
+        (cp >= 0x0670 and cp <= 0x0670) or (cp >= 0x06d6 and cp <= 0x06ed) or
+        (cp >= 0x1ab0 and cp <= 0x1aff) or (cp >= 0x1dc0 and cp <= 0x1dff) or
+        (cp >= 0x20d0 and cp <= 0x20ff) or (cp >= 0xfe00 and cp <= 0xfe0f) or
+        (cp >= 0xfe20 and cp <= 0xfe2f) or (cp >= 0xe0100 and cp <= 0xe01ef) or
+        cp == 0x200b or cp == 0x200c or cp == 0x200d) return 0;
+    // East Asian wide/full-width ranges and emoji presentation blocks.
+    if ((cp >= 0x1100 and cp <= 0x115f) or cp == 0x2329 or cp == 0x232a or
+        (cp >= 0x2e80 and cp <= 0xa4cf and cp != 0x303f) or
+        (cp >= 0xac00 and cp <= 0xd7a3) or (cp >= 0xf900 and cp <= 0xfaff) or
+        (cp >= 0xfe10 and cp <= 0xfe19) or (cp >= 0xfe30 and cp <= 0xfe6f) or
+        (cp >= 0xff00 and cp <= 0xff60) or (cp >= 0xffe0 and cp <= 0xffe6) or
+        (cp >= 0x1f300 and cp <= 0x1faff) or (cp >= 0x20000 and cp <= 0x3fffd)) return 2;
+    return 1;
+}
+
+fn visibleTextWidth(text: []const u8, ansi: bool) usize {
+    var width: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (ansi and text[i] == 0x1b and i + 1 < text.len and text[i + 1] == '[') {
+            i += 2;
+            while (i < text.len) : (i += 1) if (text[i] >= 0x40 and text[i] <= 0x7e) {
+                i += 1;
+                break;
+            };
+            continue;
+        }
+        const r = nextDisplayRune(text, &i);
+        width += runeCellWidth(r.cp);
+    }
+    return width;
+}
+
+fn runeFoldEq(a: u21, b: u21) bool {
+    if (a < 128 and b < 128) return std.ascii.toLower(@intCast(a)) == std.ascii.toLower(@intCast(b));
+    return a == b;
+}
+
 fn writeHighlighted(w: anytype, text: []const u8, query: []const u8, cols: usize, wrap: bool, ansi: bool, theme: *const Theme, focused: bool, bold_enabled: bool) !void {
     var qi: usize = 0;
     var printed: usize = 0;
     var i: usize = 0;
     const base = if (focused) theme.current else theme.normal;
     const highlight = if (focused) theme.highlight_current else theme.highlight;
+    const truncated = !wrap and visibleTextWidth(text, ansi) > cols;
+    const content_limit = if (truncated and cols > 0) cols - 1 else cols;
     while (i < text.len) {
         if (ansi and text[i] == 0x1b and i + 1 < text.len and text[i + 1] == '[') {
             const esc_start = i;
@@ -7042,19 +7375,28 @@ fn writeHighlighted(w: anytype, text: []const u8, query: []const u8, cols: usize
             try w.writeAll(text[esc_start..i]);
             continue;
         }
-        if (!wrap and printed >= cols) break;
-        const c = text[i];
-        const match = qi < query.len and std.ascii.toLower(c) == std.ascii.toLower(query[qi]);
+        const before = i;
+        const r = nextDisplayRune(text, &i);
+        const width = runeCellWidth(r.cp);
+        if (!wrap and printed + width > content_limit) {
+            i = before;
+            break;
+        }
+        var match = false;
+        if (qi < query.len) {
+            var qnext = qi;
+            const qr = nextDisplayRune(query, &qnext);
+            match = runeFoldEq(r.cp, qr.cp);
+            if (match) qi = qnext;
+        }
         if (match) {
             try writeRoleStyleOverlay(w, highlight, theme.enabled, bold_enabled);
-            try w.writeByte(c);
+            try w.writeAll(r.bytes);
             try writeRoleStyle(w, base, theme.enabled, bold_enabled);
-            qi += 1;
-        } else try w.writeByte(c);
-        printed += 1;
-        i += 1;
+        } else try w.writeAll(r.bytes);
+        printed += width;
     }
-    if (!wrap and i < text.len and cols >= 1) try w.writeAll("…");
+    if (truncated and cols != 0) try w.writeAll("…");
 }
 
 fn keyMatchesName(key: Key, name: []const u8) bool {
@@ -7096,11 +7438,25 @@ fn keyMatchesName(key: Key, name: []const u8) bool {
 
 fn writeTruncated(w: anytype, text: []const u8, cols: usize, wrap: bool, prefix: []const u8) !void {
     try w.writeAll(prefix);
-    if (wrap or text.len <= cols) return w.writeAll(text);
+    if (wrap) return w.writeAll(text);
+    const total = visibleTextWidth(text, false);
+    if (total <= cols) return w.writeAll(text);
     if (cols == 0) return;
-    const end = @min(text.len, if (cols > 1) cols - 1 else cols);
-    try w.writeAll(text[0..end]);
-    if (cols > 1) try w.writeAll("…");
+    const limit = cols - 1;
+    var used: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const before = i;
+        const r = nextDisplayRune(text, &i);
+        const width = runeCellWidth(r.cp);
+        if (used + width > limit) {
+            i = before;
+            break;
+        }
+        try w.writeAll(r.bytes);
+        used += width;
+    }
+    try w.writeAll("…");
 }
 
 fn expandPreviewCommand(allocator: Allocator, template: []const u8, item: []const u8, query: []const u8) ![]u8 {
@@ -7961,7 +8317,7 @@ test "native walker recurses and honors skip hidden and record delimiter" {
     defer a.free(top);
     const hidden_file = try std.mem.concat(a, u8, &.{ "ROOT", sep, ".hidden-file" });
     defer a.free(hidden_file);
-    const visible_dir = try std.mem.concat(a, u8, &.{ "ROOT", sep, "visible" });
+    const visible_dir = try std.mem.concat(a, u8, &.{ "ROOT", sep, "visible", sep });
     defer a.free(visible_dir);
     const keep = try std.mem.concat(a, u8, &.{ "ROOT", sep, "visible", sep, "keep.txt" });
     defer a.free(keep);
@@ -7994,26 +8350,33 @@ test "walker skip policy matches exact names and hidden directory mode" {
     defer options.deinit(std.testing.allocator);
     options.walker_skip = "cache,,node_modules";
     options.walker.hidden = false;
-    try std.testing.expect(walkerDirSkipped(&options, ".hidden"));
-    try std.testing.expect(walkerDirSkipped(&options, "cache"));
-    try std.testing.expect(walkerDirSkipped(&options, "node_modules"));
-    try std.testing.expect(!walkerDirSkipped(&options, "cache2"));
-    try std.testing.expect(!walkerDirSkipped(&options, "src"));
+    try std.testing.expect(walkerDirSkipped(&options, ".", ".hidden", ".hidden"));
+    try std.testing.expect(walkerDirSkipped(&options, ".", "cache", "cache"));
+    try std.testing.expect(walkerDirSkipped(&options, ".", "node_modules", "node_modules"));
+    try std.testing.expect(!walkerDirSkipped(&options, ".", "cache2", "cache2"));
+    try std.testing.expect(!walkerDirSkipped(&options, ".", "src", "src"));
+    options.walker_skip = "foo/bar,/deep/cache";
+    try std.testing.expect(walkerDirSkipped(&options, ".", "x/foo/bar", "bar"));
+    try std.testing.expect(!walkerDirSkipped(&options, ".", "deep/cache", "cache"));
+    try std.testing.expect(walkerDirSkipped(&options, ".", "a/deep/cache", "cache"));
+    try std.testing.expect(!walkerDirSkipped(&options, ".", "xfoo/bar", "bar"));
+    try std.testing.expect(!walkerDirSkipped(&options, ".", "foo/bar2", "bar2"));
 
+    options.walker_skip = "cache";
     options.walker.hidden = true;
-    try std.testing.expect(!walkerDirSkipped(&options, ".hidden"));
-    try std.testing.expect(walkerDirSkipped(&options, "cache"));
+    try std.testing.expect(!walkerDirSkipped(&options, ".", ".hidden", ".hidden"));
+    try std.testing.expect(walkerDirSkipped(&options, ".", "cache", "cache"));
 }
 
 test "walker path assembly avoids duplicate separators and supports NUL" {
     const a = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
-    try walkerAppendPath(&out, a, "ROOT", "one", '\n');
-    const rooted = try std.mem.concat(a, u8, &.{ "ROOT", std.fs.path.sep_str });
+    try walkerAppendPath(&out, a, ".", "one", false, '\n');
+    const rooted = try std.mem.concat(a, u8, &.{ ".", std.fs.path.sep_str, "ROOT", std.fs.path.sep_str });
     defer a.free(rooted);
-    try walkerAppendPath(&out, a, rooted, "two", 0);
-    const expected = try std.mem.concat(a, u8, &.{ "ROOT", std.fs.path.sep_str, "one\nROOT", std.fs.path.sep_str, "two\x00" });
+    try walkerAppendPath(&out, a, rooted, "two", true, 0);
+    const expected = try std.mem.concat(a, u8, &.{ "one\nROOT", std.fs.path.sep_str, "two", std.fs.path.sep_str, "\x00" });
     defer a.free(expected);
     try std.testing.expectEqualSlices(u8, expected, out.items);
 }
@@ -8027,7 +8390,7 @@ test "native walker keeps file and directory selection distinct" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "top.txt", .data = "" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dir/nested.txt", .data = "" });
 
-    const dir_path = try std.mem.concat(a, u8, &.{ "ROOT", std.fs.path.sep_str, "dir" });
+    const dir_path = try std.mem.concat(a, u8, &.{ "ROOT", std.fs.path.sep_str, "dir", std.fs.path.sep_str });
     defer a.free(dir_path);
     const top_path = try std.mem.concat(a, u8, &.{ "ROOT", std.fs.path.sep_str, "top.txt" });
     defer a.free(top_path);
@@ -8053,6 +8416,104 @@ test "native walker keeps file and directory selection distinct" {
     try std.testing.expect(!testWalkerHasRecord(dir_out.items, '\n', nested_path));
 }
 
+fn testWalkerNonEmptyRecordCount(blob: []const u8, delim: u8) usize {
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, blob, delim);
+    while (it.next()) |record| {
+        if (record.len != 0) count += 1;
+    }
+    return count;
+}
+
+fn testWalkerNativeExpectedPath(allocator: Allocator, rel: []const u8, is_dir: bool) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "ROOT");
+    try out.append(allocator, std.fs.path.sep);
+    for (rel) |byte| try out.append(allocator, if (byte == '/') std.fs.path.sep else byte);
+    if (is_dir) try out.append(allocator, std.fs.path.sep);
+    return try out.toOwnedSlice(allocator);
+}
+
+test "native walker exhaustively covers mode follow hidden delimiter and skip combinations" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    inline for (.{ "vis", "vis/keepdir", "skip", "vis/skip", ".hid" }) |name| {
+        var dir = try tmp.dir.createDirPathOpen(std.testing.io, name, .{});
+        dir.close(std.testing.io);
+    }
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "top.txt", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".dotfile", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "vis/a.txt", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "skip/s.txt", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "vis/skip/n.txt", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".hid/h.txt", .data = "" });
+
+    const FileCase = struct { rel: []const u8, hidden_dir: bool = false, skipped: bool = false };
+    const DirCase = struct { rel: []const u8, hidden_dir: bool = false, skipped: bool = false };
+    const file_cases = [_]FileCase{
+        .{ .rel = "top.txt" },
+        .{ .rel = ".dotfile" },
+        .{ .rel = "vis/a.txt" },
+        .{ .rel = "skip/s.txt", .skipped = true },
+        .{ .rel = "vis/skip/n.txt", .skipped = true },
+        .{ .rel = ".hid/h.txt", .hidden_dir = true },
+    };
+    const dir_cases = [_]DirCase{
+        .{ .rel = "vis" },
+        .{ .rel = "vis/keepdir" },
+        .{ .rel = "skip", .skipped = true },
+        .{ .rel = "vis/skip", .skipped = true },
+        .{ .rel = ".hid", .hidden_dir = true },
+    };
+    const modes = [_]WalkerOptions{
+        .{ .file = true, .dir = false, .follow = false, .hidden = false },
+        .{ .file = false, .dir = true, .follow = false, .hidden = false },
+        .{ .file = true, .dir = true, .follow = false, .hidden = false },
+    };
+
+    var combination_count: usize = 0;
+    for (modes) |base_mode| {
+        for ([_]bool{ false, true }) |follow| {
+            for ([_]bool{ false, true }) |hidden| {
+                for ([_]bool{ false, true }) |read0| {
+                    for ([_]bool{ false, true }) |with_skip| {
+                        var options: Options = .{
+                            .walker = .{ .file = base_mode.file, .dir = base_mode.dir, .follow = follow, .hidden = hidden },
+                            .walker_skip = if (with_skip) "skip" else "",
+                            .read0 = read0,
+                        };
+                        defer options.deinit(a);
+                        var out: std.ArrayList(u8) = .empty;
+                        defer out.deinit(a);
+                        try appendNativeWalkerRoot(a, std.testing.io, &options, "ROOT", tmp.dir, &out);
+                        const delim: u8 = if (read0) 0 else '\n';
+                        var expected_count: usize = 0;
+                        for (file_cases) |case| {
+                            const should = base_mode.file and (!case.hidden_dir or hidden) and (!case.skipped or !with_skip);
+                            const path = try testWalkerNativeExpectedPath(a, case.rel, false);
+                            defer a.free(path);
+                            try std.testing.expectEqual(should, testWalkerHasRecord(out.items, delim, path));
+                            if (should) expected_count += 1;
+                        }
+                        for (dir_cases) |case| {
+                            const should = base_mode.dir and (!case.hidden_dir or hidden) and (!case.skipped or !with_skip);
+                            const path = try testWalkerNativeExpectedPath(a, case.rel, true);
+                            defer a.free(path);
+                            try std.testing.expectEqual(should, testWalkerHasRecord(out.items, delim, path));
+                            if (should) expected_count += 1;
+                        }
+                        try std.testing.expectEqual(expected_count, testWalkerNonEmptyRecordCount(out.items, delim));
+                        combination_count += 1;
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 48), combination_count);
+}
+
 test "native walker traverses hidden directories when enabled and prunes custom skips" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -8075,7 +8536,7 @@ test "native walker traverses hidden directories when enabled and prunes custom 
     try std.testing.expect(std.mem.indexOf(u8, out.items, "cache") == null);
 }
 
-test "native walker follow mode terminates symlink cycles and skips dangling links" {
+test "native walker symlink semantics match fzf and terminate ancestor cycles" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -8083,7 +8544,9 @@ test "native walker follow mode terminates symlink cycles and skips dangling lin
     var dir = try tmp.dir.createDirPathOpen(std.testing.io, "dir", .{});
     dir.close(std.testing.io);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dir/keep.txt", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plain.txt", .data = "" });
     try tmp.dir.symLink(std.testing.io, "..", "dir/loop", .{ .is_directory = true });
+    try tmp.dir.symLink(std.testing.io, "plain.txt", "file-link", .{});
     try tmp.dir.symLink(std.testing.io, "missing-target", "dangling", .{});
 
     var options: Options = .{ .walker = .{ .file = true, .dir = false, .follow = true, .hidden = true }, .walker_skip = "" };
@@ -8093,8 +8556,42 @@ test "native walker follow mode terminates symlink cycles and skips dangling lin
     try appendNativeWalkerRoot(a, std.testing.io, &options, "ROOT", tmp.dir, &out);
     const keep = try std.mem.concat(a, u8, &.{ "ROOT", std.fs.path.sep_str, "dir", std.fs.path.sep_str, "keep.txt" });
     defer a.free(keep);
+    const file_link = try std.mem.concat(a, u8, &.{ "ROOT", std.fs.path.sep_str, "file-link" });
+    defer a.free(file_link);
+    const dangling = try std.mem.concat(a, u8, &.{ "ROOT", std.fs.path.sep_str, "dangling" });
+    defer a.free(dangling);
     try std.testing.expectEqual(@as(usize, 1), testWalkerRecordCount(out.items, '\n', keep));
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "dangling") == null);
+    try std.testing.expect(testWalkerHasRecord(out.items, '\n', file_link));
+    try std.testing.expect(testWalkerHasRecord(out.items, '\n', dangling));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "loop") == null);
+
+    options.walker.follow = false;
+    var no_follow: std.ArrayList(u8) = .empty;
+    defer no_follow.deinit(a);
+    try appendNativeWalkerRoot(a, std.testing.io, &options, "ROOT", tmp.dir, &no_follow);
+    try std.testing.expect(testWalkerHasRecord(no_follow.items, '\n', file_link));
+    try std.testing.expect(testWalkerHasRecord(no_follow.items, '\n', dangling));
+    try std.testing.expect(std.mem.indexOf(u8, no_follow.items, "loop") == null);
+}
+
+test "native walker prunes followed directory symlinks to root ancestors" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "keep.txt", .data = "" });
+    try tmp.dir.symLink(std.testing.io, std.fs.path.sep_str, "escape-to-root", .{ .is_directory = true });
+
+    var options: Options = .{ .walker = .{ .file = true, .dir = true, .follow = true, .hidden = true }, .walker_skip = "" };
+    defer options.deinit(a);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try appendNativeWalkerRoot(a, std.testing.io, &options, "ROOT", tmp.dir, &out);
+    const keep = try std.mem.concat(a, u8, &.{ "ROOT", std.fs.path.sep_str, "keep.txt" });
+    defer a.free(keep);
+    try std.testing.expect(testWalkerHasRecord(out.items, '\n', keep));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "escape-to-root") == null);
+    try std.testing.expectEqual(@as(usize, 1), testWalkerNonEmptyRecordCount(out.items, '\n'));
 }
 
 test "walker platform implementation supports multiple roots and NUL records" {
@@ -8189,7 +8686,7 @@ test "stream input retains bounded tail across partial records" {
     try std.testing.expectEqualStrings("c\nd\n", blob);
 }
 
-test "header lines remain outside bounded tail" {
+test "header lines remain outside bounded tail except empty filter snapshot" {
     const a = std.testing.allocator;
     var options: Options = .{ .header_lines = 1, .tail = 2 };
     defer options.deinit(a);
@@ -8208,6 +8705,14 @@ test "header lines remain outside bounded tail" {
     const streamed = try stream.materializeBlob();
     defer a.free(streamed);
     try std.testing.expectEqualStrings("HEADER\ntwo\nthree\n", streamed);
+
+    var filter_options: Options = .{ .header_lines = 1, .tail = 2, .filter = "" };
+    defer filter_options.deinit(a);
+    const filter_blob = try a.dupe(u8, "HEADER\none\ntwo\nthree\n");
+    var filtered = try candidatesFromOwnedBlob(a, filter_blob, &filter_options);
+    defer filtered.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), filtered.output.len);
+    try std.testing.expectEqualStrings("three", filtered.output[0]);
 }
 
 test "tail retains last records and empty input stays empty" {
@@ -10093,4 +10598,27 @@ test "heuristic algorithm is randomized top-k identical to v2" {
         const got = try searchCandidates(&heuristic_index, &candidates, &heuristic_options, query, &heuristic_out, &heuristic_ranks, limit);
         try std.testing.expectEqualSlices(usize, expected, got);
     }
+}
+
+test "terminal cell width handles wide combining and invalid UTF-8" {
+    try std.testing.expectEqual(@as(usize, 3), visibleTextWidth("A你", false));
+    try std.testing.expectEqual(@as(usize, 3), visibleTextWidth("A🙂", false));
+    try std.testing.expectEqual(@as(usize, 1), visibleTextWidth("e\u{301}", false));
+    try std.testing.expectEqual(@as(usize, 1), visibleTextWidth(&.{0xff}, false));
+    try std.testing.expectEqual(@as(usize, 1), visibleTextWidth("\x1b[31mX\x1b[0m", true));
+}
+
+test "terminal truncation preserves UTF-8 cell boundaries" {
+    const a = std.testing.allocator;
+    var plain: Io.Writer.Allocating = .init(a);
+    defer plain.deinit();
+    try writeTruncated(&plain.writer, "你好吗", 3, false, "");
+    try std.testing.expectEqualStrings("你…", plain.written());
+
+    var highlighted: Io.Writer.Allocating = .init(a);
+    defer highlighted.deinit();
+    var theme: Theme = .{};
+    theme.enabled = false;
+    try writeHighlighted(&highlighted.writer, "你好吗", "", 3, false, false, &theme, false, false);
+    try std.testing.expectEqualStrings("你…", highlighted.written());
 }
