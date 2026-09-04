@@ -3798,7 +3798,7 @@ fn parseInfoOption(options: *Options, text: []const u8) !void {
     }
     const colon = std.mem.indexOfScalar(u8, text, ':');
     const mode = if (colon) |at| text[0..at] else text;
-    const prefix = if (colon) |at| text[at + 1 ..] else " < ";
+    const prefix = if (colon) |at| text[at + 1 ..] else if (std.ascii.eqlIgnoreCase(mode, "inline")) " < " else "";
     if (std.ascii.eqlIgnoreCase(mode, "inline")) options.info_style = .inline_left else if (std.ascii.eqlIgnoreCase(mode, "inline-right")) options.info_style = .inline_right else return error.InvalidInfoStyle;
     options.info_prefix = prefix;
 }
@@ -9173,6 +9173,12 @@ test "legacy inline info aliases match fzf ordering" {
     defer disabled.deinit(a);
     try std.testing.expectEqual(InfoStyle.default, disabled.info_style);
     try std.testing.expectEqualStrings("custom", disabled.info_prefix);
+
+    const right_args = [_][]const u8{ "zfuzz", "--info=inline-right" };
+    var right = try parseOptions(a, &right_args);
+    defer right.deinit(a);
+    try std.testing.expectEqual(InfoStyle.inline_right, right.info_style);
+    try std.testing.expectEqualStrings("", right.info_prefix);
 }
 
 test "expect preserves fzf comma key chords" {
