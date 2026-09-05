@@ -1,8 +1,131 @@
-# zig_fuzzy
+# zfuzz
 
-Fast preprocessed fuzzy search for Zig 0.16.
+**A fast, fzf-compatible fuzzy finder written in Zig.**
 
-The public workflow is deliberately small:
+`zfuzz` is built for low-latency interactive search over large candidate sets. It keeps fzf-style query semantics and exact V2 ranking while using a parallel, append-friendly search backend designed to return useful results immediately as input and queries change.
+
+- Exact fzf V2 scoring and ranking for the default algorithm
+- Fast incremental refinement with reusable query frontiers
+- Parallel lazy search for large interactive inputs
+- Unicode-aware CLI matching and normalization
+- Extended fzf-style query grammar, schemes, tiebreaks, placeholders, bindings, preview, reload, history, and multi-select
+- Streaming input with responsive partial results
+- Bash, Zsh, and Fish integration
+- Reusable Zig fuzzy-search library in the same package
+
+## Quick start
+
+Requires **Zig 0.16.0+**.
+
+```sh
+git clone https://github.com/ItsMeSamey/zfuzz.git
+cd zfuzz
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/zfuzz
+```
+
+Pipe candidates into it just like a fuzzy finder:
+
+```sh
+find . -type f | ./zig-out/bin/zfuzz
+```
+
+Or use filter mode non-interactively:
+
+```sh
+printf 'alpha\nbeta\ngamma\n' | ./zig-out/bin/zfuzz --filter=ga
+# gamma
+```
+
+## Why zfuzz?
+
+The interactive path is optimized around the latency users actually feel: keypress handling, first useful results, cancellation, and exact completion.
+
+For large inputs, `zfuzz` stores candidates in compact append-only pages, searches shards in parallel, publishes bounded partial top-K results early, and preserves useful completed work across refinements. Prefix refinements reuse prior survivor frontiers instead of blindly rescanning the same search space.
+
+The default scorer preserves exact fzf V2 score/start/end behavior. Specialized short-query kernels skip irrelevant work while retaining exact ranking semantics.
+
+## Performance
+
+Representative guarded measurements on the development machine, using a 1,000,000-record refinement corpus:
+
+| Query | zfuzz | fzf |
+| --- | ---: | ---: |
+| load | **113.74 ms** | 175.48 ms |
+| `a` | **11.60 ms** | 37.95 ms |
+| `ab` | **6.53 ms** | 10.09 ms |
+| `abc` | **5.11 ms** | 7.34 ms |
+| `abcd` | **4.30 ms** | 5.64 ms |
+| `abcde` | **3.64 ms** | 4.29 ms |
+| `abcdef` | 3.90 ms | **3.81 ms** |
+| `abcdefg` | 3.87 ms | **3.12 ms** |
+| `abcdefgh` | 3.59 ms | **3.19 ms** |
+
+These are workload- and machine-specific numbers, not a claim that every query is faster. The broad and early-refinement cases are the primary optimization target because they dominate interactive latency.
+
+At 120 Hz simulated typing on a 1M-record corpus, the validated build preserved **601/601 key events**, with cancellation/handoff latency of roughly **0.26 ms p50**, **0.47 ms p95**, and **0.54 ms p99**.
+
+## fzf-style matching
+
+The CLI exposes three fuzzy algorithms:
+
+```text
+--algo=v2         exact fzf V2 ranking (default)
+--algo=v1         fzf V1 scoring
+--algo=heuristic  conservative prefilters + exact V2 ranking
+```
+
+Common options include:
+
+```sh
+zfuzz --query=src
+zfuzz --exact
+zfuzz --scheme=path
+zfuzz --tiebreak=length,index
+zfuzz --multi
+zfuzz --preview='bat --color=always {}'
+zfuzz --bind='ctrl-r:reload(find . -type f)'
+zfuzz --history="$HOME/.cache/zfuzz-history"
+```
+
+Run `zfuzz --help` for the full CLI surface.
+
+## Streaming and interactive search
+
+`zfuzz` does not require all input to exist before becoming useful. On supported POSIX terminals it can consume a live pipe, update results while records are still arriving, and wake the UI immediately when background search work produces new results.
+
+The large-input backend uses:
+
+1. compact page-based record storage;
+2. shard-local search state and top-K selection;
+3. reusable query frontiers for refinements;
+4. early partial-result publication;
+5. exact global top-K merging;
+6. generation-aware cancellation so stale work does not overwrite newer queries.
+
+ASCII input is classified once per source chunk so repeated refinements can avoid rescanning every record just to rediscover that it is ASCII. Mixed Unicode input automatically stays on the Unicode-aware path.
+
+## Shell integration
+
+The build installs shell integration files under `share/zfuzz/`:
+
+```text
+share/zfuzz/zfuzz.bash
+share/zfuzz/zfuzz.zsh
+share/zfuzz/zfuzz.fish
+```
+
+They can also be printed directly:
+
+```sh
+zfuzz --bash
+zfuzz --zsh
+zfuzz --fish
+```
+
+## Zig library
+
+The package also exposes a small preprocessed fuzzy-search API:
 
 ```zig
 const std = @import("std");
@@ -30,112 +153,28 @@ pub fn main() !void {
 }
 ```
 
-That is the API: preprocess the candidate array once with `fuzzy.init`, then call
-`index.search(query, output_buffer)`. Query preprocessing is automatic on every
-search; there is no unprepared search path.
+`fuzzy.init` preprocesses and owns the searchable representation. `index.search` writes best-first candidate indices into caller-provided storage.
 
-## CLI fuzzy algorithms
+## Build and test
 
-The command-line frontend supports three selectable fuzzy scorers with `--algo`:
+```sh
+zig build -Doptimize=ReleaseFast
+zig build test
+```
 
-- `--algo=v2` is the default and preserves exact fzf V2 ranking.
-- `--algo=v1` uses fzf V1 fuzzy scoring.
-- `--algo=heuristic` preserves exact V2 match membership **and ranking**. For
-  suitable ASCII multi-term AND queries it uses conservative signature and ordered-
-  subsequence filters, then the same exact specialized V2 scoring kernels on the
-  survivors. Direct/selective queries reuse the normal V2 search path.
+The release-ready tree is tested in Debug, ReleaseSafe, and ReleaseFast modes and includes PTY end-to-end coverage for interactive navigation, live streaming, bracketed paste, lazy search, redraw behavior, previews, and Unicode transitions.
 
-Mixed Unicode candidate sets remain exact: ASCII rows can use the indexed fast path,
-while non-ASCII rows are scored through the normal Unicode-aware frontend and merged
-before top-K selection. Unsupported heuristic fast-path shapes simply fall back to the
-ordinary exact V2 scorer. Exact/prefix/suffix/equal terms keep their normal semantics
-under every algorithm.
+Cross-builds are validated for:
 
-## Portability
+- x86_64 Linux musl
+- aarch64 Linux musl
+- x86_64 Windows GNU
+- aarch64 Windows GNU
+- x86_64 macOS
+- aarch64 macOS
 
-The interactive terminal backend and live pipe-refresh path are currently POSIX-only.
-Windows builds support piped/filter workflows, but native interactive TTY mode is not
-yet implemented.
+Interactive TTY mode is currently POSIX-oriented. Windows builds support piped/filter workflows; native Windows interactive terminal support is not yet implemented.
 
-`fuzzy.init` copies the searchable representation, so the input strings do not
-need to remain alive afterward. Search returns indices in the original input
-ordering, sorted best-first. The caller chooses top-K by the size of the output
-buffer and owns that storage.
+## License
 
-## Search pipeline
-
-Candidate preprocessing builds folded bytes, fzf-compatible boundary bonuses,
-a transposed 64-class/two-count signature, and a compact safe score ceiling.
-A search then uses this cascade:
-
-1. **Signature filter** — bitset intersections discard candidates that cannot
-   contain the query characters/counts. On the benchmark corpus this removes
-   about 68% before touching candidate text.
-2. **Exact forward subsequence scan** — rejects candidates with the wrong order
-   and simultaneously records the first feasible position for each query byte.
-3. **Score-ceiling filter** — once top-K has a cutoff, a safe precomputed upper
-   bound rejects candidates that cannot possibly beat it. This avoids most V2
-   dynamic-programming calls without changing results.
-4. **fzf V2 score** — exact V2 scoring runs only for candidates still capable of
-   entering top-K.
-
-When the next query is a prefix extension of the previous one, the index also
-reuses the previous exact subsequence-survivor bitset and scores the previous
-top-K first to establish a strong cutoff early. Backspace or an unrelated query
-resets that cache automatically.
-
-The public `Index.search` core remains bytewise ASCII case-insensitive. The
-`zfuzz` command-line frontend additionally follows fzf's Unicode simple-case
-and Latin/fullwidth normalization behavior when a query or candidate contains
-non-ASCII text; `--literal` disables that normalization. This Unicode frontend
-path does not add any public library API or change the ordinary ASCII indexed
-search path.
-
-The frontend also supports fzf-style command placeholders for preview,
-execute, reload, and transform actions. This includes current (`{}`), selected
-(`{+}`), matched (`{*}`), field/range (`{1}`, `{2..}`, `{+1}`), ordinal
-(`{n}`), query (`{q}`, `{q:2..}`), raw (`r`), whitespace-preserving (`s`), and
-temporary-file (`f`) forms. Prefix a valid placeholder with a backslash (for
-example `\{}`) to keep it literal. Dynamic `change-nth`/`transform-nth` and
-`change-with-nth`/`transform-with-nth` actions follow fzf's pipe-cycling,
-default-restoration, first-line transform, and `FZF_NTH`/`FZF_WITH_NTH`
-environment semantics; background transform variants are supported as well.
-`change-multi` can enable unlimited or bounded multi-selection, disable it with
-`0`, and follows fzf's selection-clearing behavior when an active multi mode is
-changed. Bindable query-edit actions also include fzf-compatible
-`beginning-of-line`, `end-of-line`, `backward-char`, `forward-char`,
-`backward-delete-char`, `delete-char`, and their `/eof` variants; character
-movement and deletion remain UTF-8 boundary-safe. `backward-subword` and
-`forward-subword` follow fzf camel-case and Unicode letter/number boundaries.
-Kill/yank editing follows the same query buffer: `kill-line`, `kill-word`,
-`kill-subword`, backward word/subword rubout,
-`unix-line-discard`, `cancel`, and `yank` preserve and restore the most recently
-removed text; Ctrl-U/Ctrl-W/Ctrl-Y use those same paths. `--filepath-word` makes the word actions use path-separator boundaries. `put(...)`, `replace-query`,
-`print-query`, `accept-non-empty`, and `accept-or-print-query` are also
-available with fzf-compatible query/output behavior. `--scroll-off=N` applies the
-fzf v0.74.3 source default of 3 rows and is shared by normal and offset navigation.
-`--no-input` starts with the existing input section hidden; `show-input`,
-`hide-input`, and `toggle-input` can change that state at runtime. List bindings also include
-`top`, `half-page-up`, `half-page-down`, `offset-up`, `offset-down`, `offset-middle`,
-`clear-screen`, `close`, and `bell`; `close`
-hides a visible preview before falling back to an interrupt exit. `bg-cancel` cancels all
-currently running background transforms without canceling asynchronous reloads.
-
-## Complexity
-
-Let `N` be the number of candidates, `B` the bytes actually scanned after
-filtering, `Q` the query length, and `D` the number of candidates that survive
-the score ceiling and need V2.
-
-- index construction: `O(total candidate bytes)`
-- signature filter: `O(U * N / 64)`, where `U <= 64` is the number of query
-  signature classes
-- forward subsequence work: `O(B)`
-- V2 work: `O(D * Q * average surviving candidate length)`
-- top-K maintenance: `O(D log K)`
-
-The important point is that V2 is no longer paid for every candidate.
-
-## Install
-
-Requires Zig 0.16.0 or newer.
+MIT © ItsMeSamey
