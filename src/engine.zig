@@ -3527,6 +3527,591 @@ pub fn scoreEqualForCli(index: *const Index, needle: []const u8, candidate: []co
     return scoreEqualForCliScheme(index, needle, candidate, entry_index, case_sensitive, .default);
 }
 
+/// Scratch storage for exact CLI matching directly against raw candidate text.
+/// Unlike `Index`, this owns no per-candidate state and is therefore suitable
+/// for streaming/lazy interactive search over very large candidate sets.
+pub const CliScratch = struct {
+    allocator: std.mem.Allocator,
+    dp: []i16 = &.{},
+    runes: []usize = &.{},
+    rune_meta: []usize = &.{},
+    pattern: []u21 = &.{},
+
+    pub fn init(allocator: std.mem.Allocator) CliScratch {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *CliScratch) void {
+        if (self.dp.len != 0) self.allocator.free(self.dp);
+        if (self.runes.len != 0) self.allocator.free(self.runes);
+        if (self.rune_meta.len != 0) self.allocator.free(self.rune_meta);
+        if (self.pattern.len != 0) self.allocator.free(self.pattern);
+        self.* = undefined;
+    }
+
+    pub fn ensure(self: *CliScratch, candidate_bytes: usize) std.mem.Allocator.Error!void {
+        if (candidate_bytes == 0) return;
+        // The worker calls ensure for every candidate. Once scratch is large
+        // enough, avoid even the power-of-two/resize arithmetic.
+        if (self.runes.len >= candidate_bytes and self.dp.len / 4 >= candidate_bytes) return;
+        const needed = std.math.ceilPowerOfTwo(usize, candidate_bytes) catch candidate_bytes;
+        if (self.runes.len < needed) {
+            self.runes = if (self.runes.len == 0)
+                try self.allocator.alloc(usize, needed)
+            else
+                try self.allocator.realloc(self.runes, needed);
+            self.rune_meta = if (self.rune_meta.len == 0)
+                try self.allocator.alloc(usize, needed)
+            else
+                try self.allocator.realloc(self.rune_meta, needed);
+            self.pattern = if (self.pattern.len == 0)
+                try self.allocator.alloc(u21, needed)
+            else
+                try self.allocator.realloc(self.pattern, needed);
+        }
+        const dp_needed = needed * 4;
+        if (self.dp.len < dp_needed) {
+            self.dp = if (self.dp.len == 0)
+                try self.allocator.alloc(i16, dp_needed)
+            else
+                try self.allocator.realloc(self.dp, dp_needed);
+        }
+    }
+};
+
+fn cliRawBonusAt(candidate: []const u8, pos: usize, scheme: CliScheme) i32 {
+    const current = if (scheme == .default) charClass(candidate[pos]) else cliSchemeCharClass(candidate[pos], scheme);
+    const previous: CharClass = if (pos == 0)
+        (if (scheme == .path) .delimiter else .white)
+    else if (scheme == .default)
+        charClass(candidate[pos - 1])
+    else
+        cliSchemeCharClass(candidate[pos - 1], scheme);
+    return if (scheme == .default)
+        bonusFor(previous, current)
+    else
+        cliSchemeBonusFor(previous, current, scheme);
+}
+
+fn cliRawContiguousScore(candidate: []const u8, start: usize, len: usize, scheme: CliScheme) i32 {
+    var total: i32 = 0;
+    var consecutive: usize = 0;
+    var first_bonus: i32 = 0;
+    for (0..len) |k| {
+        var b = cliRawBonusAt(candidate, start + k, scheme);
+        total += score_match;
+        if (consecutive == 0) {
+            first_bonus = b;
+        } else {
+            if (b >= bonus_boundary and b > first_bonus) first_bonus = b;
+            b = @max(@max(b, first_bonus), bonus_consecutive);
+        }
+        total += if (k == 0) b * bonus_first_char_multiplier else b;
+        consecutive += 1;
+    }
+    return total;
+}
+
+fn cliRawCalculateV1Score(candidate: []const u8, pattern: []const u8, start: usize, end: usize, case_sensitive: bool, scheme: CliScheme) i32 {
+    var p: usize = 0;
+    var score: i32 = 0;
+    var in_gap = false;
+    var consecutive: usize = 0;
+    var first_bonus: i32 = 0;
+    var j = start;
+    while (j < end and p < pattern.len) : (j += 1) {
+        if (cliByteEq(candidate[j], pattern[p], case_sensitive)) {
+            score += score_match;
+            var b = cliRawBonusAt(candidate, j, scheme);
+            if (consecutive == 0) {
+                first_bonus = b;
+            } else {
+                if (b >= bonus_boundary and b > first_bonus) first_bonus = b;
+                b = @max(@max(b, first_bonus), bonus_consecutive);
+            }
+            score += if (p == 0) b * bonus_first_char_multiplier else b;
+            in_gap = false;
+            consecutive += 1;
+            p += 1;
+        } else {
+            score += if (in_gap) score_gap_extension else score_gap_start;
+            in_gap = true;
+            consecutive = 0;
+            first_bonus = 0;
+        }
+    }
+    return score;
+}
+
+pub fn matchFuzzyV1RawForCliScheme(query: []const u8, candidate: []const u8, case_sensitive: bool, scheme: CliScheme) ?CliMatch {
+    if (query.len > candidate.len) return null;
+    if (query.len == 0) return .{ .score = 0, .start = 0, .end = 0 };
+    var p: usize = 0;
+    var start: ?usize = null;
+    var end: usize = 0;
+    for (candidate, 0..) |c, i| {
+        if (cliByteEq(c, query[p], case_sensitive)) {
+            if (start == null) start = i;
+            p += 1;
+            if (p == query.len) {
+                end = i + 1;
+                break;
+            }
+        }
+    }
+    if (p != query.len) return null;
+    p = query.len;
+    var compact_start = start.?;
+    var i = end;
+    while (i > compact_start and p > 0) {
+        i -= 1;
+        if (cliByteEq(candidate[i], query[p - 1], case_sensitive)) {
+            p -= 1;
+            if (p == 0) {
+                compact_start = i;
+                break;
+            }
+        }
+    }
+    return .{
+        .score = cliRawCalculateV1Score(candidate, query, compact_start, end, case_sensitive, scheme),
+        .start = compact_start,
+        .end = end,
+    };
+}
+
+inline fn cliRawBonusAtKnownScheme(candidate: []const u8, pos: usize, comptime scheme: CliScheme) i16 {
+    const current = if (scheme == .default) charClass(candidate[pos]) else cliSchemeCharClass(candidate[pos], scheme);
+    const previous: CharClass = if (pos == 0)
+        (if (scheme == .path) .delimiter else .white)
+    else if (scheme == .default)
+        charClass(candidate[pos - 1])
+    else
+        cliSchemeCharClass(candidate[pos - 1], scheme);
+    return @intCast(if (scheme == .default)
+        bonusFor(previous, current)
+    else
+        cliSchemeBonusFor(previous, current, scheme));
+}
+
+fn matchFuzzyRawTwoForCliSchemeImpl(
+    query: []const u8,
+    candidate: []const u8,
+    comptime case_sensitive: bool,
+    comptime ascii_letter_fold: bool,
+    scheme: CliScheme,
+) ?CliMatch {
+    std.debug.assert(query.len == 2);
+    const p0 = if (case_sensitive) query[0] else if (ascii_letter_fold) query[0] | 0x20 else lower_lut[query[0]];
+    const p1 = if (case_sensitive) query[1] else if (ascii_letter_fold) query[1] | 0x20 else lower_lut[query[1]];
+
+    var first0: usize = 0;
+    while (first0 < candidate.len) : (first0 += 1) {
+        const c = if (case_sensitive) candidate[first0] else if (ascii_letter_fold) candidate[first0] | 0x20 else lower_lut[candidate[first0]];
+        if (c == p0) break;
+    }
+    if (first0 == candidate.len) return null;
+    var first1 = first0 + 1;
+    while (first1 < candidate.len) : (first1 += 1) {
+        const c = if (case_sensitive) candidate[first1] else if (ascii_letter_fold) candidate[first1] | 0x20 else lower_lut[candidate[first1]];
+        if (c == p1) break;
+    }
+    if (first1 == candidate.len) return null;
+    const first_bonus = @as(i16, @intCast(cliRawBonusAt(candidate, first0, scheme)));
+    var last_q0_pos = first0;
+    var last_q0_score = @as(i16, score_match) + first_bonus * @as(i16, bonus_first_char_multiplier);
+    var last_q0_bonus = first_bonus;
+
+    // Row one cannot match before first1. Only q0 events can change the
+    // previous-column state needed to seed it, so irrelevant bytes and q1
+    // checks are omitted entirely from this prefix.
+    var j = first0 + 1;
+    while (j < first1) : (j += 1) {
+        const raw = candidate[j];
+        const c = if (case_sensitive) raw else if (ascii_letter_fold) raw | 0x20 else lower_lut[raw];
+        if (c != p0) continue;
+        const raw_bonus = @as(i16, @intCast(cliRawBonusAt(candidate, j, scheme)));
+        last_q0_pos = j;
+        last_q0_bonus = raw_bonus;
+        last_q0_score = @as(i16, score_match) + raw_bonus * @as(i16, bonus_first_char_multiplier);
+    }
+
+    // first1 is the first ordered q1 match. Seed row one from the previous
+    // q0 column; its gap alternative is zero, so the positive match always wins.
+    const seed_bonus = @as(i16, @intCast(cliRawBonusAt(candidate, first1, scheme)));
+    const seed_distance = first1 - last_q0_pos;
+    const seed_h0_prev: i16 = if (seed_distance == 1)
+        last_q0_score
+    else blk: {
+        const decay = seed_distance + 1;
+        break :blk if (decay >= @as(usize, @intCast(last_q0_score))) 0 else last_q0_score - @as(i16, @intCast(decay));
+    };
+    var seed_match_bonus = seed_bonus;
+    if (seed_distance == 1 and !(seed_match_bonus >= bonus_boundary and seed_match_bonus > last_q0_bonus)) {
+        seed_match_bonus = @max(seed_match_bonus, @max(@as(i16, bonus_consecutive), last_q0_bonus));
+    }
+    var h1 = seed_h0_prev + @as(i16, score_match) + seed_match_bonus;
+    const m2_score_ceiling: i16 = 2 * score_match + 3 * bonus_boundary_white;
+    if (h1 == m2_score_ceiling) return .{ .score = h1, .start = first0, .end = first1 + 1 };
+    var gap1 = false;
+    var last_q1_pos = first1;
+    var max_score = h1;
+    var max_score_pos = first1;
+
+    // The reverse bound is unnecessary if the first q1 already reaches the
+    // global M=2 ceiling. Otherwise keep the bound to avoid scanning a long
+    // irrelevant suffix in the steady-state DP.
+    var last1 = candidate.len - 1;
+    while (last1 > first1) : (last1 -= 1) {
+        const c = if (case_sensitive) candidate[last1] else if (ascii_letter_fold) candidate[last1] | 0x20 else lower_lut[candidate[last1]];
+        if (c == p1) break;
+    }
+
+    // Row one consumed row zero's previous column. If q0 == q1, update row
+    // zero only after seeding row one, matching the reverse-row DP dependency.
+    const seed_c = if (case_sensitive) candidate[first1] else if (ascii_letter_fold) candidate[first1] | 0x20 else lower_lut[candidate[first1]];
+    if (seed_c == p0) {
+        last_q0_pos = first1;
+        last_q0_bonus = seed_bonus;
+        last_q0_score = @as(i16, score_match) + seed_bonus * @as(i16, bonus_first_char_multiplier);
+    }
+
+    j = first1 + 1;
+    while (j <= last1) : (j += 1) {
+        const raw = candidate[j];
+        const c = if (case_sensitive) raw else if (ascii_letter_fold) raw | 0x20 else lower_lut[raw];
+        const is_q0 = c == p0;
+        const is_q1 = c == p1;
+        if (!is_q0 and !is_q1) continue;
+
+        const raw_bonus = @as(i16, @intCast(cliRawBonusAt(candidate, j, scheme)));
+        if (is_q1) {
+            const q0_distance = j - last_q0_pos;
+            const h0_prev: i16 = if (q0_distance == 1)
+                last_q0_score
+            else blk: {
+                const decay = q0_distance + 1;
+                break :blk if (decay >= @as(usize, @intCast(last_q0_score))) 0 else last_q0_score - @as(i16, @intCast(decay));
+            };
+
+            var match_bonus = raw_bonus;
+            if (q0_distance == 1 and !(match_bonus >= bonus_boundary and match_bonus > last_q0_bonus)) {
+                match_bonus = @max(match_bonus, @max(@as(i16, bonus_consecutive), last_q0_bonus));
+            }
+
+            const distance = j - last_q1_pos;
+            const first_cost: usize = if (gap1) -score_gap_extension else -score_gap_start;
+            const decay = first_cost + distance - 1;
+            const gap_score: i16 = if (decay >= @as(usize, @intCast(h1))) 0 else h1 - @as(i16, @intCast(decay));
+
+            var match_value = h0_prev + @as(i16, score_match);
+            if (match_value + match_bonus < gap_score)
+                match_value += raw_bonus
+            else
+                match_value += match_bonus;
+
+            gap1 = match_value < gap_score;
+            h1 = @max(match_value, gap_score);
+            if (h1 > max_score) {
+                if (h1 == m2_score_ceiling) return .{ .score = h1, .start = first0, .end = j + 1 };
+                max_score = h1;
+                max_score_pos = j;
+            }
+            last_q1_pos = j;
+        }
+
+        if (is_q0) {
+            last_q0_pos = j;
+            last_q0_bonus = raw_bonus;
+            last_q0_score = @as(i16, score_match) + raw_bonus * @as(i16, bonus_first_char_multiplier);
+        }
+    }
+
+    return .{ .score = @intCast(max_score), .start = first0, .end = max_score_pos + 1 };
+}
+
+fn matchFuzzyRawTwoForCliScheme(
+    query: []const u8,
+    candidate: []const u8,
+    case_sensitive: bool,
+    scheme: CliScheme,
+) ?CliMatch {
+    const q0_fold = query[0] | 0x20;
+    const q1_fold = query[1] | 0x20;
+    const ascii_letter_fold = !case_sensitive and q0_fold >= 'a' and q0_fold <= 'z' and q1_fold >= 'a' and q1_fold <= 'z';
+    if (case_sensitive) return matchFuzzyRawTwoForCliSchemeImpl(query, candidate, true, false, scheme);
+    if (ascii_letter_fold) return matchFuzzyRawTwoForCliSchemeImpl(query, candidate, false, true, scheme);
+    return matchFuzzyRawTwoForCliSchemeImpl(query, candidate, false, false, scheme);
+}
+
+fn matchFuzzyRawSmallForCliScheme(
+    comptime M: usize,
+    query: []const u8,
+    candidate: []const u8,
+    case_sensitive: bool,
+    scheme: CliScheme,
+) ?CliMatch {
+    std.debug.assert(query.len == M and M >= 2 and M <= 6);
+    const first_start = cliSubsequenceStart(candidate, query, case_sensitive) orelse return null;
+    // The last DP row can only improve at a byte matching the final query byte.
+    // Bound the raw scan to its last occurrence, mirroring the indexed scorer's
+    // last-position metadata without retaining per-record metadata.
+    var last_end = candidate.len;
+    var last = candidate.len;
+    while (last > first_start) {
+        last -= 1;
+        if (cliByteEq(candidate[last], query[M - 1], case_sensitive)) {
+            last_end = last + 1;
+            break;
+        }
+    }
+
+    var h = [_]i16{0} ** M;
+    var consecutive = [_]i16{0} ** M;
+    var in_gap = [_]bool{false} ** M;
+    const match_score: i16 = score_match;
+    const gap_start: i16 = score_gap_start;
+    const gap_extension: i16 = score_gap_extension;
+    const boundary: i16 = bonus_boundary;
+    const consecutive_bonus: i16 = bonus_consecutive;
+    const first_multiplier: i16 = bonus_first_char_multiplier;
+    var max_score: i16 = 0;
+    var max_score_pos = first_start;
+
+    var j = first_start;
+    while (j < last_end) : (j += 1) {
+        const c = candidate[j];
+        const raw_bonus: i16 = @intCast(cliRawBonusAt(candidate, j, scheme));
+
+        // Reverse row order preserves the previous-column value of h[row-1],
+        // exactly matching the candidate-sized two-row CLI DP.
+        inline for (1..M) |reverse_index| {
+            const row = M - reverse_index;
+            const left = h[row];
+            const gap_score: i16 = left + (if (in_gap[row]) gap_extension else gap_start);
+            var match_value: i16 = 0;
+            var run: i16 = 0;
+            if (j > first_start and cliByteEq(c, query[row], case_sensitive)) {
+                match_value = h[row - 1] + match_score;
+                var b = raw_bonus;
+                run = consecutive[row - 1] + 1;
+                if (run > 1) {
+                    const run_start = j + 1 - @as(usize, @intCast(run));
+                    const first_bonus: i16 = @intCast(cliRawBonusAt(candidate, run_start, scheme));
+                    if (b >= boundary and b > first_bonus) {
+                        run = 1;
+                    } else {
+                        b = @max(b, @max(consecutive_bonus, first_bonus));
+                    }
+                }
+                if (match_value + b < gap_score) {
+                    match_value += raw_bonus;
+                    run = 0;
+                } else {
+                    match_value += b;
+                }
+            }
+            consecutive[row] = run;
+            in_gap[row] = match_value < gap_score;
+            h[row] = @max(@max(match_value, gap_score), 0);
+            if (row == M - 1 and h[row] > max_score) {
+                max_score = h[row];
+                max_score_pos = j;
+            }
+        }
+
+        if (cliByteEq(c, query[0], case_sensitive)) {
+            h[0] = match_score + raw_bonus * first_multiplier;
+            consecutive[0] = 1;
+            in_gap[0] = false;
+        } else {
+            h[0] = @max(h[0] + (if (in_gap[0]) gap_extension else gap_start), 0);
+            consecutive[0] = 0;
+            in_gap[0] = true;
+        }
+    }
+    return .{ .score = @intCast(max_score), .start = first_start, .end = max_score_pos + 1 };
+}
+
+pub fn matchFuzzyRawForCliScheme(scratch: *CliScratch, query: []const u8, candidate: []const u8, case_sensitive: bool, scheme: CliScheme) ?CliMatch {
+    if (query.len > candidate.len) return null;
+    if (query.len == 0) return .{ .score = 0, .start = 0, .end = 0 };
+    if (query.len > 1000) return matchFuzzyV1RawForCliScheme(query, candidate, case_sensitive, scheme);
+    if (query.len == 1) {
+        var best: ?CliMatch = null;
+        for (candidate, 0..) |c, i| {
+            if (!cliByteEq(c, query[0], case_sensitive)) continue;
+            const raw_bonus = cliRawBonusAt(candidate, i, scheme);
+            const score = score_match + raw_bonus * bonus_first_char_multiplier;
+            if (best == null or score > best.?.score) best = .{ .score = score, .start = i, .end = i + 1 };
+            if (raw_bonus >= bonus_boundary) return best;
+        }
+        return best;
+    }
+    if (query.len <= 6) return switch (query.len) {
+        2 => matchFuzzyRawTwoForCliScheme(query, candidate, case_sensitive, scheme),
+        3 => matchFuzzyRawSmallForCliScheme(3, query, candidate, case_sensitive, scheme),
+        4 => matchFuzzyRawSmallForCliScheme(4, query, candidate, case_sensitive, scheme),
+        5 => matchFuzzyRawSmallForCliScheme(5, query, candidate, case_sensitive, scheme),
+        6 => matchFuzzyRawSmallForCliScheme(6, query, candidate, case_sensitive, scheme),
+        else => unreachable,
+    };
+    if (scratch.dp.len / 4 < candidate.len) return null;
+    const first_start = cliSubsequenceStart(candidate, query, case_sensitive) orelse return null;
+    var last_end = candidate.len;
+    var last = candidate.len;
+    while (last > first_start) {
+        last -= 1;
+        if (cliByteEq(candidate[last], query[query.len - 1], case_sensitive)) {
+            last_end = last + 1;
+            break;
+        }
+    }
+
+    const n = last_end;
+    var prev_h = scratch.dp[0..n];
+    var prev_c = scratch.dp[n .. 2 * n];
+    var cur_h = scratch.dp[2 * n .. 3 * n];
+    var cur_c = scratch.dp[3 * n .. 4 * n];
+    var previous_score: i16 = 0;
+    var in_gap = false;
+    var j: usize = first_start;
+    while (j < n) : (j += 1) {
+        const c = candidate[j];
+        if (cliByteEq(c, query[0], case_sensitive)) {
+            prev_h[j] = @intCast(score_match + cliRawBonusAt(candidate, j, scheme) * bonus_first_char_multiplier);
+            prev_c[j] = 1;
+            in_gap = false;
+        } else {
+            const penalty: i16 = @intCast(if (in_gap) score_gap_extension else score_gap_start);
+            prev_h[j] = @max(previous_score + penalty, 0);
+            prev_c[j] = 0;
+            in_gap = true;
+        }
+        previous_score = prev_h[j];
+    }
+
+    var max_score: i16 = 0;
+    var max_score_pos: usize = first_start;
+    var row: usize = 1;
+    while (row < query.len) : (row += 1) {
+        in_gap = false;
+        var left: i16 = 0;
+        j = first_start;
+        while (j < n) : (j += 1) {
+            const c = candidate[j];
+            const gap_penalty: i16 = @intCast(if (in_gap) score_gap_extension else score_gap_start);
+            const gap_score: i16 = left + gap_penalty;
+            var match_score_value: i16 = 0;
+            var consecutive: i16 = 0;
+            if (j > first_start and cliByteEq(c, query[row], case_sensitive)) {
+                match_score_value = prev_h[j - 1] + @as(i16, score_match);
+                var b: i16 = @intCast(cliRawBonusAt(candidate, j, scheme));
+                consecutive = prev_c[j - 1] + 1;
+                if (consecutive > 1) {
+                    const first_index = j + 1 - @as(usize, @intCast(consecutive));
+                    const first_bonus: i16 = @intCast(cliRawBonusAt(candidate, first_index, scheme));
+                    if (b >= bonus_boundary and b > first_bonus) {
+                        consecutive = 1;
+                    } else {
+                        b = @max(@max(b, @as(i16, bonus_consecutive)), first_bonus);
+                    }
+                }
+                if (match_score_value + b < gap_score) {
+                    match_score_value += @intCast(cliRawBonusAt(candidate, j, scheme));
+                    consecutive = 0;
+                } else {
+                    match_score_value += b;
+                }
+            }
+            cur_c[j] = consecutive;
+            in_gap = match_score_value < gap_score;
+            const score: i16 = @max(@max(match_score_value, gap_score), 0);
+            cur_h[j] = score;
+            left = score;
+            if (row + 1 == query.len and score > max_score) {
+                max_score = score;
+                max_score_pos = j;
+            }
+        }
+        std.mem.swap([]i16, &prev_h, &cur_h);
+        std.mem.swap([]i16, &prev_c, &cur_c);
+    }
+    return .{ .score = @intCast(max_score), .start = first_start, .end = max_score_pos + 1 };
+}
+
+pub fn scoreExactRawForCliScheme(needle: []const u8, candidate: []const u8, case_sensitive: bool, boundary: bool, scheme: CliScheme) ?CliMatch {
+    if (needle.len > candidate.len) return null;
+    if (needle.len == 0) return .{ .score = 0, .start = 0, .end = 0 };
+    var best_start: ?usize = null;
+    var best_bonus: i32 = -1;
+    var start: usize = 0;
+    while (start + needle.len <= candidate.len) : (start += 1) {
+        if (!cliExactAt(candidate, needle, start, case_sensitive)) continue;
+        const b = cliRawBonusAt(candidate, start, scheme);
+        if (boundary) {
+            if (b < bonus_boundary) continue;
+            if (start > 0 and !cliBoundarySide(candidate[start - 1], scheme)) continue;
+            const end = start + needle.len;
+            if (end < candidate.len and !cliBoundarySide(candidate[end], scheme)) continue;
+        }
+        if (b > best_bonus) {
+            best_bonus = b;
+            best_start = start;
+        }
+        if (b >= bonus_boundary) break;
+    }
+    const s = best_start orelse return null;
+    const e = s + needle.len;
+    if (!boundary) return .{ .score = cliRawContiguousScore(candidate, s, needle.len, scheme), .start = s, .end = e };
+    var score = best_bonus;
+    var deduct = best_bonus - bonus_boundary + 1;
+    if (s > 0 and candidate[s - 1] == '_') {
+        score -= deduct + 1;
+        deduct = 1;
+    }
+    if (e < candidate.len and candidate[e] == '_') score -= deduct;
+    const boundary_white: i32 = if (scheme == .default) bonus_boundary_white else bonus_boundary;
+    score += score_match * @as(i32, @intCast(needle.len)) + boundary_white * @as(i32, @intCast(needle.len + 1));
+    return .{ .score = score, .start = s, .end = e };
+}
+
+pub fn scorePrefixRawForCliScheme(needle: []const u8, candidate: []const u8, case_sensitive: bool, scheme: CliScheme) ?CliMatch {
+    var start: usize = 0;
+    if (needle.len != 0 and !std.ascii.isWhitespace(needle[0])) {
+        while (start < candidate.len and std.ascii.isWhitespace(candidate[start])) start += 1;
+    }
+    if (!cliExactAt(candidate, needle, start, case_sensitive)) return null;
+    return .{ .score = cliRawContiguousScore(candidate, start, needle.len, scheme), .start = start, .end = start + needle.len };
+}
+
+pub fn scoreSuffixRawForCliScheme(needle: []const u8, candidate: []const u8, case_sensitive: bool, scheme: CliScheme) ?CliMatch {
+    var end = candidate.len;
+    if (needle.len == 0 or !std.ascii.isWhitespace(needle[needle.len - 1])) {
+        while (end > 0 and std.ascii.isWhitespace(candidate[end - 1])) end -= 1;
+    }
+    if (needle.len > end) return null;
+    const start = end - needle.len;
+    if (!cliExactAt(candidate, needle, start, case_sensitive)) return null;
+    return .{ .score = cliRawContiguousScore(candidate, start, needle.len, scheme), .start = start, .end = end };
+}
+
+pub fn scoreEqualRawForCliScheme(needle: []const u8, candidate: []const u8, case_sensitive: bool, scheme: CliScheme) ?CliMatch {
+    if (needle.len == 0) return null;
+    var start: usize = 0;
+    var end = candidate.len;
+    if (!std.ascii.isWhitespace(needle[0])) {
+        while (start < end and std.ascii.isWhitespace(candidate[start])) start += 1;
+    }
+    if (!std.ascii.isWhitespace(needle[needle.len - 1])) {
+        while (end > start and std.ascii.isWhitespace(candidate[end - 1])) end -= 1;
+    }
+    if (end - start != needle.len or !cliExactAt(candidate, needle, start, case_sensitive)) return null;
+    const boundary_white: i32 = if (scheme == .default) bonus_boundary_white else bonus_boundary;
+    const score = (score_match + boundary_white) * @as(i32, @intCast(needle.len)) + (bonus_first_char_multiplier - 1) * boundary_white;
+    return .{ .score = score, .start = start, .end = end };
+}
+
 const CliRuneClass = enum(u3) { white, non_word, delimiter, lower, upper, letter, number };
 
 fn cliRuneClass(cp: u21, scheme: CliScheme) CliRuneClass {
@@ -3577,6 +4162,315 @@ fn cliRuneMetaBonus(meta: usize) i32 {
 
 fn cliRuneMetaClass(meta: usize) CliRuneClass {
     return @enumFromInt((meta >> 8) & 0x7);
+}
+
+fn cliPrepareUnicodeCandidateRaw(scratch: *CliScratch, candidate: []const u8, case_sensitive: bool, normalize: bool, scheme: CliScheme) ?usize {
+    if (!std.unicode.utf8ValidateSlice(candidate) or scratch.runes.len < candidate.len) return null;
+    var it = std.unicode.Utf8Iterator{ .bytes = candidate, .i = 0 };
+    var n: usize = 0;
+    var previous = cliInitialRuneClass(scheme);
+    while (it.nextCodepoint()) |raw| : (n += 1) {
+        const class = cliRuneClass(raw, scheme);
+        const bonus = cliRuneBonusFor(previous, class, scheme);
+        var cp = raw;
+        if (!case_sensitive) cp = unicode_cli.toLower(cp);
+        if (normalize) cp = unicode_cli.normalize(cp);
+        scratch.runes[n] = cp;
+        scratch.rune_meta[n] = @as(usize, @intCast(bonus)) | (@as(usize, @intFromEnum(class)) << 8);
+        previous = class;
+    }
+    return n;
+}
+
+fn cliPrepareUnicodePatternRaw(scratch: *CliScratch, query: []const u8, case_sensitive: bool, normalize: bool) ?usize {
+    if (!std.unicode.utf8ValidateSlice(query) or scratch.pattern.len < query.len) return null;
+    var it = std.unicode.Utf8Iterator{ .bytes = query, .i = 0 };
+    var n: usize = 0;
+    while (it.nextCodepoint()) |raw| : (n += 1) {
+        var cp = raw;
+        if (!case_sensitive) cp = unicode_cli.toLower(cp);
+        if (normalize) cp = unicode_cli.normalize(cp);
+        scratch.pattern[n] = cp;
+    }
+    return n;
+}
+
+fn cliUnicodeRawContiguousScore(scratch: *const CliScratch, start: usize, len: usize) i32 {
+    var total: i32 = 0;
+    var consecutive: usize = 0;
+    var first_bonus: i32 = 0;
+    for (start..start + len) |j| {
+        var b = cliRuneMetaBonus(scratch.rune_meta[j]);
+        total += score_match;
+        if (consecutive == 0) {
+            first_bonus = b;
+        } else {
+            if (b >= bonus_boundary and b > first_bonus) first_bonus = b;
+            b = @max(@max(b, first_bonus), bonus_consecutive);
+        }
+        total += if (j == start) b * bonus_first_char_multiplier else b;
+        consecutive += 1;
+    }
+    return total;
+}
+
+fn cliCalculateUnicodeRawScore(scratch: *const CliScratch, pattern_len: usize, start: usize, end: usize) i32 {
+    var p: usize = 0;
+    var score: i32 = 0;
+    var in_gap = false;
+    var consecutive: usize = 0;
+    var first_bonus: i32 = 0;
+    var j = start;
+    while (j < end and p < pattern_len) : (j += 1) {
+        if (scratch.runes[j] == scratch.pattern[p]) {
+            score += score_match;
+            var b = cliRuneMetaBonus(scratch.rune_meta[j]);
+            if (consecutive == 0) {
+                first_bonus = b;
+            } else {
+                if (b >= bonus_boundary and b > first_bonus) first_bonus = b;
+                b = @max(@max(b, first_bonus), bonus_consecutive);
+            }
+            score += if (p == 0) b * bonus_first_char_multiplier else b;
+            in_gap = false;
+            consecutive += 1;
+            p += 1;
+        } else {
+            score += if (in_gap) score_gap_extension else score_gap_start;
+            in_gap = true;
+            consecutive = 0;
+            first_bonus = 0;
+        }
+    }
+    return score;
+}
+
+fn cliScoreUnicodeV1RawPrepared(scratch: *CliScratch, candidate_len: usize, pattern_len: usize) ?CliMatch {
+    var p: usize = 0;
+    var start: ?usize = null;
+    var end: usize = 0;
+    for (scratch.runes[0..candidate_len], 0..) |cp, i| {
+        if (cp == scratch.pattern[p]) {
+            if (start == null) start = i;
+            p += 1;
+            if (p == pattern_len) {
+                end = i + 1;
+                break;
+            }
+        }
+    }
+    if (p != pattern_len) return null;
+    p = pattern_len;
+    var compact_start = start.?;
+    var i = end;
+    while (i > compact_start and p > 0) {
+        i -= 1;
+        if (scratch.runes[i] == scratch.pattern[p - 1]) {
+            p -= 1;
+            if (p == 0) {
+                compact_start = i;
+                break;
+            }
+        }
+    }
+    return .{
+        .score = cliCalculateUnicodeRawScore(scratch, pattern_len, compact_start, end),
+        .start = compact_start,
+        .end = end,
+    };
+}
+
+fn cliUnicodeRawExactAt(scratch: *const CliScratch, pattern_len: usize, start: usize) bool {
+    for (0..pattern_len) |k| if (scratch.runes[start + k] != scratch.pattern[k]) return false;
+    return true;
+}
+
+pub fn matchFuzzyUnicodeV1RawForCliScheme(scratch: *CliScratch, query: []const u8, candidate: []const u8, case_sensitive: bool, normalize: bool, scheme: CliScheme) ?CliMatch {
+    const n = cliPrepareUnicodeCandidateRaw(scratch, candidate, case_sensitive, normalize, scheme) orelse return null;
+    const m = cliPrepareUnicodePatternRaw(scratch, query, case_sensitive, normalize) orelse return null;
+    if (m == 0) return .{ .score = 0, .start = 0, .end = 0 };
+    if (m > n) return null;
+    return cliScoreUnicodeV1RawPrepared(scratch, n, m);
+}
+
+pub fn matchFuzzyUnicodeRawForCliScheme(scratch: *CliScratch, query: []const u8, candidate: []const u8, case_sensitive: bool, normalize: bool, scheme: CliScheme) ?CliMatch {
+    const n = cliPrepareUnicodeCandidateRaw(scratch, candidate, case_sensitive, normalize, scheme) orelse return null;
+    const m = cliPrepareUnicodePatternRaw(scratch, query, case_sensitive, normalize) orelse return null;
+    if (m == 0) return .{ .score = 0, .start = 0, .end = 0 };
+    if (m > n) return null;
+    if (m > 1000) return cliScoreUnicodeV1RawPrepared(scratch, n, m);
+    var p: usize = 0;
+    var first_start: usize = 0;
+    for (scratch.runes[0..n], 0..) |cp, j| {
+        if (cp == scratch.pattern[p]) {
+            if (p == 0) first_start = j;
+            p += 1;
+            if (p == m) break;
+        }
+    }
+    if (p != m) return null;
+    if (m == 1) {
+        var best: ?CliMatch = null;
+        for (scratch.runes[0..n], 0..) |cp, j| {
+            if (cp != scratch.pattern[0]) continue;
+            const raw_bonus = cliRuneMetaBonus(scratch.rune_meta[j]);
+            const score = score_match + raw_bonus * bonus_first_char_multiplier;
+            if (best == null or score > best.?.score) best = .{ .score = score, .start = j, .end = j + 1 };
+            if (raw_bonus >= bonus_boundary) return best;
+        }
+        return best;
+    }
+    if (scratch.dp.len < n * 4) return null;
+    var prev_h = scratch.dp[0..n];
+    var prev_c = scratch.dp[n .. 2 * n];
+    var cur_h = scratch.dp[2 * n .. 3 * n];
+    var cur_c = scratch.dp[3 * n .. 4 * n];
+    var previous_score: i16 = 0;
+    var in_gap = false;
+    var j: usize = first_start;
+    while (j < n) : (j += 1) {
+        if (scratch.runes[j] == scratch.pattern[0]) {
+            prev_h[j] = @intCast(score_match + cliRuneMetaBonus(scratch.rune_meta[j]) * bonus_first_char_multiplier);
+            prev_c[j] = 1;
+            in_gap = false;
+        } else {
+            const penalty: i16 = @intCast(if (in_gap) score_gap_extension else score_gap_start);
+            prev_h[j] = @max(previous_score + penalty, 0);
+            prev_c[j] = 0;
+            in_gap = true;
+        }
+        previous_score = prev_h[j];
+    }
+    var max_score: i16 = 0;
+    var max_score_pos = first_start;
+    var row: usize = 1;
+    while (row < m) : (row += 1) {
+        in_gap = false;
+        var left: i16 = 0;
+        j = first_start;
+        while (j < n) : (j += 1) {
+            const gap_penalty: i16 = @intCast(if (in_gap) score_gap_extension else score_gap_start);
+            const gap_score = left + gap_penalty;
+            var match_score_value: i16 = 0;
+            var consecutive: i16 = 0;
+            if (j > first_start and scratch.runes[j] == scratch.pattern[row]) {
+                match_score_value = prev_h[j - 1] + @as(i16, score_match);
+                var b: i16 = @intCast(cliRuneMetaBonus(scratch.rune_meta[j]));
+                consecutive = prev_c[j - 1] + 1;
+                if (consecutive > 1) {
+                    const first_index = j + 1 - @as(usize, @intCast(consecutive));
+                    const first_bonus: i16 = @intCast(cliRuneMetaBonus(scratch.rune_meta[first_index]));
+                    if (b >= bonus_boundary and b > first_bonus) {
+                        consecutive = 1;
+                    } else {
+                        b = @max(@max(b, @as(i16, bonus_consecutive)), first_bonus);
+                    }
+                }
+                if (match_score_value + b < gap_score) {
+                    match_score_value += @intCast(cliRuneMetaBonus(scratch.rune_meta[j]));
+                    consecutive = 0;
+                } else {
+                    match_score_value += b;
+                }
+            }
+            cur_c[j] = consecutive;
+            in_gap = match_score_value < gap_score;
+            const score: i16 = @max(@max(match_score_value, gap_score), 0);
+            cur_h[j] = score;
+            left = score;
+            if (row + 1 == m and score > max_score) {
+                max_score = score;
+                max_score_pos = j;
+            }
+        }
+        std.mem.swap([]i16, &prev_h, &cur_h);
+        std.mem.swap([]i16, &prev_c, &cur_c);
+    }
+    return .{ .score = @intCast(max_score), .start = first_start, .end = max_score_pos + 1 };
+}
+
+pub fn scoreExactUnicodeRawForCliScheme(scratch: *CliScratch, needle: []const u8, candidate: []const u8, case_sensitive: bool, normalize: bool, boundary: bool, scheme: CliScheme) ?CliMatch {
+    const n = cliPrepareUnicodeCandidateRaw(scratch, candidate, case_sensitive, normalize, scheme) orelse return null;
+    const m = cliPrepareUnicodePatternRaw(scratch, needle, case_sensitive, normalize) orelse return null;
+    if (m == 0) return .{ .score = 0, .start = 0, .end = 0 };
+    if (m > n) return null;
+    var best_start: ?usize = null;
+    var best_bonus: i32 = -1;
+    var scan_start: usize = 0;
+    while (scan_start + m <= n) : (scan_start += 1) {
+        if (!cliUnicodeRawExactAt(scratch, m, scan_start)) continue;
+        const b = cliRuneMetaBonus(scratch.rune_meta[scan_start]);
+        if (boundary) {
+            if (b < bonus_boundary) continue;
+            if (scan_start > 0 and @intFromEnum(cliRuneMetaClass(scratch.rune_meta[scan_start - 1])) > @intFromEnum(CliRuneClass.delimiter)) continue;
+            const match_end = scan_start + m;
+            if (match_end < n and @intFromEnum(cliRuneMetaClass(scratch.rune_meta[match_end])) > @intFromEnum(CliRuneClass.delimiter)) continue;
+        }
+        if (b > best_bonus) {
+            best_bonus = b;
+            best_start = scan_start;
+        }
+        if (b >= bonus_boundary) break;
+    }
+    const match_start = best_start orelse return null;
+    const match_end = match_start + m;
+    if (!boundary) return .{ .score = cliUnicodeRawContiguousScore(scratch, match_start, m), .start = match_start, .end = match_end };
+    var score = best_bonus;
+    var deduct = best_bonus - bonus_boundary + 1;
+    if (match_start > 0 and scratch.runes[match_start - 1] == '_') {
+        score -= deduct + 1;
+        deduct = 1;
+    }
+    if (match_end < n and scratch.runes[match_end] == '_') score -= deduct;
+    const boundary_white: i32 = if (scheme == .default) bonus_boundary_white else bonus_boundary;
+    score += score_match * @as(i32, @intCast(m)) + boundary_white * @as(i32, @intCast(m + 1));
+    return .{ .score = score, .start = match_start, .end = match_end };
+}
+
+pub fn scorePrefixUnicodeRawForCliScheme(scratch: *CliScratch, needle: []const u8, candidate: []const u8, case_sensitive: bool, normalize: bool, scheme: CliScheme) ?CliMatch {
+    const n = cliPrepareUnicodeCandidateRaw(scratch, candidate, case_sensitive, normalize, scheme) orelse return null;
+    const m = cliPrepareUnicodePatternRaw(scratch, needle, case_sensitive, normalize) orelse return null;
+    if (m == 0) return .{ .score = 0, .start = 0, .end = 0 };
+    if (m > n) return null;
+    var match_start: usize = 0;
+    if (!cliRuneIsWhitespace(scratch.pattern[0])) {
+        while (match_start < n and cliRuneMetaClass(scratch.rune_meta[match_start]) == .white) : (match_start += 1) {}
+    }
+    if (match_start + m > n or !cliUnicodeRawExactAt(scratch, m, match_start)) return null;
+    return .{ .score = cliUnicodeRawContiguousScore(scratch, match_start, m), .start = match_start, .end = match_start + m };
+}
+
+pub fn scoreSuffixUnicodeRawForCliScheme(scratch: *CliScratch, needle: []const u8, candidate: []const u8, case_sensitive: bool, normalize: bool, scheme: CliScheme) ?CliMatch {
+    const n = cliPrepareUnicodeCandidateRaw(scratch, candidate, case_sensitive, normalize, scheme) orelse return null;
+    const m = cliPrepareUnicodePatternRaw(scratch, needle, case_sensitive, normalize) orelse return null;
+    if (m > n) return null;
+    var match_end = n;
+    if (m == 0 or !cliRuneIsWhitespace(scratch.pattern[m - 1])) {
+        while (match_end > 0 and cliRuneMetaClass(scratch.rune_meta[match_end - 1]) == .white) : (match_end -= 1) {}
+    }
+    if (m == 0) return .{ .score = 0, .start = match_end, .end = match_end };
+    if (m > match_end) return null;
+    const match_start = match_end - m;
+    if (!cliUnicodeRawExactAt(scratch, m, match_start)) return null;
+    return .{ .score = cliUnicodeRawContiguousScore(scratch, match_start, m), .start = match_start, .end = match_end };
+}
+
+pub fn scoreEqualUnicodeRawForCliScheme(scratch: *CliScratch, needle: []const u8, candidate: []const u8, case_sensitive: bool, normalize: bool, scheme: CliScheme) ?CliMatch {
+    const n = cliPrepareUnicodeCandidateRaw(scratch, candidate, case_sensitive, normalize, scheme) orelse return null;
+    const m = cliPrepareUnicodePatternRaw(scratch, needle, case_sensitive, normalize) orelse return null;
+    if (m == 0 or m > n) return null;
+    var match_start: usize = 0;
+    var match_end = n;
+    if (!cliRuneIsWhitespace(scratch.pattern[0])) {
+        while (match_start < match_end and cliRuneMetaClass(scratch.rune_meta[match_start]) == .white) : (match_start += 1) {}
+    }
+    if (!cliRuneIsWhitespace(scratch.pattern[m - 1])) {
+        while (match_end > match_start and cliRuneMetaClass(scratch.rune_meta[match_end - 1]) == .white) : (match_end -= 1) {}
+    }
+    if (match_end - match_start != m or !cliUnicodeRawExactAt(scratch, m, match_start)) return null;
+    const boundary_white: i32 = if (scheme == .default) bonus_boundary_white else bonus_boundary;
+    const score = (score_match + boundary_white) * @as(i32, @intCast(m)) + (bonus_first_char_multiplier - 1) * boundary_white;
+    return .{ .score = score, .start = match_start, .end = match_end };
 }
 
 fn cliPrepareUnicodeCandidate(index: *Index, candidate: []const u8, case_sensitive: bool, normalize: bool, scheme: CliScheme) ?usize {
@@ -3717,7 +4611,14 @@ pub fn cliMayContainFoldedAscii(index: *const Index, entry_index: usize, query: 
 }
 
 pub fn cliTextHasNonAscii(text: []const u8) bool {
-    for (text) |c| if (c >= 0x80) return true;
+    const word_bytes = @sizeOf(usize);
+    const high_bits: usize = 0x80 * (std.math.maxInt(usize) / 0xff);
+    var i: usize = 0;
+    while (i + word_bytes <= text.len) : (i += word_bytes) {
+        const word = @as(*align(1) const usize, @ptrCast(text.ptr + i)).*;
+        if ((word & high_bits) != 0) return true;
+    }
+    for (text[i..]) |c| if (c >= 0x80) return true;
     return false;
 }
 
@@ -4613,6 +5514,229 @@ test "indexed final occurrence bound preserves subsequence search" {
             }
             const bounded = index.subsequenceIndexed(&q, entry, entry_index, first_slot, end);
             try std.testing.expectEqual(full, bounded);
+        }
+    }
+}
+
+test "CLI non-ASCII detection handles word alignment and tails" {
+    const word = @sizeOf(usize);
+    var bytes: [4 * @sizeOf(usize) + 3]u8 = undefined;
+    @memset(&bytes, 'a');
+    for (0..word) |start| {
+        for (0..2 * word + 2) |len| {
+            const slice = bytes[start .. start + len];
+            try std.testing.expect(!cliTextHasNonAscii(slice));
+            if (len == 0) continue;
+            const probes = [_]usize{ 0, len / 2, len - 1 };
+            for (probes) |pos| {
+                bytes[start + pos] = 0x80;
+                try std.testing.expect(cliTextHasNonAscii(slice));
+                bytes[start + pos] = 'a';
+            }
+        }
+    }
+}
+
+test "raw small V2 kernel matches indexed scorer across randomized ASCII" {
+    const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-./,:";
+    var buffers: [64][64]u8 = undefined;
+    var values: [64][]const u8 = undefined;
+    var state: u64 = 0x8f3c2d1e5a17b049;
+    for (&buffers, 0..) |*buffer, i| {
+        const len = 8 + (i * 37 % (buffer.len - 7));
+        for (buffer[0..len]) |*slot| {
+            state = state *% 6364136223846793005 +% 1442695040888963407;
+            slot.* = alphabet[@as(usize, @intCast(state >> 32)) % alphabet.len];
+        }
+        values[i] = buffer[0..len];
+    }
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+    var scratch = CliScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    for (values) |candidate| try scratch.ensure(candidate.len);
+    const schemes = [_]CliScheme{ .default, .path, .history };
+    var query_buf: [6]u8 = undefined;
+    for (0..2000) |trial| {
+        state = state *% 2862933555777941757 +% 3037000493;
+        const entry_index = @as(usize, @intCast(state >> 32)) % values.len;
+        const candidate = values[entry_index];
+        const qlen = 2 + trial % 5;
+        for (query_buf[0..qlen]) |*slot| {
+            state = state *% 2862933555777941757 +% 3037000493;
+            slot.* = alphabet[@as(usize, @intCast(state >> 33)) % alphabet.len];
+        }
+        const query = query_buf[0..qlen];
+        for (schemes) |scheme| for ([_]bool{ false, true }) |sensitive| {
+            try std.testing.expectEqual(
+                matchFuzzyForCliScheme(&index, query, candidate, entry_index, sensitive, scheme),
+                matchFuzzyRawForCliScheme(&scratch, query, candidate, sensitive, scheme),
+            );
+        };
+    }
+}
+
+test "dedicated raw M2 V2 kernel matches indexed scorer across arbitrary bytes" {
+    var buffers: [96][192]u8 = undefined;
+    var values: [96][]const u8 = undefined;
+    var state: u64 = 0xd6e8feb86659fd93;
+    for (&buffers, 0..) |*buffer, i| {
+        const len = 16 + (i * 73 % (buffer.len - 15));
+        for (buffer[0..len]) |*slot| {
+            state = state *% 6364136223846793005 +% 1442695040888963407;
+            slot.* = @truncate(state >> 29);
+        }
+        // Force useful ASCII/raw boundaries and duplicate bytes into every
+        // candidate while leaving the rest of the payload fully arbitrary.
+        const probes = [_]u8{ 0x00, 0xff, 'a', 'A', '/', '_', ':', '9', 'a', 0x80 };
+        for (probes, 0..) |byte, j| buffer[(j * 17 + i * 5) % len] = byte;
+        values[i] = buffer[0..len];
+    }
+
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+    var scratch = CliScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    for (values) |candidate| try scratch.ensure(candidate.len);
+
+    const schemes = [_]CliScheme{ .default, .path, .history };
+    var query: [2]u8 = undefined;
+    for (0..20_000) |trial| {
+        state = state *% 2862933555777941757 +% 3037000493;
+        const entry_index = @as(usize, @intCast(state >> 32)) % values.len;
+        const candidate = values[entry_index];
+
+        if (trial % 4 != 0) {
+            state = state *% 2862933555777941757 +% 3037000493;
+            const first = @as(usize, @intCast(state >> 32)) % (candidate.len - 1);
+            state = state *% 2862933555777941757 +% 3037000493;
+            const second = first + 1 + @as(usize, @intCast(state >> 32)) % (candidate.len - first - 1);
+            query = .{ candidate[first], candidate[second] };
+            if (trial % 13 == 0) {
+                if (query[0] >= 'a' and query[0] <= 'z') query[0] -= 'a' - 'A';
+                if (query[1] >= 'A' and query[1] <= 'Z') query[1] += 'a' - 'A';
+            }
+        } else {
+            state = state *% 2862933555777941757 +% 3037000493;
+            query[0] = @truncate(state >> 23);
+            state = state *% 2862933555777941757 +% 3037000493;
+            query[1] = @truncate(state >> 31);
+        }
+
+        for (schemes) |scheme| for ([_]bool{ false, true }) |sensitive| {
+            try std.testing.expectEqual(
+                matchFuzzyForCliScheme(&index, &query, candidate, entry_index, sensitive, scheme),
+                matchFuzzyRawForCliScheme(&scratch, &query, candidate, sensitive, scheme),
+            );
+        };
+    }
+}
+
+test "raw CLI ASCII scorers are identical to indexed CLI scorers" {
+    const values = [_][]const u8{
+        "src/fuzzy_backend.zig",
+        "FooBarBazQux",
+        "alpha-beta-gamma",
+        "  spaced target  ",
+        "/usr/local/share/node_modules",
+        "history:2026-09-05:entry",
+        "under_score-value",
+        "ABC123xyz",
+        "comma,separated:value",
+        "nothing relevant",
+    };
+    const queries = [_][]const u8{ "fb", "FBB", "abg", "target", "usr", "2026", "sv", "A1x", "csv", "zzz", "" };
+    const schemes = [_]CliScheme{ .default, .path, .history };
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+    var scratch = CliScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    for (values) |candidate| try scratch.ensure(candidate.len);
+
+    for (schemes) |scheme| {
+        for ([_]bool{ false, true }) |sensitive| {
+            for (queries) |query| {
+                for (values, 0..) |candidate, entry_index| {
+                    const indexed_v2 = matchFuzzyForCliScheme(&index, query, candidate, entry_index, sensitive, scheme);
+                    const raw_v2 = matchFuzzyRawForCliScheme(&scratch, query, candidate, sensitive, scheme);
+                    try std.testing.expectEqual(indexed_v2, raw_v2);
+                    const indexed_v1 = matchFuzzyV1ForCliScheme(&index, query, candidate, entry_index, sensitive, scheme);
+                    const raw_v1 = matchFuzzyV1RawForCliScheme(query, candidate, sensitive, scheme);
+                    try std.testing.expectEqual(indexed_v1, raw_v1);
+
+                    const indexed_exact = scoreExactForCliScheme(&index, query, candidate, entry_index, sensitive, false, scheme);
+                    const raw_exact = scoreExactRawForCliScheme(query, candidate, sensitive, false, scheme);
+                    try std.testing.expectEqual(indexed_exact, raw_exact);
+                    const indexed_boundary = scoreExactForCliScheme(&index, query, candidate, entry_index, sensitive, true, scheme);
+                    const raw_boundary = scoreExactRawForCliScheme(query, candidate, sensitive, true, scheme);
+                    try std.testing.expectEqual(indexed_boundary, raw_boundary);
+                    const indexed_prefix = scorePrefixForCliScheme(&index, query, candidate, entry_index, sensitive, scheme);
+                    const raw_prefix = scorePrefixRawForCliScheme(query, candidate, sensitive, scheme);
+                    try std.testing.expectEqual(indexed_prefix, raw_prefix);
+                    const indexed_suffix = scoreSuffixForCliScheme(&index, query, candidate, entry_index, sensitive, scheme);
+                    const raw_suffix = scoreSuffixRawForCliScheme(query, candidate, sensitive, scheme);
+                    try std.testing.expectEqual(indexed_suffix, raw_suffix);
+                    if (query.len != 0) {
+                        const indexed_equal = scoreEqualForCliScheme(&index, query, candidate, entry_index, sensitive, scheme);
+                        const raw_equal = scoreEqualRawForCliScheme(query, candidate, sensitive, scheme);
+                        try std.testing.expectEqual(indexed_equal, raw_equal);
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "raw CLI Unicode scorers are identical to indexed CLI scorers" {
+    const values = [_][]const u8{
+        "Só Danço Samba",
+        "café target",
+        "CAFÉ TARGET",
+        "東京/ファイル.txt",
+        "emoji-🙂-target",
+        "e\u{301} combining",
+        "ẞtraße",
+        "plain-ascii",
+    };
+    const queries = [_][]const u8{ "So", "café", "TARGET", "東京", "🙂t", "é", "straße", "plain", "" };
+    const schemes = [_]CliScheme{ .default, .path, .history };
+    var index = try init(std.testing.allocator, &values);
+    defer index.deinit();
+    var scratch = CliScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+
+    for (schemes) |scheme| {
+        for ([_]bool{ false, true }) |sensitive| {
+            for ([_]bool{ false, true }) |normalize| {
+                for (queries) |query| {
+                    for (values) |candidate| {
+                        try scratch.ensure(@max(candidate.len, query.len));
+                        const indexed_v2 = matchFuzzyUnicodeForCliScheme(&index, query, candidate, sensitive, normalize, scheme);
+                        const raw_v2 = matchFuzzyUnicodeRawForCliScheme(&scratch, query, candidate, sensitive, normalize, scheme);
+                        try std.testing.expectEqual(indexed_v2, raw_v2);
+                        const indexed_v1 = matchFuzzyUnicodeV1ForCliScheme(&index, query, candidate, sensitive, normalize, scheme);
+                        const raw_v1 = matchFuzzyUnicodeV1RawForCliScheme(&scratch, query, candidate, sensitive, normalize, scheme);
+                        try std.testing.expectEqual(indexed_v1, raw_v1);
+                        const indexed_exact = scoreExactUnicodeForCliScheme(&index, query, candidate, sensitive, normalize, false, scheme);
+                        const raw_exact = scoreExactUnicodeRawForCliScheme(&scratch, query, candidate, sensitive, normalize, false, scheme);
+                        try std.testing.expectEqual(indexed_exact, raw_exact);
+                        const indexed_boundary = scoreExactUnicodeForCliScheme(&index, query, candidate, sensitive, normalize, true, scheme);
+                        const raw_boundary = scoreExactUnicodeRawForCliScheme(&scratch, query, candidate, sensitive, normalize, true, scheme);
+                        try std.testing.expectEqual(indexed_boundary, raw_boundary);
+                        const indexed_prefix = scorePrefixUnicodeForCliScheme(&index, query, candidate, sensitive, normalize, scheme);
+                        const raw_prefix = scorePrefixUnicodeRawForCliScheme(&scratch, query, candidate, sensitive, normalize, scheme);
+                        try std.testing.expectEqual(indexed_prefix, raw_prefix);
+                        const indexed_suffix = scoreSuffixUnicodeForCliScheme(&index, query, candidate, sensitive, normalize, scheme);
+                        const raw_suffix = scoreSuffixUnicodeRawForCliScheme(&scratch, query, candidate, sensitive, normalize, scheme);
+                        try std.testing.expectEqual(indexed_suffix, raw_suffix);
+                        if (query.len != 0) {
+                            const indexed_equal = scoreEqualUnicodeForCliScheme(&index, query, candidate, sensitive, normalize, scheme);
+                            const raw_equal = scoreEqualUnicodeRawForCliScheme(&scratch, query, candidate, sensitive, normalize, scheme);
+                            try std.testing.expectEqual(indexed_equal, raw_equal);
+                        }
+                    }
+                }
+            }
         }
     }
 }
