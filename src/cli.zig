@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const fuzzy = @import("fuzzy");
 const fuzzy_engine = @import("engine");
 const listen = @import("listen.zig");
+const compact_store = @import("compact_store.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -14,6 +15,44 @@ const Layout = enum { default, reverse };
 fn logicalVerticalDelta(layout: Layout, visual_delta: isize) isize {
     return if (layout == .default) -visual_delta else visual_delta;
 }
+
+fn stableResultFocus(focus: usize, result_len: usize) usize {
+    return if (result_len == 0) 0 else @min(focus, result_len - 1);
+}
+
+const LazyFocusState = struct { focus: usize, hint: usize };
+
+fn refreshLazyFocus(previous_len: usize, previous_focus: usize, focus_hint: usize, result_len: usize) LazyFocusState {
+    var hint = focus_hint;
+    if (previous_len != 0) hint = previous_focus;
+    if (result_len == 0) return .{ .focus = 0, .hint = hint };
+    const focus = stableResultFocus(hint, result_len);
+    return .{ .focus = focus, .hint = focus };
+}
+
+const lazy_first_publish_max_scan_count: usize = 4 * 1024;
+const lazy_progress_publish_interval_ms: u64 = 20;
+const lazy_parallel_min_candidates: u32 = 64 * 1024;
+const lazy_frontier_depth: usize = 3;
+const lazy_max_workers: usize = 64;
+
+fn lazyWorkerCountForCores(cores: usize) usize {
+    return @max(@as(usize, 1), @min(lazy_max_workers, (cores * 2) / 3));
+}
+
+fn lazyDefaultWorkerCount() usize {
+    return lazyWorkerCountForCores(std.Thread.getCpuCount() catch 1);
+}
+
+fn lazyShouldPublishFirst(scanned: usize, retained: usize, top_k: usize) bool {
+    return (top_k != 0 and retained >= top_k) or scanned >= lazy_first_publish_max_scan_count;
+}
+
+fn effectiveScrollOff(visible: usize, configured: usize) usize {
+    if (visible == 0) return 0;
+    return @min((visible - 1) / 2, configured);
+}
+
 const CaseMode = enum { smart, ignore, respect };
 const Scheme = enum { default, path, history };
 const Algorithm = enum { v2, v1, heuristic };
@@ -371,6 +410,31 @@ const CandidateSet = struct {
     }
 };
 
+fn candidatesFromLazyRanks(allocator: Allocator, ranks: []const LazyRank) !CandidateSet {
+    const blob = try allocator.alloc(u8, 0);
+    errdefer allocator.free(blob);
+    const header = try allocator.alloc([]const u8, 0);
+    errdefer allocator.free(header);
+    const output = try allocator.alloc([]const u8, ranks.len);
+    errdefer allocator.free(output);
+    var has_non_ascii = false;
+    for (ranks, 0..) |rank, i| {
+        const text = rank.record.text();
+        output[i] = text;
+        has_non_ascii = has_non_ascii or fuzzy_engine.cliTextHasNonAscii(text);
+    }
+    return .{
+        .blob = blob,
+        .header = header,
+        .output = output,
+        .display = output,
+        .search = output,
+        .owned_display = false,
+        .owned_search = false,
+        .has_non_ascii = has_non_ascii,
+    };
+}
+
 const StreamUpdate = struct {
     changed: bool = false,
     eof_became: bool = false,
@@ -544,7 +608,7 @@ const Terminal = struct {
         raw.iflag.INPCK = false;
         raw.iflag.ISTRIP = false;
         raw.cc[@intFromEnum(std.posix.V.MIN)] = 0;
-        raw.cc[@intFromEnum(std.posix.V.TIME)] = 1;
+        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
         try std.posix.tcsetattr(self.file.handle, .FLUSH, raw);
         self.active = true;
         if (self.inline_mode) {
@@ -602,17 +666,53 @@ const Terminal = struct {
         }
     }
 
-    fn readByte(self: *Terminal) error{ UnsupportedTerminal, Timeout, ReadFailed }!u8 {
+    fn readByteTimeout(self: *Terminal, timeout_ms: i32) error{ UnsupportedTerminal, Timeout, ReadFailed }!u8 {
         if (comptime builtin.os.tag == .windows) return error.UnsupportedTerminal;
         var b: [1]u8 = undefined;
         while (true) {
+            var fds = [_]std.posix.pollfd{.{ .fd = self.file.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&fds, timeout_ms) catch return error.ReadFailed;
+            if (ready == 0) return error.Timeout;
             const n = std.c.read(self.file.handle, &b, 1);
             if (n == 1) return b[0];
-            if (n == 0) return error.Timeout;
+            if (n == 0) continue;
             const e = std.c._errno().*;
             if (e == @intFromEnum(std.posix.E.INTR)) continue;
             return error.ReadFailed;
         }
+    }
+
+    fn readByteTimeoutWithWake(self: *Terminal, wake_fd: i32, timeout_ms: i32) error{ UnsupportedTerminal, Timeout, Wake, ReadFailed }!u8 {
+        if (comptime builtin.os.tag != .linux) return self.readByteTimeout(timeout_ms);
+        if (wake_fd < 0) return self.readByteTimeout(timeout_ms);
+        var b: [1]u8 = undefined;
+        while (true) {
+            var fds = [_]std.posix.pollfd{
+                .{ .fd = self.file.handle, .events = std.posix.POLL.IN, .revents = 0 },
+                .{ .fd = @intCast(wake_fd), .events = std.posix.POLL.IN, .revents = 0 },
+            };
+            const ready = std.posix.poll(&fds, timeout_ms) catch return error.ReadFailed;
+            if (ready == 0) return error.Timeout;
+            // Input wins when both descriptors become ready together.
+            if (fds[0].revents != 0) {
+                const n = std.c.read(self.file.handle, &b, 1);
+                if (n == 1) return b[0];
+                if (n < 0) {
+                    const e = std.c._errno().*;
+                    if (e == @intFromEnum(std.posix.E.INTR)) continue;
+                    return error.ReadFailed;
+                }
+            }
+            if (fds[1].revents != 0) {
+                var count: u64 = 0;
+                _ = std.c.read(@intCast(wake_fd), @ptrCast(&count), @sizeOf(u64));
+                return error.Wake;
+            }
+        }
+    }
+
+    fn readByte(self: *Terminal) error{ UnsupportedTerminal, Timeout, ReadFailed }!u8 {
+        return self.readByteTimeout(40);
     }
 
     fn physicalSize(self: *Terminal) TerminalSize {
@@ -669,6 +769,17 @@ const Pane = struct {
 const PaneGeometry = struct {
     main: Pane,
     preview: ?Pane,
+};
+
+const RenderGeometryKey = struct {
+    rows: usize,
+    cols: usize,
+    main: Pane,
+    content: Pane,
+    preview: ?Pane,
+    border: bool,
+    border_style: BorderStyle,
+    preview_border_style: BorderStyle,
 };
 
 const QueryHistory = struct {
@@ -1037,6 +1148,12 @@ fn backgroundTransformThread(ctx: *BackgroundContext) void {
     ctx.queue.finish(ctx.kind, output, ctx.generation, ctx.binding_slot, ctx.cancel_generation);
 }
 
+fn lazyAcceptNeedsWait(has_backend: bool, applied_generation: u64, generation: u64, result_len: usize, selected_count: usize, search_complete: bool) bool {
+    if (!has_backend) return false;
+    if (applied_generation != generation) return true;
+    return result_len == 0 and selected_count == 0 and !search_complete;
+}
+
 const Ui = struct {
     allocator: Allocator,
     io: Io,
@@ -1047,6 +1164,16 @@ const Ui = struct {
     stream: ?*StreamInput,
     server: ?*listen.Server,
     child_env: *const std.process.Environ.Map,
+    lazy_backend: ?*LazyBackend,
+    lazy_generation: u64 = 0,
+    lazy_applied_generation: u64 = 0,
+    lazy_pending_accept: bool = false,
+    lazy_top_k: usize = 0,
+    lazy_total_count: u32 = 0,
+    lazy_match_count: u32 = 0,
+    lazy_scanned_count: u32 = 0,
+    lazy_search_complete: bool = false,
+    lazy_input_finished: bool = false,
     bg_queue: *BackgroundQueue,
     preview_queue: *BackgroundQueue,
     history: ?QueryHistory = null,
@@ -1065,6 +1192,7 @@ const Ui = struct {
     result_cap: usize = 0,
     focus: usize = 0,
     scroll: usize = 0,
+    lazy_focus_hint: usize = 0,
     selected: []bool,
     selection_order: std.ArrayList(usize) = .empty,
     selected_count: usize = 0,
@@ -1075,6 +1203,8 @@ const Ui = struct {
     preview_text: []u8 = &.{},
     preview_offset: usize = 0,
     last_frame: []u8 = &.{},
+    last_list_frame: []u8 = &.{},
+    last_render_geometry: ?RenderGeometryKey = null,
     accepted_key: ?[]const u8 = null,
     change_event_pending: bool = false,
     load_event_pending: bool = false,
@@ -1118,6 +1248,7 @@ const Ui = struct {
         stream: ?*StreamInput,
         server: ?*listen.Server,
         child_env: *const std.process.Environ.Map,
+        lazy_backend: ?*LazyBackend,
     ) !Ui {
         var query: std.ArrayList(u8) = .empty;
         try query.appendSlice(allocator, options.query);
@@ -1153,6 +1284,7 @@ const Ui = struct {
             .stream = stream,
             .server = server,
             .child_env = child_env,
+            .lazy_backend = lazy_backend,
             .bg_queue = bg_queue,
             .preview_queue = preview_queue,
             .history = history,
@@ -1187,6 +1319,7 @@ const Ui = struct {
         self.selection_order.deinit(self.allocator);
         if (self.preview_text.len != 0) self.allocator.free(self.preview_text);
         if (self.last_frame.len != 0) self.allocator.free(self.last_frame);
+        if (self.last_list_frame.len != 0) self.allocator.free(self.last_list_frame);
         if (self.owned_prompt) |value| self.allocator.free(value);
         if (self.owned_search_override) |value| self.allocator.free(value);
         if (self.owned_nth) |value| self.allocator.free(value);
@@ -1205,13 +1338,16 @@ const Ui = struct {
 
     fn run(self: *Ui) !u8 {
         try self.refreshSearch(true);
-        const input_complete = self.stream == null or self.stream.?.eof;
-        if (input_complete and self.options.select_1 and self.match_len == 1) {
+        const input_complete = if (self.lazy_backend != null)
+            self.lazy_input_finished and self.lazy_search_complete
+        else
+            self.stream == null or self.stream.?.eof;
+        if (input_complete and self.options.select_1 and self.reportedMatchCount() == 1) {
             self.focusCandidate(self.match_results[0]);
             try self.emitSelection(null);
             return 0;
         }
-        if (input_complete and self.options.exit_0 and self.match_len == 0) return 1;
+        if (input_complete and self.options.exit_0 and self.reportedMatchCount() == 0) return 1;
 
         try self.terminal.enter();
         defer self.terminal.leave();
@@ -1229,6 +1365,7 @@ const Ui = struct {
                     stream_finished = true;
                 }
             }
+            if (try self.processLazyResults()) |code| return code;
             if (self.load_event_pending) {
                 self.load_event_pending = false;
                 if (try self.fireEvent("load")) |code| return code;
@@ -1239,12 +1376,12 @@ const Ui = struct {
             }
             if (self.dirty_search) try self.refreshSearch(false);
             if (stream_finished) {
-                if (self.options.select_1 and self.match_len == 1) {
+                if (self.options.select_1 and self.reportedMatchCount() == 1) {
                     self.focusCandidate(self.match_results[0]);
                     try self.emitSelection(null);
                     return 0;
                 }
-                if (self.options.exit_0 and self.match_len == 0) return 1;
+                if (self.options.exit_0 and self.reportedMatchCount() == 0) return 1;
             }
             if (self.result_event_pending) {
                 self.result_event_pending = false;
@@ -1271,13 +1408,29 @@ const Ui = struct {
             if (try self.processBackgroundResults()) |code| return code;
             self.processPreviewResults();
             try self.render();
-            const key = try readKey(self.terminal);
+            const wake_fd = if (self.lazy_backend) |backend| backend.ui_wake_fd else -1;
+            const key = try readKey(self.terminal, wake_fd);
             if (key != .unknown) self.last_activity_ms = monotonicMilliseconds(self.io);
             if (try self.handleKey(key)) |code| return code;
         }
     }
 
     fn refreshSearch(self: *Ui, force_all_for_auto: bool) !void {
+        if (self.lazy_backend) |backend| {
+            const size = self.terminal.size();
+            if (self.lazy_top_k == 0) self.lazy_top_k = @max(@as(usize, 128), size.rows * 4);
+            const effective = resolveEffectiveSearch(self.query.items, self.options.disabled, self.owned_search_override);
+            var search_options = self.options.*;
+            search_options.disabled = effective.disabled;
+            self.lazy_generation = try backend.submit(effective.query, &search_options, self.lazy_top_k);
+            // Counts belong to a search generation. Never render the previous
+            // generation's progress next to a newly edited query.
+            self.lazy_match_count = 0;
+            self.lazy_scanned_count = 0;
+            self.lazy_search_complete = false;
+            self.dirty_search = false;
+            return;
+        }
         const n = self.candidates.display.len;
         var track_key = self.pending_track_key;
         self.pending_track_key = null;
@@ -1331,7 +1484,23 @@ const Ui = struct {
         if (old_focus_idx != new_focus_idx) self.focus_event_pending = true;
     }
 
+    fn canGrowResults(self: *const Ui) bool {
+        if (self.lazy_backend != null) {
+            if (self.lazy_top_k == 0 or self.result_len < self.lazy_top_k) return false;
+            return !self.lazy_search_complete or self.lazy_match_count > self.result_len;
+        }
+        return self.result_len == self.result_cap and self.result_cap < self.candidates.display.len;
+    }
+
     fn growResults(self: *Ui) !void {
+        if (self.lazy_backend != null) {
+            if (!self.canGrowResults()) return;
+            const grown = @max(self.lazy_top_k +| 1, self.lazy_top_k *| 2);
+            self.lazy_top_k = @min(grown, @as(usize, std.math.maxInt(u32)));
+            self.dirty_search = true;
+            try self.refreshSearch(false);
+            return;
+        }
         if (self.result_cap >= self.candidates.display.len) return;
         self.result_cap = @min(self.candidates.display.len, @max(self.result_cap + 1, self.result_cap * 2));
         self.dirty_search = true;
@@ -1431,7 +1600,7 @@ const Ui = struct {
         if (rows == 0 or self.result_len == 0) return;
         const visible = @min(rows, self.result_len);
         const max_scroll = self.result_len - visible;
-        const scroll_off = @min(visible / 2, self.options.scroll_off);
+        const scroll_off = effectiveScrollOff(visible, self.options.scroll_off);
 
         // fzf first constrains the viewport so the current item is visible, then
         // reserves up to --scroll-off rows on each side unless a list boundary
@@ -1487,6 +1656,10 @@ const Ui = struct {
         for (self.options.expect.items) |expected| {
             if (keyMatchesName(key, expected)) {
                 self.accepted_key = expected;
+                if (lazyAcceptNeedsWait(self.lazy_backend != null, self.lazy_applied_generation, self.lazy_generation, self.result_len, self.selected_count, self.lazy_search_complete)) {
+                    self.lazy_pending_accept = true;
+                    return null;
+                }
                 if (self.result_len == 0 and self.selected_count == 0) return 1;
                 try self.emitSelection(expected);
                 return 0;
@@ -1511,6 +1684,10 @@ const Ui = struct {
             .byte => |b| switch (b) {
                 3, 7, 27 => return 130,
                 13 => {
+                    if (lazyAcceptNeedsWait(self.lazy_backend != null, self.lazy_applied_generation, self.lazy_generation, self.result_len, self.selected_count, self.lazy_search_complete)) {
+                        self.lazy_pending_accept = true;
+                        return null;
+                    }
                     if (self.result_len == 0 and self.selected_count == 0) return 1;
                     try self.emitSelection(self.accepted_key);
                     return 0;
@@ -1691,6 +1868,86 @@ const Ui = struct {
                     server.completeGet(waiter, response orelse try self.allocator.dupe(u8, "{\"error\":\"status\"}"));
                 },
             }
+        }
+        return null;
+    }
+
+    fn applyLazyResult(self: *Ui, result: *const LazyResult) !void {
+        // Compact-store pages never move while the backend is alive, so the UI
+        // can borrow the retained record text directly instead of copying and
+        // reparsing the top-K into a fresh blob for every progress publication.
+        var new_candidates = try candidatesFromLazyRanks(self.allocator, result.ranks);
+        errdefer new_candidates.deinit(self.allocator);
+        // LazyBackend owns matching over the compact store. The initial empty
+        // fuzzy index is intentionally left untouched; rebuilding an index for
+        // the transient display window on every partial only stalls the UI.
+        const n = new_candidates.display.len;
+        const next_focus = refreshLazyFocus(self.result_len, self.focus, self.lazy_focus_hint, n);
+        const new_results = try self.allocator.alloc(usize, n);
+        errdefer self.allocator.free(new_results);
+        for (new_results, 0..) |*slot, i| slot.* = i;
+
+        self.candidates.deinit(self.allocator);
+        self.allocator.free(self.results);
+        self.candidates.* = new_candidates;
+        self.results = new_results;
+        self.lazy_applied_generation = result.generation;
+        self.result_len = n;
+        self.match_len = n;
+        self.best_match_idx = if (n == 0) null else 0;
+        self.result_cap = n;
+        // Keep the cursor at the same logical result position while partial
+        // rankings evolve. A transient empty partial must not erase that row:
+        // save it as a hint and restore it when a later partial has results.
+        self.focus = next_focus.focus;
+        self.lazy_focus_hint = next_focus.hint;
+        if (n == 0) {
+            self.scroll = 0;
+        } else {
+            self.ensureVisible();
+        }
+        self.dirty_search = false;
+        self.preview_cache_key = null;
+    }
+
+    fn processLazyResults(self: *Ui) !?u8 {
+        const backend = self.lazy_backend orelse return null;
+        var newest: ?*LazyResult = null;
+        while (backend.takeResult()) |result| {
+            if (result.generation != self.lazy_generation) {
+                result.deinit();
+                continue;
+            }
+            if (newest) |old| old.deinit();
+            newest = result;
+        }
+        const result = newest orelse return null;
+        defer result.deinit();
+        try self.applyLazyResult(result);
+        self.lazy_total_count = result.total_count;
+        self.lazy_match_count = result.match_count;
+        self.lazy_scanned_count = result.scanned_count;
+        const became_finished = result.input_finished and !self.lazy_input_finished;
+        self.lazy_input_finished = result.input_finished;
+        self.lazy_search_complete = result.search_complete;
+        self.result_event_pending = true;
+        self.zero_event_pending = result.search_complete and result.match_count == 0;
+        self.one_event_pending = result.search_complete and result.match_count == 1;
+        self.result_final_event_pending = result.search_complete;
+        if (became_finished) self.load_event_pending = true;
+        if (self.lazy_pending_accept and (self.result_len != 0 or result.search_complete)) {
+            self.lazy_pending_accept = false;
+            if (self.result_len == 0 and self.selected_count == 0) return 1;
+            try self.emitSelection(self.accepted_key);
+            return 0;
+        }
+        if (result.search_complete) {
+            if (self.options.select_1 and result.match_count == 1 and self.result_len == 1) {
+                self.focusCandidate(self.results[0]);
+                try self.emitSelection(null);
+                return 0;
+            }
+            if (self.options.exit_0 and result.match_count == 0) return 1;
         }
         return null;
     }
@@ -2691,11 +2948,11 @@ const Ui = struct {
     fn handleMouse(self: *Ui, m: Mouse) !void {
         if (m.release) return;
         if (m.button == 64) {
-            self.move(-3);
+            self.moveVisual(-3);
             return;
         }
         if (m.button == 65) {
-            self.move(3);
+            self.moveVisual(3);
             return;
         }
         if (m.button != 0) return;
@@ -2755,9 +3012,7 @@ const Ui = struct {
         } else {
             const amount: usize = @intCast(delta);
             if (self.focus + amount >= self.result_len) {
-                if (self.result_len == self.result_cap and self.result_cap < self.candidates.display.len) {
-                    self.growResults() catch {};
-                }
+                if (self.canGrowResults()) self.growResults() catch {};
                 self.focus = if (self.options.cycle) 0 else self.result_len - 1;
             } else self.focus += amount;
         }
@@ -2867,7 +3122,7 @@ const Ui = struct {
 
         if (delta > 0) {
             const amount: usize = @intCast(delta);
-            if (self.scroll +| amount > max_scroll and self.result_len == self.result_cap and self.result_cap < self.candidates.display.len) {
+            if (self.scroll +| amount > max_scroll and self.canGrowResults()) {
                 self.growResults() catch {};
                 visible = @min(rows, self.result_len);
                 max_scroll = self.result_len - visible;
@@ -2875,7 +3130,7 @@ const Ui = struct {
             const target_scroll = @min(max_scroll, self.scroll +| amount);
             if (target_scroll == self.scroll) return;
             self.scroll = target_scroll;
-            const scroll_off = @min(visible / 2, self.options.scroll_off);
+            const scroll_off = effectiveScrollOff(visible, self.options.scroll_off);
             if (self.focus < self.scroll + scroll_off) {
                 self.focus = @min(self.result_len - 1, self.focus +| amount);
             }
@@ -2884,7 +3139,7 @@ const Ui = struct {
             const target_scroll = self.scroll -| amount;
             if (target_scroll == self.scroll) return;
             self.scroll = target_scroll;
-            const scroll_off = @min(visible / 2, self.options.scroll_off);
+            const scroll_off = effectiveScrollOff(visible, self.options.scroll_off);
             const high_margin = self.scroll + visible - 1 - scroll_off;
             if (self.focus > high_margin) self.focus -|= amount;
         }
@@ -3315,28 +3570,50 @@ const Ui = struct {
     fn render(self: *Ui) !void {
         const size = self.terminal.size();
         const geom = self.paneGeometry(size);
+        const content = self.contentPane(geom.main);
+        const geometry_key = RenderGeometryKey{
+            .rows = size.rows,
+            .cols = size.cols,
+            .main = geom.main,
+            .content = content,
+            .preview = geom.preview,
+            .border = self.options.border,
+            .border_style = self.options.border_style,
+            .preview_border_style = self.options.preview.border_style,
+        };
+        const previous_geometry = self.last_render_geometry;
+        const geometry_changed = if (previous_geometry) |old| !std.meta.eql(old, geometry_key) else false;
+        if (geometry_changed) {
+            if (self.terminal.inline_mode) {
+                var cleanup: Io.Writer.Allocating = .init(self.allocator);
+                defer cleanup.deinit();
+                const old_rows = previous_geometry.?.rows;
+                var clear_row: usize = 1;
+                while (clear_row <= @max(old_rows, size.rows)) : (clear_row += 1) {
+                    try cursorTo(&cleanup.writer, clear_row, 1, true);
+                    try cleanup.writer.writeAll("\x1b[2K");
+                }
+                try self.terminal.write(cleanup.written());
+            } else {
+                try self.terminal.write("\x1b[H\x1b[2J");
+            }
+        }
+        self.last_render_geometry = geometry_key;
+
         var frame: Io.Writer.Allocating = .init(self.allocator);
         defer frame.deinit();
         const w = &frame.writer;
         // Synchronized output keeps a multi-row redraw from becoming visible
         // half-written on terminals that implement DEC mode 2026. Unsupported
-        // terminals simply ignore the private mode.
+        // terminals simply ignore the private mode. Do not clear the whole
+        // screen on every frame: each rendered row erases only its own pane
+        // cells before overwriting them, avoiding a visible blank-frame flash.
         try w.writeAll("\x1b[?2026h");
-        if (self.terminal.inline_mode) {
-            var clear_row: usize = 1;
-            while (clear_row <= size.rows) : (clear_row += 1) {
-                try cursorTo(w, clear_row, 1, true);
-                try w.writeAll("\x1b[2K");
-            }
-        } else {
-            try w.writeAll("\x1b[H\x1b[2J");
-        }
 
         if (self.options.border) {
             try drawPaneBorder(w, geom.main, self.terminal.inline_mode, self.options.border_style, self.options.theme.border, self.options.theme.enabled, self.options.bold);
             if (self.options.border_label) |label| try drawBorderLabel(w, geom.main, self.terminal.inline_mode, self.options.border_style, label, self.options.border_label_pos, self.options.theme.border, self.options.theme.enabled, self.options.bold);
         }
-        const content = self.contentPane(geom.main);
         var row = content.row;
         if (self.options.layout == .reverse) {
             if (self.options.header_first) row = try self.renderHeaderBlock(w, row, content);
@@ -3349,10 +3626,10 @@ const Ui = struct {
                 row += 1;
             }
             if (!self.options.header_first) row = try self.renderHeaderBlock(w, row, content);
-            row = try self.renderList(w, row, content, true);
+            row = try self.renderListCached(w, row, content, true, geometry_changed);
             if (self.options.footer) |f| try self.renderPlainLine(w, row, content.col, f, content.cols, self.options.theme.footer);
         } else {
-            row = try self.renderList(w, row, content, false);
+            row = try self.renderListCached(w, row, content, false, geometry_changed);
             row = try self.renderHeaderBlock(w, row, content);
             if (self.options.info_style == .default or self.options.info_style == .right) {
                 try self.renderInfo(w, row, content.col, content.cols);
@@ -3372,14 +3649,38 @@ const Ui = struct {
 
         try w.writeAll("\x1b[?2026l");
         const rendered = frame.written();
-        if (std.mem.eql(u8, rendered, self.last_frame)) return;
+        if (!geometry_changed and std.mem.eql(u8, rendered, self.last_frame)) return;
         const cached = try self.allocator.dupe(u8, rendered);
         if (self.last_frame.len != 0) self.allocator.free(self.last_frame);
         self.last_frame = cached;
         try self.terminal.write(rendered);
     }
 
+    fn totalCandidateCount(self: *const Ui) usize {
+        if (self.lazy_backend) |backend| return backend.store.count();
+        return self.candidates.display.len;
+    }
+
+    fn reportedMatchCount(self: *const Ui) usize {
+        if (self.lazy_backend != null) {
+            const effective = resolveEffectiveSearch(self.query.items, self.options.disabled, self.owned_search_override);
+            if (effective.disabled or effective.query.len == 0) return self.totalCandidateCount();
+            return self.lazy_match_count;
+        }
+        return self.match_len;
+    }
+
     fn statusText(self: *Ui) ![]u8 {
+        if (self.lazy_backend != null) {
+            const total = self.totalCandidateCount();
+            const matches = self.reportedMatchCount();
+            if (self.lazy_search_complete and self.lazy_input_finished) {
+                if (self.options.multi) return try std.fmt.allocPrint(self.allocator, "{d}/{d} ({d})", .{ matches, total, self.selected_count });
+                return try std.fmt.allocPrint(self.allocator, "{d}/{d}", .{ matches, total });
+            }
+            if (self.options.multi) return try std.fmt.allocPrint(self.allocator, "{d}/{d} [{d} scanned] ({d})", .{ matches, total, self.lazy_scanned_count, self.selected_count });
+            return try std.fmt.allocPrint(self.allocator, "{d}/{d} [{d} scanned]", .{ matches, total, self.lazy_scanned_count });
+        }
         if (self.match_len == self.result_cap and self.result_cap < self.candidates.display.len) {
             if (self.options.multi) return try std.fmt.allocPrint(self.allocator, "{d}+/{d} ({d})", .{ self.match_len, self.candidates.display.len, self.selected_count });
             return try std.fmt.allocPrint(self.allocator, "{d}+/{d}", .{ self.match_len, self.candidates.display.len });
@@ -3392,6 +3693,7 @@ const Ui = struct {
         if (self.options.info_style == .hidden or self.options.info_style == .inline_left or self.options.info_style == .inline_right) return;
         const status = try self.statusText();
         defer self.allocator.free(status);
+        try prepareRenderRow(w, row, col, cols, self.terminal.inline_mode);
         try writeRoleStyle(w, self.options.theme.info, self.options.theme.enabled, self.options.bold);
         if (self.options.info_style == .right) {
             const offset = if (cols > status.len) cols - status.len else 0;
@@ -3415,7 +3717,7 @@ const Ui = struct {
     }
 
     fn renderPrompt(self: *Ui, w: anytype, row: usize, col: usize, cols: usize) !void {
-        try cursorTo(w, row, col, self.terminal.inline_mode);
+        try prepareRenderRow(w, row, col, cols, self.terminal.inline_mode);
         try writeRoleStyle(w, self.options.theme.prompt, self.options.theme.enabled, self.options.bold);
         try w.writeAll(self.options.prompt);
         try writeReset(w);
@@ -3454,10 +3756,25 @@ const Ui = struct {
     }
 
     fn renderPlainLine(self: *Ui, w: anytype, row: usize, col: usize, text: []const u8, cols: usize, style: RoleStyle) !void {
-        try cursorTo(w, row, col, self.terminal.inline_mode);
+        try prepareRenderRow(w, row, col, cols, self.terminal.inline_mode);
         try writeRoleStyle(w, style, self.options.theme.enabled, self.options.bold);
         try writeTruncated(w, text, cols, false, "");
         try writeReset(w);
+    }
+
+    fn renderListCached(self: *Ui, w: anytype, start_row: usize, content: Pane, top_down: bool, force: bool) !usize {
+        if (self.lazy_backend == null) return self.renderList(w, start_row, content, top_down);
+        var section: Io.Writer.Allocating = .init(self.allocator);
+        defer section.deinit();
+        const end_row = try self.renderList(&section.writer, start_row, content, top_down);
+        const rendered = section.written();
+        if (force or !std.mem.eql(u8, rendered, self.last_list_frame)) {
+            try w.writeAll(rendered);
+            const cached = try self.allocator.dupe(u8, rendered);
+            if (self.last_list_frame.len != 0) self.allocator.free(self.last_list_frame);
+            self.last_list_frame = cached;
+        }
+        return end_row;
     }
 
     fn renderList(self: *Ui, w: anytype, start_row: usize, content: Pane, top_down: bool) !usize {
@@ -3466,12 +3783,12 @@ const Ui = struct {
         while (line < rows) : (line += 1) {
             const row = start_row + line;
             if (row >= content.row + content.rows) break;
-            try cursorTo(w, row, content.col, self.terminal.inline_mode);
+            try prepareRenderRow(w, row, content.col, content.cols, self.terminal.inline_mode);
             const logical = if (top_down) self.scroll + line else self.scroll + (rows - 1 - line);
             if (logical >= self.result_len) continue;
             const idx = self.results[logical];
             const focused = logical == self.focus;
-            const marked = self.selected[idx];
+            const marked = self.options.multi and self.selected[idx];
             const dimmed = self.options.raw and !self.match_flags[idx];
             try writeRoleStyle(w, if (focused) self.options.theme.current else self.options.theme.normal, self.options.theme.enabled, self.options.bold);
             if (dimmed and self.options.theme.enabled) try w.writeAll("\x1b[2m");
@@ -3567,12 +3884,24 @@ const Ui = struct {
         while (skipped < self.preview_offset and lines.next() != null) : (skipped += 1) {}
         var row: usize = 0;
         while (row < content.rows) : (row += 1) {
-            const line = lines.next() orelse break;
-            try cursorTo(w, content.row + row, content.col, self.terminal.inline_mode);
+            try prepareRenderRow(w, content.row + row, content.col, content.cols, self.terminal.inline_mode);
+            const line = lines.next() orelse continue;
             try writeTruncated(w, line, content.cols, self.options.preview.wrap, "");
         }
     }
 };
+
+fn eraseRenderCells(w: anytype, cols: usize) !void {
+    if (cols == 0) return;
+    // ECH erases in place without moving the cursor. Restricting the erase
+    // to the pane width preserves borders and avoids full-screen flashes.
+    try w.print("\x1b[{d}X", .{cols});
+}
+
+fn prepareRenderRow(w: anytype, row: usize, col: usize, cols: usize, inline_mode: bool) !void {
+    try cursorTo(w, row, col, inline_mode);
+    try eraseRenderCells(w, cols);
+}
 
 fn cursorTo(w: anytype, row: usize, col: usize, inline_mode: bool) !void {
     if (!inline_mode) {
@@ -3928,6 +4257,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(allocator);
     var options: Options = .{};
+    defer options.deinit(allocator);
     if (init.environ_map.get("NO_COLOR") != null) options.theme.enabled = false;
     var file_default_args: ?[][]const u8 = null;
     defer if (file_default_args) |parsed| freeShellArgs(allocator, parsed);
@@ -3946,7 +4276,6 @@ pub fn main(init: std.process.Init) !void {
         try parseOptionsInto(allocator, init.io, &options, env_default_args.?, 0);
     }
     try parseOptionsInto(allocator, init.io, &options, args, 1);
-    defer options.deinit(allocator);
 
     var fallback_temp_dir: ?[:0]u8 = null;
     defer if (fallback_temp_dir) |path| allocator.free(path);
@@ -3965,7 +4294,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (hasArg(args, "--version")) {
-        try Io.File.stdout().writeStreamingAll(init.io, "zfuzz 0.2.0\n");
+        try Io.File.stdout().writeStreamingAll(init.io, "zfuzz 0.3.0\n");
         return;
     }
     if (hasArg(args, "--bash")) {
@@ -4006,14 +4335,18 @@ pub fn main(init: std.process.Init) !void {
     defer if (terminal_opt) |*terminal| terminal.close(init.io);
 
     const stdin_is_tty = Io.File.stdin().isTty(init.io) catch false;
-    const live_stdin = builtin.os.tag != .windows and terminal_opt != null and !stdin_is_tty and !options.sync;
+    const use_lazy = terminal_opt != null and options.filter == null and lazyInteractiveEligible(&options);
+    const live_stdin = !use_lazy and builtin.os.tag != .windows and terminal_opt != null and !stdin_is_tty and !options.sync;
     var stream_input: ?StreamInput = if (live_stdin)
         StreamInput.init(allocator, if (options.read0) 0 else '\n', options.tail, options.header_lines)
     else
         null;
     defer if (stream_input) |*stream| stream.deinit();
 
-    var candidates = if (stream_input) |*stream| blk: {
+    var candidates = if (use_lazy) blk: {
+        const blob = try allocator.alloc(u8, 0);
+        break :blk try candidatesFromOwnedBlob(allocator, blob, &options);
+    } else if (stream_input) |*stream| blk: {
         _ = try stream.readAvailable();
         const blob = try stream.materializeBlob();
         break :blk try candidatesFromOwnedBlob(allocator, blob, &options);
@@ -4034,7 +4367,16 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
 
-    var ui = try Ui.init(allocator, init.io, &options, &candidates, &index, terminal, if (stream_input) |*stream| stream else null, server, &child_env);
+    var lazy_backend: ?*LazyBackend = null;
+    defer if (lazy_backend) |backend| backend.destroy();
+    if (use_lazy) {
+        const backend = try LazyBackend.create(allocator, init.io);
+        errdefer backend.destroy();
+        try backend.startSource(&options, stdin_is_tty, init.environ_map.get("FZF_DEFAULT_COMMAND"));
+        lazy_backend = backend;
+    }
+
+    var ui = try Ui.init(allocator, init.io, &options, &candidates, &index, terminal, if (stream_input) |*stream| stream else null, server, &child_env, lazy_backend);
     defer ui.deinit();
     const code = try ui.run();
     if (code != 0) {
@@ -4136,6 +4478,7 @@ fn firstLine(value: []const u8) []const u8 {
 
 fn parseOptions(allocator: Allocator, args: []const []const u8) !Options {
     var o: Options = .{};
+    errdefer o.deinit(allocator);
     try parseOptionsInto(allocator, std.testing.io, &o, args, 1);
     return o;
 }
@@ -5753,6 +6096,198 @@ fn runWalker(allocator: Allocator, io: Io, options: *const Options) ![]u8 {
     return try out.toOwnedSlice(allocator);
 }
 
+fn lazySourceNotifyAfterPush(backend: *LazyBackend, since_notify: *usize) void {
+    since_notify.* += 1;
+    const count = backend.store.count();
+    if ((count <= 4096 and since_notify.* >= 128) or since_notify.* >= 4096) {
+        since_notify.* = 0;
+        backend.notifyData();
+    }
+}
+
+fn lazyWalkerAppendPath(
+    backend: *LazyBackend,
+    root: []const u8,
+    relative: []const u8,
+    is_dir: bool,
+    since_notify: *usize,
+) !void {
+    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = walkerLogicalPath(root, relative, buf[0..std.fs.max_path_bytes]) orelse return error.NameTooLong;
+    var len = path.len;
+    if (is_dir and (len == 0 or !std.fs.path.isSep(path[len - 1]))) {
+        if (len == buf.len) return error.NameTooLong;
+        buf[len] = std.fs.path.sep;
+        len += 1;
+    }
+    _ = try backend.store.append(buf[0..len]);
+    lazySourceNotifyAfterPush(backend, since_notify);
+}
+
+fn lazyWalkNativeDir(
+    allocator: Allocator,
+    io: Io,
+    backend: *LazyBackend,
+    options: *const Options,
+    root_label: []const u8,
+    root_real: []const u8,
+    dir: Io.Dir,
+    relative: *std.ArrayList(u8),
+    ancestors: *std.ArrayList(Io.File.INode),
+    since_notify: *usize,
+) !void {
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (backend.stop.load(.acquire)) return error.Canceled;
+        const old_len = relative.items.len;
+        defer relative.shrinkRetainingCapacity(old_len);
+        if (old_len != 0) try relative.append(allocator, std.fs.path.sep);
+        try relative.appendSlice(allocator, entry.name);
+
+        const is_symlink = entry.kind == .sym_link;
+        var kind = entry.kind;
+        var is_dir_symlink = false;
+        if (is_symlink) {
+            const followed = dir.statFile(io, entry.name, .{ .follow_symlinks = true }) catch null;
+            is_dir_symlink = if (followed) |stat| stat.kind == .directory else false;
+            if (is_dir_symlink) {
+                if (!options.walker.follow) continue;
+                var target_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const target_len = dir.realPathFile(io, entry.name, &target_buf) catch continue;
+                if (walkerSymlinkTargetIsRootAncestor(root_real, target_buf[0..target_len])) continue;
+                kind = .directory;
+            } else {
+                kind = .file;
+            }
+        } else if (kind == .unknown) {
+            const stat = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch continue;
+            kind = stat.kind;
+        }
+
+        if (kind == .directory) {
+            if (walkerDirSkipped(options, root_label, relative.items, entry.name)) continue;
+            if (options.walker.dir) try lazyWalkerAppendPath(backend, root_label, relative.items, true, since_notify);
+            var child = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+            defer child.close(io);
+            const child_stat = child.stat(io) catch continue;
+            if (walkerAncestorContains(ancestors.items, child_stat.inode)) continue;
+            try ancestors.append(allocator, child_stat.inode);
+            defer _ = ancestors.pop();
+            try lazyWalkNativeDir(allocator, io, backend, options, root_label, root_real, child, relative, ancestors, since_notify);
+        } else if (kind == .file and options.walker.file) {
+            try lazyWalkerAppendPath(backend, root_label, relative.items, false, since_notify);
+        }
+    }
+}
+
+fn lazyRunWalkerRoot(backend: *LazyBackend, options: *const Options, root_path: []const u8, explicit: bool, since_notify: *usize) !void {
+    const label = walkerTrimRoot(root_path);
+    if (explicit and !std.mem.eql(u8, label, ".")) {
+        const basename = std.fs.path.basename(label);
+        if (walkerDirSkipped(options, ".", label, basename)) return;
+        if (options.walker.dir) try lazyWalkerAppendPath(backend, ".", label, true, since_notify);
+    }
+    var root = try Io.Dir.cwd().openDir(backend.io, root_path, .{ .iterate = true });
+    defer root.close(backend.io);
+    var relative: std.ArrayList(u8) = .empty;
+    defer relative.deinit(backend.allocator);
+    var ancestors: std.ArrayList(Io.File.INode) = .empty;
+    defer ancestors.deinit(backend.allocator);
+    var root_real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_real_len = try root.realPath(backend.io, &root_real_buf);
+    const root_real = root_real_buf[0..root_real_len];
+    const root_stat = try root.stat(backend.io);
+    try ancestors.append(backend.allocator, root_stat.inode);
+    try lazyWalkNativeDir(backend.allocator, backend.io, backend, options, root_path, root_real, root, &relative, &ancestors, since_notify);
+}
+
+fn lazyRunWalker(backend: *LazyBackend, options: *const Options) !void {
+    if (!options.walker.file and !options.walker.dir) return;
+    var since_notify: usize = 0;
+    if (options.walker_roots.items.len == 0) {
+        try lazyRunWalkerRoot(backend, options, ".", false, &since_notify);
+    } else {
+        for (options.walker_roots.items) |root_path| try lazyRunWalkerRoot(backend, options, root_path, true, &since_notify);
+    }
+    if (since_notify != 0) backend.notifyData();
+}
+
+fn lazyPushDelimitedRecord(backend: *LazyBackend, record: []const u8, delim: u8, since_notify: *usize) !void {
+    var line = record;
+    if (delim == '\n' and line.len != 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+    _ = try backend.store.appendClassified(line);
+    lazySourceNotifyAfterPush(backend, since_notify);
+}
+
+fn lazyFeedFd(backend: *LazyBackend, fd: std.posix.fd_t, delim: u8) !void {
+    var buffer: [128 * 1024]u8 = undefined;
+    var partial: std.ArrayList(u8) = .empty;
+    defer partial.deinit(backend.allocator);
+    var since_notify: usize = 0;
+    while (!backend.stop.load(.acquire)) {
+        const rc = std.c.read(fd, &buffer, buffer.len);
+        if (rc < 0) {
+            const e = std.c._errno().*;
+            if (e == @intFromEnum(std.posix.E.INTR)) continue;
+            return error.ReadFailed;
+        }
+        if (rc == 0) break;
+        const n: usize = @intCast(rc);
+        // Classify the source buffer once, before publishing any record from it.
+        // All records and partial records assembled from observed chunks are then
+        // safe to append without rescanning each short candidate.
+        backend.store.observeBytes(buffer[0..n]);
+        var at: usize = 0;
+        while (at < n) {
+            const pos = std.mem.indexOfScalarPos(u8, buffer[0..n], at, delim) orelse {
+                try partial.appendSlice(backend.allocator, buffer[at..n]);
+                break;
+            };
+            if (partial.items.len == 0) {
+                try lazyPushDelimitedRecord(backend, buffer[at..pos], delim, &since_notify);
+            } else {
+                try partial.appendSlice(backend.allocator, buffer[at..pos]);
+                try lazyPushDelimitedRecord(backend, partial.items, delim, &since_notify);
+                partial.clearRetainingCapacity();
+            }
+            at = pos + 1;
+        }
+    }
+    if (partial.items.len != 0 and !backend.stop.load(.acquire)) try lazyPushDelimitedRecord(backend, partial.items, delim, &since_notify);
+    if (since_notify != 0) backend.notifyData();
+}
+
+fn lazyRunCommandSource(backend: *LazyBackend, command: []const u8, delim: u8) !void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.UnsupportedTerminal;
+    var child = try std.process.spawn(backend.io, .{
+        .argv = &.{ "/bin/sh", "-c", command },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    defer child.kill(backend.io);
+    const pgid: i64 = @intCast(child.id.?);
+    backend.source_child_pgid.store(pgid, .release);
+    defer backend.source_child_pgid.store(0, .release);
+    try lazyFeedFd(backend, child.stdout.?.handle, delim);
+    _ = try child.wait(backend.io);
+}
+
+fn lazySourceThread(backend: *LazyBackend) void {
+    defer backend.finishInput();
+    const options = backend.source_options orelse return;
+    const delim: u8 = if (options.read0) 0 else '\n';
+    switch (backend.source_kind) {
+        .stdin => if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+            lazyFeedFd(backend, std.posix.STDIN_FILENO, delim) catch {};
+        },
+        .walker => lazyRunWalker(backend, options) catch {},
+        .command => if (backend.source_command) |command| lazyRunCommandSource(backend, command, delim) catch {},
+        .none => {},
+    }
+}
+
 fn runDefaultCommand(allocator: Allocator, io: Io, command: []const u8, windows_shell: ?[]const u8) ![]u8 {
     const result = if (comptime builtin.os.tag == .windows)
         try runProcessStdout(allocator, io, &.{ windows_shell orelse "cmd.exe", "/d", "/s", "/c", command })
@@ -5763,6 +6298,24 @@ fn runDefaultCommand(allocator: Allocator, io: Io, command: []const u8, windows_
 
 fn filterUsesStreamingPath(options: *const Options) bool {
     return options.filter != null and options.no_sort and !options.tac and !options.sync;
+}
+
+fn lazyInteractiveEligible(options: *const Options) bool {
+    // Keep whole-corpus transformation/state modes on the mature synchronous
+    // path until their incremental equivalents are implemented. The normal
+    // interactive search path must never materialize or index the full input.
+    return !options.sync and
+        options.tail == null and
+        options.header_lines == 0 and
+        options.nth == null and
+        options.with_nth == null and
+        !options.ansi and
+        !options.tac and
+        !options.multi and
+        !options.raw and
+        !options.track and
+        options.listen_addr == null and
+        options.bindings.items.len == 0;
 }
 
 fn readCandidates(allocator: Allocator, io: Io, options: *const Options, default_command: ?[]const u8, windows_shell: ?[]const u8) !CandidateSet {
@@ -6408,6 +6961,1176 @@ fn scoreTerm(index: *fuzzy.Index, term: QueryTerm, line: []const u8, entry_index
     };
 }
 
+const RawTermPlan = struct {
+    term: QueryTerm,
+    sensitive: bool,
+    normalize: bool,
+    has_non_ascii: bool,
+    valid_utf8: bool,
+};
+
+const RawQueryPlan = struct {
+    parsed: ParsedQuery,
+    terms: []const RawTermPlan,
+    cli_scheme: fuzzy_engine.CliScheme,
+    algorithm: Algorithm,
+    simple_positive: bool,
+    query_has_valid_non_ascii: bool,
+    ascii_fuzzy_needs_scratch: bool,
+    max_term_bytes: usize,
+};
+
+fn prepareRawQuery(
+    parsed: ParsedQuery,
+    mode: CaseMode,
+    normalize_enabled: bool,
+    scheme: Scheme,
+    algorithm: Algorithm,
+    storage: *[512]RawTermPlan,
+) RawQueryPlan {
+    var query_has_valid_non_ascii = false;
+    var ascii_fuzzy_needs_scratch = false;
+    var max_term_bytes: usize = 0;
+    for (parsed.terms, 0..) |term, i| {
+        max_term_bytes = @max(max_term_bytes, term.text.len);
+        const has_non_ascii = fuzzy_engine.cliTextHasNonAscii(term.text);
+        const valid_utf8 = std.unicode.utf8ValidateSlice(term.text);
+        storage[i] = .{
+            .term = term,
+            .sensitive = termCaseSensitive(mode, term.text),
+            .normalize = fuzzy_engine.cliNormalizeTerm(term.text, normalize_enabled),
+            .has_non_ascii = has_non_ascii,
+            .valid_utf8 = valid_utf8,
+        };
+        query_has_valid_non_ascii = query_has_valid_non_ascii or (has_non_ascii and valid_utf8);
+        ascii_fuzzy_needs_scratch = ascii_fuzzy_needs_scratch or
+            (term.kind == .fuzzy and algorithm != .v1 and term.text.len > 6 and term.text.len <= 1000);
+    }
+    return .{
+        .parsed = parsed,
+        .terms = storage[0..parsed.terms.len],
+        .cli_scheme = switch (scheme) {
+            .default => .default,
+            .path => .path,
+            .history => .history,
+        },
+        .algorithm = algorithm,
+        .simple_positive = parsed.terms.len == 1 and parsed.clause_count == 1 and !parsed.terms[0].inverse,
+        .query_has_valid_non_ascii = query_has_valid_non_ascii,
+        .ascii_fuzzy_needs_scratch = ascii_fuzzy_needs_scratch,
+        .max_term_bytes = max_term_bytes,
+    };
+}
+
+fn scoreSimplePositiveCandidateRaw(
+    scratch: *fuzzy_engine.CliScratch,
+    plan: RawQueryPlan,
+    line: []const u8,
+) std.mem.Allocator.Error!?CandidateScore {
+    const line_has_non_ascii = fuzzy_engine.cliTextHasNonAscii(line);
+    const line_valid_utf8 = !line_has_non_ascii or std.unicode.utf8ValidateSlice(line);
+    if (line_has_non_ascii or plan.query_has_valid_non_ascii or plan.ascii_fuzzy_needs_scratch)
+        try scratch.ensure(@max(line.len, plan.max_term_bytes));
+
+    const term_plan = plan.terms[0];
+    // The overwhelmingly common lazy query is one positive ASCII fuzzy term.
+    // For an ASCII candidate this can go straight to the raw V2/heuristic
+    // scorer; the generic dispatcher otherwise carries every Unicode and
+    // exact-mode branch in one large function. Preserve the generic path for
+    // non-ASCII/invalid-UTF8 candidates and V1 exactly as before.
+    const matched: fuzzy_engine.CliMatch = if (!line_has_non_ascii and !term_plan.has_non_ascii and term_plan.term.kind == .fuzzy and plan.algorithm != .v1)
+        (fuzzy_engine.matchFuzzyRawForCliScheme(scratch, term_plan.term.text, line, term_plan.sensitive, plan.cli_scheme) orelse return null)
+    else
+        (scoreTermRaw(scratch, term_plan, line, line_has_non_ascii, line_valid_utf8, plan.cli_scheme, plan.algorithm) orelse return null);
+    var total: CandidateScore = .{ .rune_offsets = line_has_non_ascii and line_valid_utf8 };
+    total.add(matched);
+    return total;
+}
+
+fn scoreSimplePositiveCandidateRawKnownAscii(
+    scratch: *fuzzy_engine.CliScratch,
+    plan: RawQueryPlan,
+    line: []const u8,
+) std.mem.Allocator.Error!?CandidateScore {
+    const term_plan = plan.terms[0];
+    if (plan.query_has_valid_non_ascii or plan.ascii_fuzzy_needs_scratch)
+        try scratch.ensure(@max(line.len, plan.max_term_bytes));
+    const matched: fuzzy_engine.CliMatch = if (!term_plan.has_non_ascii and term_plan.term.kind == .fuzzy and plan.algorithm != .v1)
+        (fuzzy_engine.matchFuzzyRawForCliScheme(scratch, term_plan.term.text, line, term_plan.sensitive, plan.cli_scheme) orelse return null)
+    else
+        (scoreTermRaw(scratch, term_plan, line, false, true, plan.cli_scheme, plan.algorithm) orelse return null);
+    var total: CandidateScore = .{};
+    total.add(matched);
+    return total;
+}
+
+fn scoreParsedCandidateRaw(
+    scratch: *fuzzy_engine.CliScratch,
+    plan: RawQueryPlan,
+    line: []const u8,
+) std.mem.Allocator.Error!?CandidateScore {
+    if (plan.terms.len == 0) return .{};
+    if (plan.simple_positive) return scoreSimplePositiveCandidateRaw(scratch, plan, line);
+    const line_has_non_ascii = fuzzy_engine.cliTextHasNonAscii(line);
+    const line_valid_utf8 = !line_has_non_ascii or std.unicode.utf8ValidateSlice(line);
+    if (line_has_non_ascii or plan.query_has_valid_non_ascii or plan.ascii_fuzzy_needs_scratch)
+        try scratch.ensure(@max(line.len, plan.max_term_bytes));
+
+    var total: CandidateScore = .{ .rune_offsets = line_has_non_ascii and line_valid_utf8 };
+
+    var clause: usize = 0;
+    while (clause < plan.parsed.clause_count) : (clause += 1) {
+        var matched = false;
+        var contribution: ?fuzzy_engine.CliMatch = null;
+        for (plan.terms) |term_plan| {
+            const term = term_plan.term;
+            if (term.clause != clause) continue;
+            const term_match = scoreTermRaw(scratch, term_plan, line, line_has_non_ascii, line_valid_utf8, plan.cli_scheme, plan.algorithm);
+            if (term_match) |value| {
+                if (term.inverse) continue;
+                contribution = value;
+                matched = true;
+                break;
+            } else if (term.inverse) {
+                contribution = null;
+                matched = true;
+                continue;
+            }
+        }
+        if (!matched) return null;
+        if (contribution) |value| total.add(value);
+    }
+    return total;
+}
+
+fn scoreTermRaw(
+    scratch: *fuzzy_engine.CliScratch,
+    plan: RawTermPlan,
+    line: []const u8,
+    line_has_non_ascii: bool,
+    line_valid_utf8: bool,
+    cli_scheme: fuzzy_engine.CliScheme,
+    algorithm: Algorithm,
+) ?fuzzy_engine.CliMatch {
+    const term = plan.term;
+    const unicode_path = (plan.has_non_ascii or line_has_non_ascii) and plan.valid_utf8 and line_valid_utf8;
+    if (unicode_path) return switch (term.kind) {
+        .fuzzy => if (algorithm == .v1)
+            fuzzy_engine.matchFuzzyUnicodeV1RawForCliScheme(scratch, term.text, line, plan.sensitive, plan.normalize, cli_scheme)
+        else
+            fuzzy_engine.matchFuzzyUnicodeRawForCliScheme(scratch, term.text, line, plan.sensitive, plan.normalize, cli_scheme),
+        .exact => fuzzy_engine.scoreExactUnicodeRawForCliScheme(scratch, term.text, line, plan.sensitive, plan.normalize, false, cli_scheme),
+        .boundary_exact => fuzzy_engine.scoreExactUnicodeRawForCliScheme(scratch, term.text, line, plan.sensitive, plan.normalize, true, cli_scheme),
+        .prefix => fuzzy_engine.scorePrefixUnicodeRawForCliScheme(scratch, term.text, line, plan.sensitive, plan.normalize, cli_scheme),
+        .suffix => fuzzy_engine.scoreSuffixUnicodeRawForCliScheme(scratch, term.text, line, plan.sensitive, plan.normalize, cli_scheme),
+        .equal => fuzzy_engine.scoreEqualUnicodeRawForCliScheme(scratch, term.text, line, plan.sensitive, plan.normalize, cli_scheme),
+    };
+    return switch (term.kind) {
+        .fuzzy => if (algorithm == .v1)
+            fuzzy_engine.matchFuzzyV1RawForCliScheme(term.text, line, plan.sensitive, cli_scheme)
+        else
+            fuzzy_engine.matchFuzzyRawForCliScheme(scratch, term.text, line, plan.sensitive, cli_scheme),
+        .exact => fuzzy_engine.scoreExactRawForCliScheme(term.text, line, plan.sensitive, false, cli_scheme),
+        .boundary_exact => fuzzy_engine.scoreExactRawForCliScheme(term.text, line, plan.sensitive, true, cli_scheme),
+        .prefix => fuzzy_engine.scorePrefixRawForCliScheme(term.text, line, plan.sensitive, cli_scheme),
+        .suffix => fuzzy_engine.scoreSuffixRawForCliScheme(term.text, line, plan.sensitive, cli_scheme),
+        .equal => fuzzy_engine.scoreEqualRawForCliScheme(term.text, line, plan.sensitive, cli_scheme),
+    };
+}
+
+const LazySearchConfig = struct {
+    extended: bool,
+    exact: bool,
+    case_mode: CaseMode,
+    literal: bool,
+    scheme: Scheme,
+    algorithm: Algorithm,
+    no_sort: bool,
+    tiebreaks: [3]TieBreak,
+    tiebreak_count: u2,
+    disabled: bool,
+
+    fn fromOptions(options: *const Options) LazySearchConfig {
+        return .{
+            .extended = options.extended,
+            .exact = options.exact,
+            .case_mode = options.case_mode,
+            .literal = options.literal,
+            .scheme = options.scheme,
+            .algorithm = options.algorithm,
+            .no_sort = options.no_sort,
+            .tiebreaks = options.tiebreaks,
+            .tiebreak_count = options.tiebreak_count,
+            .disabled = options.disabled,
+        };
+    }
+
+    fn parseOptions(self: LazySearchConfig) Options {
+        var out: Options = .{};
+        out.extended = self.extended;
+        out.exact = self.exact;
+        out.case_mode = self.case_mode;
+        out.literal = self.literal;
+        out.scheme = self.scheme;
+        out.algorithm = self.algorithm;
+        out.no_sort = self.no_sort;
+        out.tiebreaks = self.tiebreaks;
+        out.tiebreak_count = self.tiebreak_count;
+        out.disabled = self.disabled;
+        return out;
+    }
+};
+
+const LazyRank = struct {
+    record: compact_store.RecordRef,
+    score: CandidateScore,
+    tiebreak_values: [3]u32 = .{ 0, 0, 0 },
+};
+
+const LazyRankContext = struct {
+    config: LazySearchConfig,
+};
+
+const LazyFrontierPage = struct {
+    page_index: usize,
+    record_count: u32,
+    stores_matches: bool = true,
+    sparse_mode: bool = false,
+    bits: []u64 = &.{},
+    sparse: []compact_store.RecordRef = &.{},
+
+    fn deinit(self: *LazyFrontierPage, allocator: Allocator) void {
+        if (self.sparse_mode) {
+            if (self.sparse.len != 0) allocator.free(self.sparse);
+        } else if (self.bits.len != 0) allocator.free(self.bits);
+        self.* = undefined;
+    }
+};
+
+const LazyShardFrontier = struct {
+    allocator: Allocator,
+    query: []u8,
+    config: LazySearchConfig,
+    sensitive: bool,
+    normalize: bool,
+    snapshot_count: u32,
+    pages: []LazyFrontierPage,
+
+    fn deinit(self: *LazyShardFrontier) void {
+        for (self.pages) |*page| page.deinit(self.allocator);
+        self.allocator.free(self.pages);
+        self.allocator.free(self.query);
+        self.* = undefined;
+    }
+};
+
+const LazyShardCache = struct {
+    entries: [lazy_frontier_depth]?LazyShardFrontier = @splat(null),
+    next_slot: usize = 0,
+
+    fn deinit(self: *LazyShardCache) void {
+        for (&self.entries) |*entry| if (entry.*) |*frontier| frontier.deinit();
+        self.* = .{};
+    }
+
+    fn store(self: *LazyShardCache, frontier: LazyShardFrontier) void {
+        if (self.entries[self.next_slot]) |*old| old.deinit();
+        self.entries[self.next_slot] = frontier;
+        self.next_slot = (self.next_slot + 1) % lazy_frontier_depth;
+    }
+};
+
+fn lazyRawPlanCacheable(query: []const u8, raw_plan: RawQueryPlan) bool {
+    if (!raw_plan.simple_positive or raw_plan.terms.len != 1) return false;
+    const term = raw_plan.terms[0];
+    return term.term.kind == .fuzzy and !term.term.inverse and !term.has_non_ascii and !fuzzy_engine.cliTextHasNonAscii(query);
+}
+
+fn lazyFrontierCanRefine(frontier: *const LazyShardFrontier, query: []const u8, config: LazySearchConfig, raw_plan: RawQueryPlan, snapshot_count: u32) bool {
+    if (frontier.snapshot_count > snapshot_count) return false;
+    if (!std.meta.eql(frontier.config, config)) return false;
+    if (!lazyRawPlanCacheable(query, raw_plan)) return false;
+    const term = raw_plan.terms[0];
+    if (fuzzy_engine.cliTextHasNonAscii(frontier.query)) return false;
+    if (frontier.sensitive != term.sensitive or frontier.normalize != term.normalize) return false;
+    if (frontier.query.len > query.len) return false;
+    return std.mem.startsWith(u8, query, frontier.query);
+}
+
+fn lazyBestFrontier(cache: *const LazyShardCache, query: []const u8, config: LazySearchConfig, raw_plan: RawQueryPlan, snapshot_count: u32) ?*const LazyShardFrontier {
+    var best: ?*const LazyShardFrontier = null;
+    for (&cache.entries) |*entry| {
+        const frontier = if (entry.*) |*value| value else continue;
+        if (!lazyFrontierCanRefine(frontier, query, config, raw_plan, snapshot_count)) continue;
+        if (best == null or frontier.query.len > best.?.query.len) best = frontier;
+    }
+    return best;
+}
+
+fn lazyBestFrontierPage(cache: *const LazyShardCache, query: []const u8, config: LazySearchConfig, raw_plan: RawQueryPlan, snapshot_count: u32, page_index: usize) ?LazyFrontierPage {
+    var best_page: ?LazyFrontierPage = null;
+    var best_query_len: usize = 0;
+    for (&cache.entries) |*entry| {
+        const frontier = if (entry.*) |*value| value else continue;
+        if (!lazyFrontierCanRefine(frontier, query, config, raw_plan, snapshot_count)) continue;
+        var candidate_page: ?LazyFrontierPage = null;
+        for (frontier.pages) |page| {
+            if (page.page_index < page_index) continue;
+            if (page.page_index == page_index) candidate_page = page;
+            break;
+        }
+        const page = candidate_page orelse continue;
+        if (best_page == null or frontier.query.len > best_query_len or
+            (frontier.query.len == best_query_len and page.record_count > best_page.?.record_count))
+        {
+            best_page = page;
+            best_query_len = frontier.query.len;
+        }
+    }
+    return best_page;
+}
+
+fn lazyFrontierBitSet(page: LazyFrontierPage, local_index: u32) bool {
+    if (page.sparse_mode or local_index >= page.record_count) return false;
+    const word: usize = @intCast(local_index / 64);
+    const bit: u6 = @intCast(local_index % 64);
+    return (page.bits[word] & (@as(u64, 1) << bit)) != 0;
+}
+
+fn lazySetFrontierBit(bits: []u64, local_index: u32) void {
+    const word: usize = @intCast(local_index / 64);
+    const bit: u6 = @intCast(local_index % 64);
+    bits[word] |= @as(u64, 1) << bit;
+}
+
+fn lazyCacheStoresMatches(matches: u32, scanned: u32) bool {
+    if (scanned == 0) return true;
+    return @as(u64, matches) * 2 <= scanned;
+}
+
+fn lazyCacheStoresSparse(matches: u32, scanned: u32) bool {
+    return scanned != 0 and @as(u64, matches) * 128 <= scanned;
+}
+
+fn lazyFrontierCanSkip(page: LazyFrontierPage, local_index: u32) bool {
+    if (page.sparse_mode or local_index >= page.record_count) return false;
+    const set = lazyFrontierBitSet(page, local_index);
+    return if (page.stores_matches) !set else set;
+}
+
+fn prepareLazyRankTiebreaks(ctx: LazyRankContext, rank: *LazyRank) void {
+    var i: usize = 0;
+    while (i < ctx.config.tiebreak_count) : (i += 1) {
+        const value = tiebreakValue(ctx.config.tiebreaks[i], rank.record.text(), rank.score);
+        rank.tiebreak_values[i] = if (value == std.math.maxInt(usize))
+            std.math.maxInt(u32)
+        else
+            @intCast(value);
+    }
+}
+
+fn betterLazyRank(ctx: LazyRankContext, a: LazyRank, b: LazyRank) bool {
+    if (a.score.score != b.score.score) return a.score.score > b.score.score;
+    var i: usize = 0;
+    while (i < ctx.config.tiebreak_count) : (i += 1) {
+        const av = a.tiebreak_values[i];
+        const bv = b.tiebreak_values[i];
+        if (av != bv) return av < bv;
+    }
+    return a.record.id < b.record.id;
+}
+
+fn lazySiftWorst(heap: []LazyRank, ctx: LazyRankContext, start: usize) void {
+    var parent = start;
+    while (true) {
+        const left = parent * 2 + 1;
+        if (left >= heap.len) break;
+        const right = left + 1;
+        var worse_child = left;
+        if (right < heap.len and betterLazyRank(ctx, heap[left], heap[right])) worse_child = right;
+        if (!betterLazyRank(ctx, heap[parent], heap[worse_child])) break;
+        std.mem.swap(LazyRank, &heap[parent], &heap[worse_child]);
+        parent = worse_child;
+    }
+}
+
+fn lazyHeapifyWorst(heap: []LazyRank, ctx: LazyRankContext) void {
+    var parent = heap.len / 2;
+    while (parent != 0) {
+        parent -= 1;
+        lazySiftWorst(heap, ctx, parent);
+    }
+}
+
+const LazyResult = struct {
+    allocator: Allocator,
+    generation: u64,
+    ranks: []LazyRank,
+    total_count: u32,
+    match_count: u32,
+    scanned_count: u32,
+    input_finished: bool,
+    search_complete: bool,
+
+    fn deinit(self: *LazyResult) void {
+        self.allocator.free(self.ranks);
+        self.allocator.destroy(self);
+    }
+};
+
+const LazyPending = struct {
+    generation: u64,
+    query: []u8,
+    config: LazySearchConfig,
+    top_k: usize,
+};
+
+const LazyActive = struct {
+    generation: u64,
+    query: []u8,
+    config: LazySearchConfig,
+    top_k: usize,
+    scanned_count: u32 = 0,
+    match_count: u32 = 0,
+    published_partial: bool = false,
+    ranks: std.ArrayList(LazyRank) = .empty,
+
+    fn deinit(self: *LazyActive, allocator: Allocator) void {
+        allocator.free(self.query);
+        self.ranks.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const LazyBackend = struct {
+    allocator: Allocator,
+    io: Io,
+    store: compact_store.Store,
+    mutex: Io.Mutex = .init,
+    condition: Io.Condition = .init,
+    stop: std.atomic.Value(bool) = .init(false),
+    latest_generation: std.atomic.Value(u64) = .init(0),
+    data_epoch: u64 = 0,
+    pending: ?LazyPending = null,
+    result: ?*LazyResult = null,
+    search_thread: ?std.Thread = null,
+    source_thread: ?std.Thread = null,
+    source_child_pgid: std.atomic.Value(i64) = .init(0),
+    source_options: ?*const Options = null,
+    source_command: ?[]u8 = null,
+    source_kind: enum { none, stdin, walker, command } = .none,
+    ui_wake_fd: i32 = -1,
+    worker_count: usize = 1,
+    shard_caches: []LazyShardCache = &.{},
+
+    fn create(allocator: Allocator, io: Io) !*LazyBackend {
+        const self = try allocator.create(LazyBackend);
+        const worker_count = lazyDefaultWorkerCount();
+        const shard_caches = try allocator.alloc(LazyShardCache, worker_count);
+        errdefer allocator.free(shard_caches);
+        for (shard_caches) |*cache| cache.* = .{};
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .store = compact_store.Store.init(allocator, io),
+            .worker_count = worker_count,
+            .shard_caches = shard_caches,
+        };
+        if (comptime builtin.os.tag == .linux) {
+            const fd = std.c.eventfd(0, std.os.linux.EFD.NONBLOCK | std.os.linux.EFD.CLOEXEC);
+            if (fd >= 0) self.ui_wake_fd = fd;
+        }
+        errdefer {
+            if (comptime builtin.os.tag == .linux) {
+                if (self.ui_wake_fd >= 0) _ = std.c.close(self.ui_wake_fd);
+            }
+            self.store.deinit();
+            allocator.destroy(self);
+        }
+        self.search_thread = try std.Thread.spawn(.{}, lazySearchThread, .{self});
+        return self;
+    }
+
+    fn destroy(self: *LazyBackend) void {
+        self.stop.store(true, .release);
+        const pgid = self.source_child_pgid.load(.acquire);
+        if (pgid != 0 and builtin.os.tag != .windows and builtin.os.tag != .wasi) killBackgroundProcessGroup(pgid);
+        if (self.source_kind == .stdin and !self.store.isFinished() and builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+            _ = std.c.close(std.posix.STDIN_FILENO);
+        }
+        self.mutex.lockUncancelable(self.io);
+        self.condition.broadcast(self.io);
+        self.mutex.unlock(self.io);
+        if (self.source_thread) |thread| thread.join();
+        if (self.search_thread) |thread| thread.join();
+        if (comptime builtin.os.tag == .linux) {
+            if (self.ui_wake_fd >= 0) _ = std.c.close(self.ui_wake_fd);
+        }
+        if (self.pending) |pending| self.allocator.free(pending.query);
+        if (self.result) |result| result.deinit();
+        if (self.source_command) |command| self.allocator.free(command);
+        for (self.shard_caches) |*cache| cache.deinit();
+        self.allocator.free(self.shard_caches);
+        self.store.deinit();
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+
+    fn startSource(self: *LazyBackend, options: *const Options, stdin_is_tty: bool, default_command: ?[]const u8) !void {
+        self.source_options = options;
+        if (!stdin_is_tty) {
+            self.source_kind = .stdin;
+        } else if (default_command) |command| {
+            if (command.len == 0) {
+                self.source_kind = .walker;
+            } else {
+                self.source_kind = .command;
+                self.source_command = try self.allocator.dupe(u8, command);
+            }
+        } else {
+            self.source_kind = .walker;
+        }
+        self.source_thread = try std.Thread.spawn(.{}, lazySourceThread, .{self});
+    }
+
+    fn submit(self: *LazyBackend, query: []const u8, options: *const Options, top_k: usize) !u64 {
+        const owned = try self.allocator.dupe(u8, query);
+        errdefer self.allocator.free(owned);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.pending) |pending| self.allocator.free(pending.query);
+        const generation = self.latest_generation.load(.monotonic) +% 1;
+        // A result that was published before this submit is stale by
+        // definition. Drop it here so consumers never have to drain an old
+        // generation after the new generation has been announced.
+        if (self.result) |old_result| {
+            old_result.deinit();
+            self.result = null;
+        }
+        self.pending = .{
+            .generation = generation,
+            .query = owned,
+            .config = .fromOptions(options),
+            .top_k = @max(@as(usize, 1), top_k),
+        };
+        self.latest_generation.store(generation, .release);
+        self.condition.signal(self.io);
+        return generation;
+    }
+
+    fn notifyData(self: *LazyBackend) void {
+        self.mutex.lockUncancelable(self.io);
+        self.data_epoch +%= 1;
+        self.condition.signal(self.io);
+        self.mutex.unlock(self.io);
+    }
+
+    fn finishInput(self: *LazyBackend) void {
+        self.store.markFinished();
+        self.notifyData();
+    }
+
+    fn wakeUi(self: *LazyBackend) void {
+        if (comptime builtin.os.tag != .linux) return;
+        if (self.ui_wake_fd < 0) return;
+        var one: u64 = 1;
+        // Nonblocking eventfd: EAGAIN only means a wake is already pending.
+        _ = std.c.write(self.ui_wake_fd, @ptrCast(&one), @sizeOf(u64));
+    }
+
+    fn takeResult(self: *LazyBackend) ?*LazyResult {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const result = self.result;
+        self.result = null;
+        return result;
+    }
+
+    fn takePending(self: *LazyBackend) ?LazyPending {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const pending = self.pending;
+        self.pending = null;
+        return pending;
+    }
+
+    fn waitForWork(self: *LazyBackend, seen_epoch: *u64) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        while (!self.stop.load(.acquire) and self.pending == null and self.data_epoch == seen_epoch.*) {
+            self.condition.waitUncancelable(self.io, &self.mutex);
+        }
+        seen_epoch.* = self.data_epoch;
+    }
+
+    fn publish(self: *LazyBackend, active: *const LazyActive, total_count: u32, input_finished: bool, search_complete: bool) !void {
+        if (self.latest_generation.load(.acquire) != active.generation) return;
+        const ranks = try self.allocator.alloc(LazyRank, active.ranks.items.len);
+        @memcpy(ranks, active.ranks.items);
+        // betterLazyRank has a total order (record id is the final tie-break),
+        // so stable ordering cannot affect observable ranking. PDQ avoids the
+        // substantially heavier stable block-sort on every partial publish.
+        if (!active.config.no_sort) std.mem.sortUnstable(LazyRank, ranks, LazyRankContext{ .config = active.config }, betterLazyRank);
+        const result = try self.allocator.create(LazyResult);
+        errdefer self.allocator.destroy(result);
+        result.* = .{
+            .allocator = self.allocator,
+            .generation = active.generation,
+            .ranks = ranks,
+            .total_count = total_count,
+            .match_count = active.match_count,
+            .scanned_count = active.scanned_count,
+            .input_finished = input_finished,
+            .search_complete = search_complete,
+        };
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.latest_generation.load(.acquire) != active.generation) {
+            result.deinit();
+            return;
+        }
+        if (self.result) |old| old.deinit();
+        self.result = result;
+        self.wakeUi();
+    }
+};
+
+fn lazyInsertRank(active: *LazyActive, allocator: Allocator, incoming: LazyRank, sortable: bool) !void {
+    var rank = incoming;
+    if (active.ranks.items.len < active.top_k) {
+        if (active.ranks.items.len == 0 and active.ranks.capacity < active.top_k)
+            try active.ranks.ensureTotalCapacity(allocator, active.top_k);
+        if (sortable) prepareLazyRankTiebreaks(.{ .config = active.config }, &rank);
+        try active.ranks.append(allocator, rank);
+        if (sortable and active.ranks.items.len == active.top_k)
+            lazyHeapifyWorst(active.ranks.items, .{ .config = active.config });
+        return;
+    }
+    if (!sortable) return;
+
+    const worst = active.ranks.items[0];
+    if (rank.score.score < worst.score.score) return;
+    const ctx = LazyRankContext{ .config = active.config };
+    prepareLazyRankTiebreaks(ctx, &rank);
+    if (betterLazyRank(ctx, rank, worst)) {
+        active.ranks.items[0] = rank;
+        lazySiftWorst(active.ranks.items, ctx, 0);
+    }
+}
+
+const LazyShardWorker = struct {
+    allocator: Allocator,
+    snapshot: *const compact_store.Snapshot,
+    raw_plan: RawQueryPlan,
+    config: LazySearchConfig,
+    latest_generation: *const std.atomic.Value(u64),
+    stop: *const std.atomic.Value(bool),
+    generation: u64,
+    top_k: usize,
+    shard_index: usize,
+    shard_count: usize,
+    sortable: bool,
+    cache_frontier: bool,
+    cache_matches: bool,
+    cache_sparse: bool,
+    query: []const u8,
+    reuse_cache: ?*const LazyShardCache = null,
+    match_count: u32 = 0,
+    ranks: std.ArrayList(LazyRank) = .empty,
+    frontier_pages: std.ArrayList(LazyFrontierPage) = .empty,
+    failed: bool = false,
+    canceled: bool = false,
+    completed: bool = false,
+
+    fn deinit(self: *LazyShardWorker) void {
+        self.ranks.deinit(self.allocator);
+        for (self.frontier_pages.items) |*page| page.deinit(self.allocator);
+        self.frontier_pages.deinit(self.allocator);
+    }
+};
+
+fn lazyShardInsertRank(worker: *LazyShardWorker, incoming: LazyRank) !void {
+    var rank = incoming;
+    if (worker.ranks.items.len < worker.top_k) {
+        if (worker.sortable) prepareLazyRankTiebreaks(.{ .config = worker.config }, &rank);
+        try worker.ranks.append(worker.allocator, rank);
+        if (worker.sortable and worker.ranks.items.len == worker.top_k)
+            lazyHeapifyWorst(worker.ranks.items, .{ .config = worker.config });
+        return;
+    }
+    if (!worker.sortable) return;
+    const worst = worker.ranks.items[0];
+    if (rank.score.score < worst.score.score) return;
+    const ctx = LazyRankContext{ .config = worker.config };
+    prepareLazyRankTiebreaks(ctx, &rank);
+    if (betterLazyRank(ctx, rank, worst)) {
+        worker.ranks.items[0] = rank;
+        lazySiftWorst(worker.ranks.items, ctx, 0);
+    }
+}
+
+const LazyPageFrontierBuilder = struct {
+    allocator: Allocator,
+    page_index: usize,
+    page_base: u32,
+    record_count: u32,
+    mode: enum { none, bits, sparse } = .none,
+    stores_matches: bool = true,
+    bits: []u64 = &.{},
+    sparse: std.ArrayList(compact_store.RecordRef) = .empty,
+    sparse_limit: usize = 0,
+
+    fn init(worker: *const LazyShardWorker, page_index: usize, page_base: u32, record_count: u32, force_sparse: bool) !LazyPageFrontierBuilder {
+        var self = LazyPageFrontierBuilder{
+            .allocator = worker.allocator,
+            .page_index = page_index,
+            .page_base = page_base,
+            .record_count = record_count,
+            .stores_matches = worker.cache_matches,
+        };
+        if (!worker.cache_frontier) return self;
+        const words: usize = @intCast((record_count + 63) / 64);
+        if (worker.cache_sparse or force_sparse) {
+            self.mode = .sparse;
+            self.sparse_limit = (words * @sizeOf(u64)) / @sizeOf(compact_store.RecordRef);
+        } else {
+            self.mode = .bits;
+            self.bits = try worker.allocator.alloc(u64, words);
+            @memset(self.bits, 0);
+        }
+        return self;
+    }
+
+    fn deinit(self: *LazyPageFrontierBuilder) void {
+        if (self.bits.len != 0) self.allocator.free(self.bits);
+        self.sparse.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn observe(self: *LazyPageFrontierBuilder, record: compact_store.RecordRef, matched: bool) !void {
+        switch (self.mode) {
+            .none => {},
+            .bits => if (matched == self.stores_matches) {
+                lazySetFrontierBit(self.bits, record.id - self.page_base);
+            },
+            .sparse => if (matched) {
+                if (self.sparse.items.len >= self.sparse_limit) {
+                    self.sparse.deinit(self.allocator);
+                    self.sparse = .empty;
+                    self.mode = .none;
+                    return;
+                }
+                try self.sparse.append(self.allocator, record);
+            },
+        }
+    }
+
+    fn finish(self: *LazyPageFrontierBuilder, worker: *LazyShardWorker) !void {
+        switch (self.mode) {
+            .none => {},
+            .bits => {
+                const bits = self.bits;
+                self.bits = &.{};
+                errdefer if (bits.len != 0) self.allocator.free(bits);
+                try worker.frontier_pages.append(worker.allocator, .{
+                    .page_index = self.page_index,
+                    .record_count = self.record_count,
+                    .stores_matches = self.stores_matches,
+                    .bits = bits,
+                });
+            },
+            .sparse => {
+                const refs = try self.sparse.toOwnedSlice(self.allocator);
+                errdefer if (refs.len != 0) self.allocator.free(refs);
+                try worker.frontier_pages.append(worker.allocator, .{
+                    .page_index = self.page_index,
+                    .record_count = self.record_count,
+                    .sparse_mode = true,
+                    .sparse = refs,
+                });
+            },
+        }
+        self.mode = .none;
+    }
+};
+
+fn lazyShardCheckCanceled(worker: *LazyShardWorker) bool {
+    if (worker.stop.load(.acquire) or worker.latest_generation.load(.acquire) != worker.generation) {
+        worker.canceled = true;
+        return true;
+    }
+    return false;
+}
+
+fn lazyShardScoreRecord(worker: *LazyShardWorker, scratch: *fuzzy_engine.CliScratch, builder: *LazyPageFrontierBuilder, record: compact_store.RecordRef) bool {
+    const scored = (if (worker.snapshot.all_ascii and worker.raw_plan.simple_positive)
+        scoreSimplePositiveCandidateRawKnownAscii(scratch, worker.raw_plan, record.text())
+    else
+        scoreParsedCandidateRaw(scratch, worker.raw_plan, record.text())) catch {
+        worker.failed = true;
+        return false;
+    };
+    builder.observe(record, scored != null) catch {
+        worker.failed = true;
+        return false;
+    };
+    if (scored) |score| {
+        worker.match_count +%= 1;
+        lazyShardInsertRank(worker, .{ .record = record, .score = score }) catch {
+            worker.failed = true;
+            return false;
+        };
+    }
+    return true;
+}
+
+fn lazyShardScanWorker(worker: *LazyShardWorker) Io.Cancelable!void {
+    var scratch = fuzzy_engine.CliScratch.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    var page_index = worker.shard_index;
+    while (page_index < worker.snapshot.pageCount()) : (page_index += worker.shard_count) {
+        if (lazyShardCheckCanceled(worker)) return;
+        const page_base = worker.snapshot.pageBaseId(page_index);
+        const page_count = worker.snapshot.pageRecordCount(page_index);
+        const end_id = page_base + page_count;
+        const reuse_page = if (worker.reuse_cache) |cache|
+            lazyBestFrontierPage(cache, worker.query, worker.config, worker.raw_plan, worker.snapshot.count, page_index)
+        else
+            null;
+        var builder = LazyPageFrontierBuilder.init(worker, page_index, page_base, page_count, if (reuse_page) |page| page.sparse_mode else false) catch {
+            worker.failed = true;
+            return;
+        };
+        defer builder.deinit();
+
+        if (reuse_page) |page| sparse: {
+            if (!page.sparse_mode) break :sparse;
+            var since_cancel_check: usize = 0;
+            for (page.sparse) |record| {
+                since_cancel_check += 1;
+                if (since_cancel_check >= 256) {
+                    since_cancel_check = 0;
+                    if (lazyShardCheckCanceled(worker)) return;
+                }
+                if (!lazyShardScoreRecord(worker, &scratch, &builder, record)) return;
+            }
+            // A cached tail page may have grown after the frontier was built.
+            // Direct refs cover the immutable prefix; only the appended suffix
+            // must be decoded from compact storage.
+            if (page.record_count < page_count) {
+                var iterator = worker.snapshot.iteratorFrom(page_base + page.record_count);
+                while (iterator.next()) |record| {
+                    if (record.id >= end_id) break;
+                    since_cancel_check += 1;
+                    if (since_cancel_check >= 256) {
+                        since_cancel_check = 0;
+                        if (lazyShardCheckCanceled(worker)) return;
+                    }
+                    if (!lazyShardScoreRecord(worker, &scratch, &builder, record)) return;
+                }
+            }
+            builder.finish(worker) catch {
+                worker.failed = true;
+                return;
+            };
+            continue;
+        }
+
+        var iterator = worker.snapshot.pageIterator(page_index);
+        var since_cancel_check: usize = 0;
+        while (iterator.next()) |record| {
+            if (record.id >= end_id) break;
+            since_cancel_check += 1;
+            if (since_cancel_check >= 256) {
+                since_cancel_check = 0;
+                if (lazyShardCheckCanceled(worker)) return;
+            }
+            if (reuse_page) |page| {
+                // Cached nonmatches in the covered prefix cannot match a
+                // monotone refinement. Observe the rejection so a rejection-
+                // oriented output bitmap can preserve it without rescoring.
+                if (lazyFrontierCanSkip(page, record.id - page_base)) {
+                    builder.observe(record, false) catch {
+                        worker.failed = true;
+                        return;
+                    };
+                    continue;
+                }
+            }
+            if (!lazyShardScoreRecord(worker, &scratch, &builder, record)) return;
+        }
+        // Only a fully processed page becomes reusable. Cancellation above
+        // drops the builder, so a partial bitmap/ref vector is never exposed.
+        builder.finish(worker) catch {
+            worker.failed = true;
+            return;
+        };
+    }
+    worker.completed = true;
+}
+
+fn lazyMergeShardTopK(state: *LazyActive, allocator: Allocator, workers: []LazyShardWorker) bool {
+    const ctx = LazyRankContext{ .config = state.config };
+    for (workers) |*worker| std.mem.sortUnstable(LazyRank, worker.ranks.items, ctx, betterLazyRank);
+
+    var sources: [lazy_max_workers][]const LazyRank = undefined;
+    var offsets: [lazy_max_workers]usize = @splat(0);
+    var source_count: usize = 0;
+    for (workers) |*worker| {
+        if (worker.ranks.items.len == 0) continue;
+        sources[source_count] = worker.ranks.items;
+        source_count += 1;
+    }
+
+    var merged: std.ArrayList(LazyRank) = .empty;
+    errdefer merged.deinit(allocator);
+    merged.ensureTotalCapacity(allocator, state.top_k) catch return false;
+    while (merged.items.len < state.top_k) {
+        var best_source: ?usize = null;
+        var best: LazyRank = undefined;
+        for (0..source_count) |source_index| {
+            const at = offsets[source_index];
+            if (at >= sources[source_index].len) continue;
+            const candidate = sources[source_index][at];
+            if (best_source == null or betterLazyRank(ctx, candidate, best)) {
+                best_source = source_index;
+                best = candidate;
+            }
+        }
+        const source_index = best_source orelse break;
+        merged.appendAssumeCapacity(best);
+        offsets[source_index] += 1;
+    }
+    state.ranks.deinit(allocator);
+    state.ranks = merged;
+    return true;
+}
+
+fn lazyCommitShardFrontier(self: *LazyBackend, state: *const LazyActive, raw_plan: RawQueryPlan, snapshot_count: u32, worker: *LazyShardWorker) void {
+    if (worker.frontier_pages.items.len == 0 or !lazyRawPlanCacheable(state.query, raw_plan)) return;
+    const pages = worker.frontier_pages.toOwnedSlice(self.allocator) catch return;
+    worker.frontier_pages = .empty;
+    const query = self.allocator.dupe(u8, state.query) catch {
+        for (pages) |*page| page.deinit(self.allocator);
+        self.allocator.free(pages);
+        return;
+    };
+    const term = raw_plan.terms[0];
+    self.shard_caches[worker.shard_index].store(.{
+        .allocator = self.allocator,
+        .query = query,
+        .config = state.config,
+        .sensitive = term.sensitive,
+        .normalize = term.normalize,
+        .snapshot_count = snapshot_count,
+        .pages = pages,
+    });
+}
+
+fn lazyParallelScanCompletedCorpus(
+    self: *LazyBackend,
+    state: *LazyActive,
+    snapshot: *const compact_store.Snapshot,
+    raw_plan: RawQueryPlan,
+    sortable: bool,
+) bool {
+    if (!snapshot.finished or !sortable) return false;
+    if (snapshot.count < lazy_parallel_min_candidates) return false;
+    // A full shard pass deliberately rechecks the tiny prefix used for the first
+    // partial so every completed shard owns a complete reusable frontier. Avoid
+    // doing that after a long streaming scan has already consumed the corpus.
+    if (state.scanned_count > lazy_first_publish_max_scan_count) return false;
+    if (self.worker_count < 2 or snapshot.pageCount() < 2) return false;
+
+    const workers = self.allocator.alloc(LazyShardWorker, self.worker_count) catch return false;
+    var initialized: usize = 0;
+    defer {
+        for (workers[0..initialized]) |*worker| worker.deinit();
+        self.allocator.free(workers);
+    }
+    for (workers, 0..) |*worker, shard_index| {
+        worker.* = .{
+            .allocator = self.allocator,
+            .snapshot = snapshot,
+            .raw_plan = raw_plan,
+            .config = state.config,
+            .latest_generation = &self.latest_generation,
+            .stop = &self.stop,
+            .generation = state.generation,
+            .top_k = state.top_k,
+            .shard_index = shard_index,
+            .shard_count = self.worker_count,
+            .sortable = sortable,
+            .cache_frontier = lazyRawPlanCacheable(state.query, raw_plan),
+            .cache_matches = lazyCacheStoresMatches(state.match_count, state.scanned_count),
+            .cache_sparse = lazyCacheStoresSparse(state.match_count, state.scanned_count),
+            .query = state.query,
+            .reuse_cache = &self.shard_caches[shard_index],
+        };
+        worker.ranks.ensureTotalCapacity(self.allocator, state.top_k) catch return false;
+        initialized += 1;
+    }
+
+    var group: Io.Group = .init;
+    for (workers) |*worker| group.concurrent(self.io, lazyShardScanWorker, .{worker}) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => lazyShardScanWorker(worker) catch {},
+    };
+    group.await(self.io) catch return false;
+
+    // A keypress may make the global generation stale while some shards have
+    // already completed. Those completed frontiers are still exact for the old
+    // query and are intentionally retained for monotone refinement by the next
+    // generation. Canceled/incomplete shards commit nothing.
+    for (workers) |*worker| lazyCommitShardFrontier(self, state, raw_plan, snapshot.count, worker);
+
+    if (self.latest_generation.load(.acquire) != state.generation or self.stop.load(.acquire)) return false;
+    for (workers) |*worker| if (worker.canceled or worker.failed or !worker.completed) return false;
+
+    state.match_count = 0;
+    for (workers) |*worker| state.match_count +%= worker.match_count;
+    if (!lazyMergeShardTopK(state, self.allocator, workers)) return false;
+    state.scanned_count = snapshot.count;
+    return true;
+}
+
+fn lazySearchThread(self: *LazyBackend) void {
+    var scratch = fuzzy_engine.CliScratch.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    var active: ?LazyActive = null;
+    defer if (active) |*value| value.deinit(self.allocator);
+    var seen_epoch: u64 = 0;
+
+    while (!self.stop.load(.acquire)) {
+        if (self.takePending()) |pending| {
+            if (active) |*old| old.deinit(self.allocator);
+            active = .{
+                .generation = pending.generation,
+                .query = pending.query,
+                .config = pending.config,
+                .top_k = pending.top_k,
+            };
+        }
+        if (active == null) {
+            self.waitForWork(&seen_epoch);
+            continue;
+        }
+        var state = &active.?;
+        if (self.latest_generation.load(.acquire) != state.generation) continue;
+
+        var snapshot = self.store.snapshot(std.heap.page_allocator) catch {
+            self.waitForWork(&seen_epoch);
+            continue;
+        };
+        defer snapshot.deinit();
+
+        var parse_options = state.config.parseOptions();
+        var term_buf: [512]QueryTerm = undefined;
+        const parsed = parseQuery(state.query, &parse_options, &term_buf) catch {
+            state.scanned_count = snapshot.count;
+            state.match_count = 0;
+            state.ranks.clearRetainingCapacity();
+            self.publish(state, snapshot.count, snapshot.finished, snapshot.finished) catch {};
+            self.waitForWork(&seen_epoch);
+            continue;
+        };
+        const sortable = !state.config.no_sort and parsed.sortable;
+        var raw_term_buf: [512]RawTermPlan = undefined;
+        const raw_plan = prepareRawQuery(parsed, state.config.case_mode, !state.config.literal, state.config.scheme, state.config.algorithm, &raw_term_buf);
+
+        if (state.config.disabled or state.query.len == 0) {
+            if (state.ranks.items.len < state.top_k) {
+                var it = snapshot.iteratorFrom(state.scanned_count);
+                while (it.next()) |record| {
+                    if (state.ranks.items.len < state.top_k) {
+                        var rank = LazyRank{ .record = record, .score = .{} };
+                        if (sortable) prepareLazyRankTiebreaks(.{ .config = state.config }, &rank);
+                        state.ranks.append(self.allocator, rank) catch break;
+                    }
+                }
+            }
+            state.scanned_count = snapshot.count;
+            state.match_count = snapshot.count;
+            self.publish(state, snapshot.count, snapshot.finished, snapshot.finished) catch {};
+            if (snapshot.finished) self.waitForWork(&seen_epoch) else if (self.store.count() == state.scanned_count) self.waitForWork(&seen_epoch);
+            continue;
+        }
+
+        // Keep the first partial single-threaded. Once the UI has something to
+        // draw, fan the remaining finished corpus across stable page shards.
+        if (state.published_partial and lazyParallelScanCompletedCorpus(self, state, &snapshot, raw_plan, sortable)) {
+            self.publish(state, snapshot.count, snapshot.finished, true) catch {};
+            self.waitForWork(&seen_epoch);
+            continue;
+        }
+        if (self.latest_generation.load(.acquire) != state.generation) continue;
+
+        const first_publish_base = state.scanned_count;
+        var iterator = snapshot.iteratorFrom(state.scanned_count);
+        var since_cancel_check: usize = 0;
+        var since_publish: usize = 0;
+        var last_publish_ms: u64 = if (state.published_partial) monotonicMilliseconds(self.io) else 0;
+        var canceled = false;
+        var parallel_complete = false;
+        while (iterator.next()) |record| {
+            state.scanned_count = record.id + 1;
+            since_cancel_check += 1;
+            since_publish += 1;
+            if (since_cancel_check >= 256) {
+                since_cancel_check = 0;
+                if (self.stop.load(.acquire) or self.latest_generation.load(.acquire) != state.generation) {
+                    canceled = true;
+                    break;
+                }
+            }
+            if ((scoreParsedCandidateRaw(&scratch, raw_plan, record.text()) catch null)) |score| {
+                state.match_count +%= 1;
+                lazyInsertRank(state, self.allocator, .{ .record = record, .score = score }, sortable) catch {
+                    canceled = true;
+                    break;
+                };
+            }
+            if (since_publish >= 1024) {
+                // Publish the first useful result set by scan progress, not by a
+                // wall-clock delay. At 120 Hz an 8 ms first-result timer lands
+                // just before the next key; a small scan threshold makes the
+                // current generation visible much earlier without increasing
+                // its number of pre-cancel result frames. Later progress stays
+                // display-cadenced and polls the clock only once per scan batch.
+                since_publish = 0;
+                if (!state.published_partial and lazyShouldPublishFirst(state.scanned_count -| first_publish_base, state.ranks.items.len, state.top_k)) {
+                    self.publish(state, snapshot.count, snapshot.finished, false) catch {};
+                    state.published_partial = true;
+                    last_publish_ms = monotonicMilliseconds(self.io);
+                    if (lazyParallelScanCompletedCorpus(self, state, &snapshot, raw_plan, sortable)) {
+                        parallel_complete = true;
+                        break;
+                    } else if (self.latest_generation.load(.acquire) != state.generation) {
+                        canceled = true;
+                        break;
+                    }
+                } else if (state.published_partial) {
+                    const now = monotonicMilliseconds(self.io);
+                    if (now -| last_publish_ms >= lazy_progress_publish_interval_ms) {
+                        self.publish(state, snapshot.count, snapshot.finished, false) catch {};
+                        last_publish_ms = now;
+                    }
+                }
+            }
+        }
+        if (canceled) continue;
+        if (parallel_complete) {
+            self.publish(state, snapshot.count, snapshot.finished, true) catch {};
+            self.waitForWork(&seen_epoch);
+            continue;
+        }
+        const caught_up = state.scanned_count >= snapshot.count;
+        const complete = caught_up and snapshot.finished;
+        self.publish(state, snapshot.count, snapshot.finished, complete) catch {};
+        if (!complete) state.published_partial = true;
+        if (complete or self.store.count() == state.scanned_count) self.waitForWork(&seen_epoch);
+    }
+}
+
 fn parseQuery(query: []const u8, options: *const Options, storage: *[512]QueryTerm) !ParsedQuery {
     if (!options.extended) {
         if (storage.len == 0) return error.TooManyTerms;
@@ -7040,9 +8763,12 @@ fn stripAnsi(allocator: Allocator, s: []const u8) ![]const u8 {
     return try out.toOwnedSlice(allocator);
 }
 
-fn readKey(t: *Terminal) !Key {
-    const b = t.readByte() catch |err| switch (err) {
-        error.Timeout => return .unknown,
+fn readKey(t: *Terminal, wake_fd: i32) !Key {
+    // Lazy result publication wakes the same poll as terminal input on Linux;
+    // other targets keep the frame-scale timeout fallback. Escape-sequence
+    // continuation bytes still use the longer terminal-only readByte timeout.
+    const b = t.readByteTimeoutWithWake(wake_fd, 4) catch |err| switch (err) {
+        error.Timeout, error.Wake => return .unknown,
         else => return err,
     };
     if (b != 0x1b) return .{ .byte = b };
@@ -8186,7 +9912,37 @@ test "vertical navigation follows visual layout direction" {
     try std.testing.expectEqual(@as(isize, 1), logicalVerticalDelta(.reverse, 1));
 }
 
+test "partial result refresh keeps cursor position stable" {
+    try std.testing.expectEqual(@as(usize, 0), stableResultFocus(0, 512));
+    try std.testing.expectEqual(@as(usize, 17), stableResultFocus(17, 512));
+    try std.testing.expectEqual(@as(usize, 17), stableResultFocus(17, 64));
+    try std.testing.expectEqual(@as(usize, 7), stableResultFocus(17, 8));
+    try std.testing.expectEqual(@as(usize, 0), stableResultFocus(17, 0));
+}
+
+test "empty lazy partial preserves cursor hint" {
+    const empty = refreshLazyFocus(512, 17, 0, 0);
+    try std.testing.expectEqual(@as(usize, 0), empty.focus);
+    try std.testing.expectEqual(@as(usize, 17), empty.hint);
+    const restored = refreshLazyFocus(0, empty.focus, empty.hint, 512);
+    try std.testing.expectEqual(@as(usize, 17), restored.focus);
+    try std.testing.expectEqual(@as(usize, 17), restored.hint);
+    const clamped = refreshLazyFocus(0, 0, restored.hint, 8);
+    try std.testing.expectEqual(@as(usize, 7), clamped.focus);
+    try std.testing.expectEqual(@as(usize, 7), clamped.hint);
+}
+
+test "lazy partial publishing fills the display or reaches the scan fallback" {
+    try std.testing.expect(!lazyShouldPublishFirst(1024, 511, 512));
+    try std.testing.expect(lazyShouldPublishFirst(1024, 512, 512));
+    try std.testing.expect(!lazyShouldPublishFirst(4095, 3, 512));
+    try std.testing.expect(lazyShouldPublishFirst(4096, 0, 512));
+    try std.testing.expectEqual(@as(u64, 20), lazy_progress_publish_interval_ms);
+}
+
 test "scroll-off viewport constraint matches single-line fzf semantics" {
+    try std.testing.expectEqual(@as(usize, 2), effectiveScrollOff(6, 3));
+    try std.testing.expectEqual(@as(usize, 0), effectiveScrollOff(1, 3));
     // 20 visible rows, default scroll-off 3: keep the cursor three rows
     // from either edge once list boundaries no longer make that impossible.
     const rows: usize = 20;
@@ -8204,7 +9960,7 @@ test "scroll-off viewport constraint matches single-line fzf semantics" {
     for (cases) |case| {
         const visible = @min(rows, count);
         const max_scroll = count - visible;
-        const scroll_off = @min(visible / 2, off);
+        const scroll_off = effectiveScrollOff(visible, off);
         const base_min = case.focus -| (visible - 1);
         const base_max = @min(max_scroll, case.focus);
         const lower = @min(base_max, @max(base_min, case.focus -| (visible - 1 - scroll_off)));
@@ -8660,12 +10416,12 @@ test "default command preserves stdout even when command exits nonzero" {
 test "walker root option consumes directories and replaces prior roots" {
     const a = std.testing.allocator;
 
-    const args = [_][]const u8{ "zfuzz", "--walker-root=not-required-to-exist", "--walker-root", "src", "experiments", "--no-sort" };
+    const args = [_][]const u8{ "zfuzz", "--walker-root=not-required-to-exist", "--walker-root", "src", "tests", "--no-sort" };
     var options = try parseOptions(a, &args);
     defer options.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), options.walker_roots.items.len);
     try std.testing.expectEqualStrings("src", options.walker_roots.items[0]);
-    try std.testing.expectEqualStrings("experiments", options.walker_roots.items[1]);
+    try std.testing.expectEqualStrings("tests", options.walker_roots.items[1]);
     try std.testing.expect(options.no_sort);
 
     try std.testing.expectError(error.NoDirectorySpecified, parseOptions(a, &.{ "zfuzz", "--walker-root", "__zfuzz_missing_walker_root__" }));
@@ -10600,6 +12356,372 @@ test "heuristic algorithm is randomized top-k identical to v2" {
     }
 }
 
+test "lazy candidate view borrows compact-store records" {
+    const a = std.testing.allocator;
+    var store = compact_store.Store.init(a, std.testing.io);
+    defer store.deinit();
+    const alpha = try store.append("alpha");
+    const unicode = try store.append("βeta");
+    const ranks = [_]LazyRank{
+        .{ .record = alpha, .score = .{} },
+        .{ .record = unicode, .score = .{} },
+    };
+    var candidates = try candidatesFromLazyRanks(a, &ranks);
+    defer candidates.deinit(a);
+    try std.testing.expectEqual(alpha.ptr, candidates.output[0].ptr);
+    try std.testing.expectEqual(unicode.ptr, candidates.output[1].ptr);
+    try std.testing.expectEqualStrings("alpha", candidates.display[0]);
+    try std.testing.expectEqualStrings("βeta", candidates.search[1]);
+    try std.testing.expect(candidates.has_non_ascii);
+}
+
+test "lazy rank cached tiebreaks preserve comparator order" {
+    const a = std.testing.allocator;
+    var store = compact_store.Store.init(a, std.testing.io);
+    defer store.deinit();
+    const long = try store.append("longest");
+    const short = try store.append("x");
+    const mid0 = try store.append("mid");
+    const mid1 = try store.append("zzz");
+    var options: Options = .{};
+    const ctx = LazyRankContext{ .config = LazySearchConfig.fromOptions(&options) };
+    var ranks = [_]LazyRank{
+        .{ .record = long, .score = .{} },
+        .{ .record = mid1, .score = .{} },
+        .{ .record = short, .score = .{} },
+        .{ .record = mid0, .score = .{} },
+    };
+    for (&ranks) |*rank| prepareLazyRankTiebreaks(ctx, rank);
+    std.mem.sort(LazyRank, &ranks, ctx, betterLazyRank);
+    try std.testing.expectEqualSlices(u32, &.{ short.id, mid0.id, mid1.id, long.id }, &.{ ranks[0].record.id, ranks[1].record.id, ranks[2].record.id, ranks[3].record.id });
+}
+
+test "lazy top-k heap matches full ranking" {
+    const a = std.testing.allocator;
+    var store = compact_store.Store.init(a, std.testing.io);
+    defer store.deinit();
+    const texts = [_][]const u8{ "aaaa", "b", "ccc", "dd", "eeeee", "f", "gg", "hhh" };
+    const scores = [_]i32{ 10, 30, 20, 30, 25, 30, 5, 27 };
+    var options: Options = .{};
+    const config = LazySearchConfig.fromOptions(&options);
+    const ctx = LazyRankContext{ .config = config };
+    var active = LazyActive{
+        .generation = 1,
+        .query = try a.dupe(u8, "x"),
+        .config = config,
+        .top_k = 3,
+    };
+    defer active.deinit(a);
+    var all: [texts.len]LazyRank = undefined;
+    for (texts, scores, 0..) |text, score, i| {
+        const record = try store.append(text);
+        all[i] = .{ .record = record, .score = .{ .score = score } };
+        prepareLazyRankTiebreaks(ctx, &all[i]);
+        try lazyInsertRank(&active, a, .{ .record = record, .score = .{ .score = score } }, true);
+    }
+    std.mem.sort(LazyRank, &all, ctx, betterLazyRank);
+    const retained = try a.dupe(LazyRank, active.ranks.items);
+    defer a.free(retained);
+    std.mem.sort(LazyRank, retained, ctx, betterLazyRank);
+    try std.testing.expectEqual(@as(usize, 3), retained.len);
+    for (retained, 0..) |rank, i| try std.testing.expectEqual(all[i].record.id, rank.record.id);
+}
+
+test "lazy worker count leaves one third of logical CPUs free" {
+    try std.testing.expectEqual(@as(usize, 1), lazyWorkerCountForCores(1));
+    try std.testing.expectEqual(@as(usize, 1), lazyWorkerCountForCores(2));
+    try std.testing.expectEqual(@as(usize, 2), lazyWorkerCountForCores(3));
+    try std.testing.expectEqual(@as(usize, 8), lazyWorkerCountForCores(12));
+    try std.testing.expectEqual(lazy_max_workers, lazyWorkerCountForCores(192));
+}
+
+test "lazy frontier refinement only reuses monotone compatible fuzzy queries" {
+    const a = std.testing.allocator;
+    var options: Options = .{};
+    const config = LazySearchConfig.fromOptions(&options);
+
+    var parse_options = config.parseOptions();
+    var old_terms: [512]QueryTerm = undefined;
+    const old_parsed = try parseQuery("a", &parse_options, &old_terms);
+    var old_raw_terms: [512]RawTermPlan = undefined;
+    const old_plan = prepareRawQuery(old_parsed, config.case_mode, !config.literal, config.scheme, config.algorithm, &old_raw_terms);
+    var frontier = LazyShardFrontier{
+        .allocator = a,
+        .query = try a.dupe(u8, "a"),
+        .config = config,
+        .sensitive = old_plan.terms[0].sensitive,
+        .normalize = old_plan.terms[0].normalize,
+        .snapshot_count = 1234,
+        .pages = try a.alloc(LazyFrontierPage, 0),
+    };
+    defer frontier.deinit();
+
+    parse_options = config.parseOptions();
+    var refined_terms: [512]QueryTerm = undefined;
+    const refined_parsed = try parseQuery("ab", &parse_options, &refined_terms);
+    var refined_raw_terms: [512]RawTermPlan = undefined;
+    const refined_plan = prepareRawQuery(refined_parsed, config.case_mode, !config.literal, config.scheme, config.algorithm, &refined_raw_terms);
+    try std.testing.expect(lazyFrontierCanRefine(&frontier, "ab", config, refined_plan, 1234));
+    try std.testing.expect(lazyFrontierCanRefine(&frontier, "ab", config, refined_plan, 1235));
+    try std.testing.expect(!lazyFrontierCanRefine(&frontier, "ab", config, refined_plan, 1233));
+
+    parse_options = config.parseOptions();
+    var upper_terms: [512]QueryTerm = undefined;
+    const upper_parsed = try parseQuery("aB", &parse_options, &upper_terms);
+    var upper_raw_terms: [512]RawTermPlan = undefined;
+    const upper_plan = prepareRawQuery(upper_parsed, config.case_mode, !config.literal, config.scheme, config.algorithm, &upper_raw_terms);
+    try std.testing.expect(!lazyFrontierCanRefine(&frontier, "aB", config, upper_plan, 1234));
+}
+
+test "lazy frontier bitmap stores the minority side" {
+    try std.testing.expect(!lazyCacheStoresMatches(750, 1000));
+    try std.testing.expect(lazyCacheStoresMatches(250, 1000));
+    try std.testing.expect(lazyCacheStoresMatches(0, 0));
+
+    var bits = [_]u64{0};
+    lazySetFrontierBit(&bits, 3);
+    const survivors = LazyFrontierPage{ .page_index = 0, .record_count = 8, .stores_matches = true, .bits = &bits };
+    const rejects = LazyFrontierPage{ .page_index = 0, .record_count = 8, .stores_matches = false, .bits = &bits };
+    try std.testing.expect(!lazyFrontierCanSkip(survivors, 3));
+    try std.testing.expect(lazyFrontierCanSkip(survivors, 2));
+    try std.testing.expect(lazyFrontierCanSkip(rejects, 3));
+    try std.testing.expect(!lazyFrontierCanSkip(rejects, 2));
+}
+
+test "lazy frontier bitset records shard-local survivors" {
+    var bits = [_]u64{ 0, 0 };
+    lazySetFrontierBit(&bits, 0);
+    lazySetFrontierBit(&bits, 63);
+    lazySetFrontierBit(&bits, 64);
+    const page = LazyFrontierPage{ .page_index = 7, .record_count = 65, .stores_matches = true, .bits = &bits };
+    try std.testing.expect(lazyFrontierBitSet(page, 0));
+    try std.testing.expect(!lazyFrontierBitSet(page, 1));
+    try std.testing.expect(lazyFrontierBitSet(page, 63));
+    try std.testing.expect(lazyFrontierBitSet(page, 64));
+    try std.testing.expect(!lazyFrontierBitSet(page, 65));
+    try std.testing.expect(lazyFrontierCanSkip(page, 1));
+    try std.testing.expect(!lazyFrontierCanSkip(page, 0));
+    // Index 65 did not exist when this frontier was built. It must be scored
+    // if the page later grows rather than being treated as an old nonmatch.
+    try std.testing.expect(!lazyFrontierCanSkip(page, 65));
+}
+
+test "page frontier falls back independently across recent query generations" {
+    const a = std.testing.allocator;
+    var options: Options = .{};
+    const config = LazySearchConfig.fromOptions(&options);
+    var parse_options = config.parseOptions();
+    var term_buf: [512]QueryTerm = undefined;
+    const parsed = try parseQuery("abc", &parse_options, &term_buf);
+    var raw_term_buf: [512]RawTermPlan = undefined;
+    const raw_plan = prepareRawQuery(parsed, config.case_mode, !config.literal, config.scheme, config.algorithm, &raw_term_buf);
+    const sensitive = raw_plan.terms[0].sensitive;
+    const normalize = raw_plan.terms[0].normalize;
+
+    var cache: LazyShardCache = .{};
+    defer cache.deinit();
+
+    const a_pages = try a.alloc(LazyFrontierPage, 2);
+    const a_bits0 = try a.alloc(u64, 1);
+    const a_bits1 = try a.alloc(u64, 1);
+    a_bits0[0] = 1;
+    a_bits1[0] = 1;
+    a_pages[0] = .{ .page_index = 0, .record_count = 2, .stores_matches = true, .bits = a_bits0 };
+    a_pages[1] = .{ .page_index = 1, .record_count = 2, .stores_matches = true, .bits = a_bits1 };
+    cache.store(.{
+        .allocator = a,
+        .query = try a.dupe(u8, "a"),
+        .config = config,
+        .sensitive = sensitive,
+        .normalize = normalize,
+        .snapshot_count = 4,
+        .pages = a_pages,
+    });
+
+    const ab_pages = try a.alloc(LazyFrontierPage, 1);
+    const ab_bits0 = try a.alloc(u64, 1);
+    ab_bits0[0] = 2;
+    ab_pages[0] = .{ .page_index = 0, .record_count = 2, .stores_matches = true, .bits = ab_bits0 };
+    cache.store(.{
+        .allocator = a,
+        .query = try a.dupe(u8, "ab"),
+        .config = config,
+        .sensitive = sensitive,
+        .normalize = normalize,
+        .snapshot_count = 4,
+        .pages = ab_pages,
+    });
+
+    const page0 = lazyBestFrontierPage(&cache, "abc", config, raw_plan, 4, 0) orelse return error.TestUnexpectedResult;
+    const page1 = lazyBestFrontierPage(&cache, "abc", config, raw_plan, 4, 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!lazyFrontierBitSet(page0, 0));
+    try std.testing.expect(lazyFrontierBitSet(page0, 1));
+    try std.testing.expect(lazyFrontierBitSet(page1, 0));
+}
+
+test "completed shard frontier survives a stale global generation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const backend = try LazyBackend.create(a, io);
+    defer backend.destroy();
+    _ = try backend.store.append("alpha");
+    backend.finishInput();
+    var snapshot = try backend.store.snapshot(a);
+    defer snapshot.deinit();
+
+    var options: Options = .{};
+    const config = LazySearchConfig.fromOptions(&options);
+    var parse_options = config.parseOptions();
+    var term_buf: [512]QueryTerm = undefined;
+    const parsed = try parseQuery("a", &parse_options, &term_buf);
+    var raw_term_buf: [512]RawTermPlan = undefined;
+    const raw_plan = prepareRawQuery(parsed, config.case_mode, !config.literal, config.scheme, config.algorithm, &raw_term_buf);
+    var state = LazyActive{
+        .generation = 1,
+        .query = try a.dupe(u8, "a"),
+        .config = config,
+        .top_k = 8,
+    };
+    defer state.deinit(a);
+    var worker = LazyShardWorker{
+        .allocator = a,
+        .snapshot = &snapshot,
+        .raw_plan = raw_plan,
+        .config = config,
+        .latest_generation = &backend.latest_generation,
+        .stop = &backend.stop,
+        .generation = 1,
+        .top_k = 8,
+        .shard_index = 0,
+        .shard_count = backend.worker_count,
+        .sortable = true,
+        .cache_frontier = true,
+        .cache_matches = true,
+        .cache_sparse = false,
+        .query = state.query,
+        .reuse_cache = &backend.shard_caches[0],
+        .completed = true,
+    };
+    defer worker.deinit();
+    const bits = try a.alloc(u64, 1);
+    bits[0] = 1;
+    try worker.frontier_pages.append(a, .{ .page_index = 0, .record_count = 1, .stores_matches = true, .bits = bits });
+
+    // Simulate a keypress arriving after this shard finished but before the
+    // other shards did. The completed old-generation shard is still reusable.
+    backend.latest_generation.store(2, .release);
+    lazyCommitShardFrontier(backend, &state, raw_plan, snapshot.count, &worker);
+
+    parse_options = config.parseOptions();
+    var refined_terms: [512]QueryTerm = undefined;
+    const refined = try parseQuery("ab", &parse_options, &refined_terms);
+    var refined_raw_terms: [512]RawTermPlan = undefined;
+    const refined_plan = prepareRawQuery(refined, config.case_mode, !config.literal, config.scheme, config.algorithm, &refined_raw_terms);
+    try std.testing.expect(lazyBestFrontier(&backend.shard_caches[0], "ab", config, refined_plan, snapshot.count) != null);
+    try std.testing.expectEqual(@as(usize, 0), worker.frontier_pages.items.len);
+}
+
+test "lazy backend retains completed shard frontier for appended query" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const backend = try LazyBackend.create(a, io);
+    defer backend.destroy();
+    const total: usize = 100_000;
+    var expected_ab: u32 = 0;
+    for (0..total) |i| {
+        var buf: [128]u8 = undefined;
+        const line = if (i % 4 == 0) blk: {
+            expected_ab += 1;
+            break :blk try std.fmt.bufPrint(&buf, "alpha beta target row {d:0>6} ........................................................", .{i});
+        } else try std.fmt.bufPrint(&buf, "alpha ordinary row {d:0>6} ............................................................", .{i});
+        _ = try backend.store.append(line);
+    }
+    backend.finishInput();
+    var options: Options = .{};
+    const first_generation = try backend.submit("a", &options, 64);
+    var spins: usize = 0;
+    while (spins < 4_000_000) : (spins += 1) {
+        if (backend.takeResult()) |candidate| {
+            const complete = candidate.generation == first_generation and candidate.search_complete;
+            candidate.deinit();
+            if (complete) break;
+        }
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(spins < 4_000_000);
+
+    const config = LazySearchConfig.fromOptions(&options);
+    var parse_options = config.parseOptions();
+    var term_buf: [512]QueryTerm = undefined;
+    const parsed = try parseQuery("ab", &parse_options, &term_buf);
+    var raw_term_buf: [512]RawTermPlan = undefined;
+    const raw_plan = prepareRawQuery(parsed, config.case_mode, !config.literal, config.scheme, config.algorithm, &raw_term_buf);
+    var reusable: usize = 0;
+    for (backend.shard_caches) |*cache| if (lazyBestFrontier(cache, "ab", config, raw_plan, @intCast(total)) != null) {
+        reusable += 1;
+    };
+    var cache_snapshot = try backend.store.snapshot(a);
+    defer cache_snapshot.deinit();
+    try std.testing.expectEqual(@min(backend.worker_count, cache_snapshot.pageCount()), reusable);
+
+    const second_generation = try backend.submit("ab", &options, 64);
+    var final: ?*LazyResult = null;
+    spins = 0;
+    while (spins < 4_000_000) : (spins += 1) {
+        if (backend.takeResult()) |candidate| {
+            if (candidate.generation == second_generation and candidate.search_complete) {
+                final = candidate;
+                break;
+            }
+            candidate.deinit();
+        }
+        std.Thread.yield() catch {};
+    }
+    const got = final orelse return error.TestUnexpectedResult;
+    defer got.deinit();
+    try std.testing.expectEqual(expected_ab, got.match_count);
+    try std.testing.expectEqual(@as(u32, @intCast(total)), got.scanned_count);
+    for (got.ranks) |rank| try std.testing.expect(std.mem.indexOf(u8, rank.record.text(), "beta") != null);
+}
+
+test "lazy backend scans compact store asynchronously with exact full count" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const backend = try LazyBackend.create(a, io);
+    defer backend.destroy();
+    var expected_matches: u32 = 0;
+    for (0..10_000) |i| {
+        var buf: [96]u8 = undefined;
+        const line = if (i % 7 == 0) blk: {
+            expected_matches += 1;
+            break :blk try std.fmt.bufPrint(&buf, "row-{d:0>5}-needle-target", .{i});
+        } else try std.fmt.bufPrint(&buf, "row-{d:0>5}-ordinary", .{i});
+        _ = try backend.store.append(line);
+    }
+    backend.finishInput();
+    var options: Options = .{};
+    const generation = try backend.submit("needle", &options, 64);
+    var result: ?*LazyResult = null;
+    var spins: usize = 0;
+    while (spins < 2_000_000) : (spins += 1) {
+        if (backend.takeResult()) |candidate| {
+            if (candidate.generation == generation and candidate.search_complete) {
+                result = candidate;
+                break;
+            }
+            candidate.deinit();
+        }
+        std.Thread.yield() catch {};
+    }
+    const final = result orelse return error.TestUnexpectedResult;
+    defer final.deinit();
+    try std.testing.expectEqual(@as(u32, 10_000), final.total_count);
+    try std.testing.expectEqual(expected_matches, final.match_count);
+    try std.testing.expectEqual(@as(u32, 10_000), final.scanned_count);
+    try std.testing.expectEqual(@as(usize, 64), final.ranks.len);
+    for (final.ranks) |rank| try std.testing.expect(std.mem.indexOf(u8, rank.record.text(), "needle") != null);
+}
+
 test "terminal cell width handles wide combining and invalid UTF-8" {
     try std.testing.expectEqual(@as(usize, 3), visibleTextWidth("A你", false));
     try std.testing.expectEqual(@as(usize, 3), visibleTextWidth("A🙂", false));
@@ -10621,4 +12743,156 @@ test "terminal truncation preserves UTF-8 cell boundaries" {
     theme.enabled = false;
     try writeHighlighted(&highlighted.writer, "你好吗", "", 3, false, false, &theme, false, false);
     try std.testing.expectEqualStrings("你…", highlighted.written());
+}
+
+test "lazy backend publishes zero-match progress before input completion" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const backend = try LazyBackend.create(a, io);
+    defer backend.destroy();
+    for (0..20_000) |i| {
+        var buf: [48]u8 = undefined;
+        _ = try backend.store.append(try std.fmt.bufPrint(&buf, "ordinary-{d}", .{i}));
+    }
+    var options: Options = .{};
+    const generation = try backend.submit("~", &options, 32);
+    backend.notifyData();
+    var partial: ?*LazyResult = null;
+    var spins: usize = 0;
+    while (spins < 2_000_000) : (spins += 1) {
+        if (backend.takeResult()) |candidate| {
+            if (candidate.generation == generation and candidate.scanned_count == 20_000 and !candidate.search_complete) {
+                partial = candidate;
+                break;
+            }
+            candidate.deinit();
+        }
+        std.Thread.yield() catch {};
+    }
+    const got = partial orelse return error.TestUnexpectedResult;
+    defer got.deinit();
+    try std.testing.expectEqual(@as(u32, 0), got.match_count);
+    try std.testing.expectEqual(@as(usize, 0), got.ranks.len);
+    try std.testing.expectEqual(@as(u32, 20_000), got.total_count);
+}
+
+test "lazy backend newest query generation replaces older work" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const backend = try LazyBackend.create(a, io);
+    defer backend.destroy();
+    for (0..30_000) |i| {
+        var buf: [64]u8 = undefined;
+        const line = if (i % 3 == 0)
+            try std.fmt.bufPrint(&buf, "alpha-{d}", .{i})
+        else
+            try std.fmt.bufPrint(&buf, "beta-{d}", .{i});
+        _ = try backend.store.append(line);
+    }
+    backend.finishInput();
+    var options: Options = .{};
+    _ = try backend.submit("alpha", &options, 64);
+    const newest = try backend.submit("beta", &options, 64);
+    var final: ?*LazyResult = null;
+    var spins: usize = 0;
+    while (spins < 2_000_000) : (spins += 1) {
+        if (backend.takeResult()) |candidate| {
+            if (candidate.generation == newest and candidate.search_complete) {
+                final = candidate;
+                break;
+            }
+            candidate.deinit();
+        }
+        std.Thread.yield() catch {};
+    }
+    const got = final orelse return error.TestUnexpectedResult;
+    defer got.deinit();
+    try std.testing.expectEqual(@as(u32, 20_000), got.match_count);
+    for (got.ranks) |rank| try std.testing.expect(std.mem.startsWith(u8, rank.record.text(), "beta-"));
+}
+
+test "lazy accept waits for current generation and incomplete empty results" {
+    try std.testing.expect(!lazyAcceptNeedsWait(false, 1, 2, 0, 0, false));
+    try std.testing.expect(lazyAcceptNeedsWait(true, 1, 2, 1, 0, false));
+    try std.testing.expect(lazyAcceptNeedsWait(true, 2, 2, 0, 0, false));
+    try std.testing.expect(!lazyAcceptNeedsWait(true, 2, 2, 1, 0, false));
+    try std.testing.expect(!lazyAcceptNeedsWait(true, 2, 2, 0, 1, false));
+    try std.testing.expect(!lazyAcceptNeedsWait(true, 2, 2, 0, 0, true));
+}
+
+test "lazy backend cancels a running generation without later stale publication" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const backend = try LazyBackend.create(a, io);
+    defer backend.destroy();
+    const total: usize = 200_000;
+    for (0..total) |i| {
+        var buf: [80]u8 = undefined;
+        const line = if (i % 2 == 0)
+            try std.fmt.bufPrint(&buf, "alpha alphabetic candidate row {d}", .{i})
+        else
+            try std.fmt.bufPrint(&buf, "beta betatron candidate row {d}", .{i});
+        _ = try backend.store.append(line);
+    }
+    backend.finishInput();
+
+    var options: Options = .{ .exact = true };
+    const old_generation = try backend.submit("alpha", &options, 64);
+    var saw_running_old = false;
+    var spins: usize = 0;
+    while (spins < 4_000_000) : (spins += 1) {
+        if (backend.takeResult()) |candidate| {
+            defer candidate.deinit();
+            if (candidate.generation == old_generation and candidate.scanned_count > 0 and !candidate.search_complete) {
+                saw_running_old = true;
+                break;
+            }
+        }
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(saw_running_old);
+
+    const newest = try backend.submit("beta", &options, 64);
+    var final: ?*LazyResult = null;
+    spins = 0;
+    while (spins < 4_000_000) : (spins += 1) {
+        if (backend.takeResult()) |candidate| {
+            if (candidate.generation != newest) {
+                candidate.deinit();
+                return error.TestUnexpectedResult;
+            }
+            if (candidate.search_complete) {
+                final = candidate;
+                break;
+            }
+            candidate.deinit();
+        }
+        std.Thread.yield() catch {};
+    }
+    const got = final orelse return error.TestUnexpectedResult;
+    defer got.deinit();
+    try std.testing.expectEqual(@as(u32, @intCast(total / 2)), got.match_count);
+    try std.testing.expectEqual(@as(u32, @intCast(total)), got.scanned_count);
+}
+
+test "lazy interactive eligibility keeps whole-corpus modes on fallback" {
+    var options: Options = .{};
+    try std.testing.expect(lazyInteractiveEligible(&options));
+    options.tail = 5;
+    try std.testing.expect(!lazyInteractiveEligible(&options));
+    options.tail = null;
+    options.header_lines = 1;
+    try std.testing.expect(!lazyInteractiveEligible(&options));
+    options.header_lines = 0;
+    options.ansi = true;
+    try std.testing.expect(!lazyInteractiveEligible(&options));
+    options.ansi = false;
+    options.multi = true;
+    try std.testing.expect(!lazyInteractiveEligible(&options));
+    options.multi = false;
+    options.track = true;
+    try std.testing.expect(!lazyInteractiveEligible(&options));
+    options.track = false;
+    options.listen_addr = "";
+    try std.testing.expect(!lazyInteractiveEligible(&options));
 }
